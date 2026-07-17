@@ -133,6 +133,10 @@ class SwanLabTrackerTest(unittest.TestCase):
                 "reward_m2m": 0.5,
                 "loss": -0.1,
                 "elapsed_seconds": 8.0,
+                "reward_within_prompt_std": 0.2,
+                "reward_between_prompt_std": 0.7,
+                "eval_reward": 1.6,
+                "eval_reward_delta": 0.03,
             },
             learning_rate=1.0e-4,
         )
@@ -144,6 +148,10 @@ class SwanLabTrackerTest(unittest.TestCase):
         self.assertEqual(metrics["ppo/loss"], -0.1)
         self.assertEqual(metrics["time/epoch_seconds"], 8.0)
         self.assertEqual(metrics["optimization/learning_rate"], 1.0e-4)
+        self.assertEqual(metrics["reward/within_prompt_std"], 0.2)
+        self.assertEqual(metrics["reward/between_prompt_std"], 0.7)
+        self.assertEqual(metrics["eval/reward_total"], 1.6)
+        self.assertEqual(metrics["eval/reward_total_delta"], 0.03)
 
 
 if __name__ == "__main__":

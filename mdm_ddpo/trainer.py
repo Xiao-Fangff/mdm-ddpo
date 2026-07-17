@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from .config import TrainConfig
@@ -46,6 +47,77 @@ from .tracking import SwanLabTracker, format_training_metrics
 LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class PromptBatch:
+    motion: torch.Tensor
+    lengths: torch.Tensor
+    texts: list[str]
+
+
+def repeat_prompt_batch(
+    motion: torch.Tensor,
+    lengths: torch.Tensor,
+    texts: list[str],
+    samples_per_prompt: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[str], torch.Tensor]:
+    """Repeat each conditioning item contiguously for grouped DDPO rollouts."""
+    prompt_count = motion.shape[0]
+    if lengths.shape[0] != prompt_count or len(texts) != prompt_count:
+        raise ValueError("Motion, length, and text prompt counts must match.")
+    if samples_per_prompt < 2:
+        raise ValueError("Grouped DDPO requires at least two samples per prompt.")
+    repeated_motion = motion.repeat_interleave(samples_per_prompt, dim=0)
+    repeated_lengths = lengths.repeat_interleave(samples_per_prompt, dim=0)
+    repeated_texts = [
+        text
+        for text in texts
+        for _ in range(samples_per_prompt)
+    ]
+    prompt_ids = torch.arange(prompt_count).repeat_interleave(samples_per_prompt)
+    return repeated_motion, repeated_lengths, repeated_texts, prompt_ids
+
+
+def compute_grouped_advantages(
+    rewards: torch.Tensor,
+    prompt_ids: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Whiten rewards within each prompt instead of across prompt difficulty."""
+    if rewards.ndim != 1 or prompt_ids.shape != rewards.shape:
+        raise ValueError("Rewards and prompt_ids must be matching 1-D tensors.")
+    if epsilon <= 0:
+        raise ValueError("Advantage epsilon must be positive.")
+
+    advantages = torch.zeros_like(rewards)
+    group_means: list[torch.Tensor] = []
+    group_stds: list[torch.Tensor] = []
+    unique_prompt_ids = torch.unique(prompt_ids, sorted=True)
+    for prompt_id in unique_prompt_ids:
+        mask = prompt_ids == prompt_id
+        group_rewards = rewards[mask]
+        if group_rewards.numel() < 2:
+            raise ValueError(
+                f"Prompt group {int(prompt_id)} has fewer than two samples."
+            )
+        group_mean = group_rewards.mean()
+        group_std = group_rewards.std(unbiased=False)
+        advantages[mask] = (group_rewards - group_mean) / (group_std + epsilon)
+        group_means.append(group_mean)
+        group_stds.append(group_std)
+
+    means = torch.stack(group_means)
+    stds = torch.stack(group_stds)
+    stats = {
+        "unique_prompts": float(len(unique_prompt_ids)),
+        "reward_within_prompt_std": stds.mean().item(),
+        "reward_between_prompt_std": means.std(unbiased=False).item(),
+        "zero_variance_prompt_fraction": (
+            (stds < epsilon).float().mean().item()
+        ),
+    }
+    return advantages, stats
+
+
 @dataclass
 class Trajectory:
     latents: torch.Tensor
@@ -59,12 +131,25 @@ class Trajectory:
     text_embeddings: list[CachedTextEmbedding]
     lengths: torch.Tensor
     gt_motion: torch.Tensor
+    prompt_ids: torch.Tensor
     advantages: torch.Tensor | None = None
+    group_stats: dict[str, float] | None = None
 
     @classmethod
     def concatenate(cls, batches: list["Trajectory"]) -> "Trajectory":
         if not batches:
             raise ValueError("Cannot concatenate an empty rollout list.")
+        prompt_id_parts: list[torch.Tensor] = []
+        prompt_offset = 0
+        for batch in batches:
+            unique_ids, local_ids = torch.unique(
+                batch.prompt_ids,
+                sorted=True,
+                return_inverse=True,
+            )
+            prompt_id_parts.append(local_ids + prompt_offset)
+            prompt_offset += len(unique_ids)
+
         return cls(
             latents=torch.cat([batch.latents for batch in batches], dim=0),
             next_latents=torch.cat(
@@ -89,6 +174,7 @@ class Trajectory:
             ],
             lengths=torch.cat([batch.lengths for batch in batches], dim=0),
             gt_motion=torch.cat([batch.gt_motion for batch in batches], dim=0),
+            prompt_ids=torch.cat(prompt_id_parts, dim=0),
         )
 
 
@@ -152,8 +238,14 @@ class DDPOTrainer:
         self.reward_model = MotionReward(config, self.reward_device)
         self.start_epoch = 0
         self.global_step = 0
+        self.fixed_eval_baseline: dict[str, float] | None = None
         if config.resume:
             self._load_checkpoint(config.resume)
+        self.fixed_eval_batch = (
+            self._build_fixed_eval_batch()
+            if config.fixed_eval_every > 0
+            else None
+        )
 
         total, trainable = parameter_counts(self.model)
         LOGGER.info(
@@ -208,6 +300,114 @@ class DDPOTrainer:
             ),
             "policy_device": str(self.device),
             "reward_device": str(self.reward_device),
+            "prompts_per_rollout_batch": (
+                self.config.prompts_per_rollout_batch
+            ),
+            "samples_per_prompt": self.config.samples_per_prompt,
+            "fixed_eval_enabled": self.fixed_eval_batch is not None,
+        }
+
+    def _build_fixed_eval_batch(self) -> PromptBatch:
+        """Select a deterministic prompt pool without advancing training RNG."""
+        rng_state = self._rng_state()
+        try:
+            seed_everything(self.config.fixed_eval_seed)
+            loader = DataLoader(
+                self.data_loader.dataset,
+                batch_size=self.config.prompts_per_rollout_batch,
+                shuffle=False,
+                num_workers=0,
+                drop_last=True,
+                collate_fn=self.data_loader.collate_fn,
+            )
+            motion, condition = next(iter(loader))
+        finally:
+            self._restore_rng_state(rng_state)
+        return PromptBatch(
+            motion=motion.detach().cpu(),
+            lengths=condition["y"]["lengths"].detach().cpu().long(),
+            texts=list(condition["y"]["text"]),
+        )
+
+    @torch.no_grad()
+    def evaluate_fixed_pool(self) -> dict[str, float]:
+        """Evaluate identical prompts and diffusion noise with mean embeddings."""
+        if self.fixed_eval_batch is None:
+            raise RuntimeError("Fixed evaluation is disabled.")
+
+        motion, lengths, texts, _ = repeat_prompt_batch(
+            self.fixed_eval_batch.motion,
+            self.fixed_eval_batch.lengths,
+            self.fixed_eval_batch.texts,
+            self.config.samples_per_prompt,
+        )
+        motion = motion.to(self.device, dtype=torch.float32)
+        batch_size, _, _, num_frames = motion.shape
+        model_kwargs = build_model_kwargs(
+            self.model,
+            texts,
+            lengths,
+            num_frames,
+            device=self.device,
+            guidance_scale=self.config.guidance_scale,
+        )
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(self.config.fixed_eval_seed)
+        current = torch.randn(
+            motion.shape,
+            device=self.device,
+            dtype=motion.dtype,
+            generator=generator,
+        )
+        for step in tqdm(
+            range(self.diffusion.num_timesteps - 1, -1, -1),
+            desc="fixed evaluation",
+            leave=False,
+            dynamic_ncols=True,
+        ):
+            timestep = torch.full(
+                (batch_size,),
+                step,
+                device=self.device,
+                dtype=torch.long,
+            )
+            with autocast_context(self.device, self.config.precision):
+                current, _, _ = ddim_step_with_logprob(
+                    self.diffusion,
+                    self.policy_model,
+                    current,
+                    timestep,
+                    model_kwargs=model_kwargs,
+                    eta=self.config.ddim_eta,
+                    mask=model_kwargs["y"]["mask"],
+                    clip_denoised=self.config.clip_denoised,
+                    generator=generator,
+                )
+
+        generated_motion = current.squeeze(2).permute(0, 2, 1).contiguous()
+        gt_motion = motion.squeeze(2).permute(0, 2, 1).contiguous()
+        previous_mode = self.reward_model.embedding_mode
+        self.reward_model.embedding_mode = "mean"
+        try:
+            reward_output = self.reward_model.score(
+                texts=texts,
+                generated_motion=generated_motion,
+                lengths=lengths,
+                gt_motion=gt_motion,
+            )
+        finally:
+            self.reward_model.embedding_mode = previous_mode
+
+        return {
+            "eval_reward": reward_output.total.float().mean().item(),
+            "eval_reward_std": reward_output.total.float().std(
+                unbiased=False
+            ).item(),
+            "eval_reward_retrieval": (
+                reward_output.retrieval.float().mean().item()
+            ),
+            "eval_reward_m2m": reward_output.m2m.float().mean().item(),
+            "eval_samples": float(batch_size),
         }
 
     def _next_batch(self) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -222,13 +422,19 @@ class DDPOTrainer:
     @torch.no_grad()
     def _rollout_batch(self, epoch: int, batch_index: int) -> Trajectory:
         motion, condition = self._next_batch()
+        lengths = condition["y"]["lengths"].long()
+        texts = list(condition["y"]["text"])
+        motion, lengths, texts, prompt_ids = repeat_prompt_batch(
+            motion,
+            lengths,
+            texts,
+            self.config.samples_per_prompt,
+        )
         motion = motion.to(
             self.device,
             dtype=torch.float32,
             non_blocking=self.config.pin_memory,
         )
-        lengths = condition["y"]["lengths"].long()
-        texts = list(condition["y"]["text"])
         batch_size, _, _, num_frames = motion.shape
         model_kwargs = build_model_kwargs(
             self.model,
@@ -302,6 +508,7 @@ class DDPOTrainer:
             text_embeddings=cached_text_embeddings,
             lengths=lengths.detach().cpu(),
             gt_motion=gt_motion.detach().float().cpu(),
+            prompt_ids=prompt_ids,
         )
 
     def collect_rollouts(self, epoch: int) -> Trajectory:
@@ -314,15 +521,15 @@ class DDPOTrainer:
             for batch_index in range(self.config.rollout_batches_per_epoch)
         ]
         trajectory = Trajectory.concatenate(batches)
-        reward_mean = trajectory.rewards.mean()
-        reward_std = trajectory.rewards.std(unbiased=False)
-        trajectory.advantages = (
-            trajectory.rewards - reward_mean
-        ) / (reward_std + self.config.advantage_epsilon)
-        if reward_std.item() < self.config.advantage_epsilon:
+        trajectory.advantages, trajectory.group_stats = compute_grouped_advantages(
+            trajectory.rewards,
+            trajectory.prompt_ids,
+            self.config.advantage_epsilon,
+        )
+        if trajectory.group_stats["zero_variance_prompt_fraction"] > 0:
             LOGGER.warning(
-                "Reward variance is effectively zero; this epoch has no useful "
-                "policy-gradient signal."
+                "%.1f%% of prompt groups have effectively zero reward variance.",
+                100.0 * trajectory.group_stats["zero_variance_prompt_fraction"],
             )
         return trajectory
 
@@ -532,6 +739,7 @@ class DDPOTrainer:
     def _rollout_metrics(self, trajectory: Trajectory) -> dict[str, float]:
         advantages = trajectory.advantages
         assert advantages is not None
+        group_stats = trajectory.group_stats or {}
         return {
             "reward": trajectory.rewards.mean().item(),
             "reward_std": trajectory.rewards.std(unbiased=False).item(),
@@ -540,11 +748,65 @@ class DDPOTrainer:
             "advantage_mean": advantages.mean().item(),
             "advantage_std": advantages.std(unbiased=False).item(),
             "rollout_samples": float(len(trajectory.rewards)),
+            "samples_per_prompt": float(self.config.samples_per_prompt),
+            **group_stats,
         }
 
     def _append_metrics(self, record: dict[str, Any]) -> None:
         with open(self.output_dir / "metrics.jsonl", "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _append_fixed_eval(self, record: dict[str, Any]) -> None:
+        with open(
+            self.output_dir / "fixed_eval.jsonl",
+            "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _fixed_eval_with_deltas(
+        self,
+        metrics: dict[str, float],
+    ) -> dict[str, float]:
+        if self.fixed_eval_baseline is None:
+            raise RuntimeError("Fixed evaluation baseline has not been initialized.")
+        result = dict(metrics)
+        for name in ("eval_reward", "eval_reward_retrieval", "eval_reward_m2m"):
+            result[f"{name}_baseline"] = self.fixed_eval_baseline[name]
+            result[f"{name}_delta"] = metrics[name] - self.fixed_eval_baseline[name]
+        return result
+
+    def _initialize_fixed_eval(self) -> dict[str, Any] | None:
+        if self.fixed_eval_batch is None:
+            return None
+        if self.fixed_eval_baseline is None:
+            if self.config.resume:
+                LOGGER.warning(
+                    "The resumed checkpoint has no fixed-eval baseline; using "
+                    "the resumed policy as the new baseline."
+                )
+            self.fixed_eval_baseline = self.evaluate_fixed_pool()
+        record: dict[str, Any] = {
+            "event": "baseline",
+            "epoch": self.start_epoch - 1,
+            "global_step": self.global_step,
+            **self._fixed_eval_with_deltas(self.fixed_eval_baseline),
+        }
+        self._append_fixed_eval(record)
+        LOGGER.info("fixed evaluation baseline: %s", json.dumps(record, sort_keys=True))
+        return record
+
+    def _run_fixed_eval(self, epoch: int) -> dict[str, float]:
+        metrics = self._fixed_eval_with_deltas(self.evaluate_fixed_pool())
+        self._append_fixed_eval(
+            {
+                "event": "evaluation",
+                "epoch": epoch,
+                "global_step": self.global_step,
+                **metrics,
+            }
+        )
+        return metrics
 
     def _rng_state(self) -> dict[str, Any]:
         state: dict[str, Any] = {
@@ -590,6 +852,7 @@ class DDPOTrainer:
             "optimizer": self.optimizer.state_dict(),
             "scaler": self.scaler.state_dict(),
             "rng": self._rng_state(),
+            "fixed_eval_baseline": self.fixed_eval_baseline,
         }
         torch.save(payload, temporary_path)
         os.replace(temporary_path, checkpoint_path)
@@ -618,6 +881,7 @@ class DDPOTrainer:
             self._restore_rng_state(checkpoint["rng"])
         self.start_epoch = int(checkpoint["epoch"]) + 1
         self.global_step = int(checkpoint.get("global_step", 0))
+        self.fixed_eval_baseline = checkpoint.get("fixed_eval_baseline")
         LOGGER.info(
             "Resumed from %s at epoch=%d, global_step=%d",
             checkpoint_path,
@@ -635,18 +899,34 @@ class DDPOTrainer:
             return
 
         with SwanLabTracker(self.config, self.output_dir) as tracker:
+            baseline_record = self._initialize_fixed_eval()
+            if baseline_record is not None:
+                tracker.log(
+                    format_training_metrics(
+                        baseline_record,
+                        learning_rate=float(self.optimizer.param_groups[0]["lr"]),
+                    ),
+                    step=0,
+                )
             last_saved_epoch = -1
             for epoch in range(self.start_epoch, self.config.epochs):
                 epoch_started = time.time()
                 trajectory = self.collect_rollouts(epoch)
                 rollout_metrics = self._rollout_metrics(trajectory)
                 optimization_metrics = self.optimize(trajectory)
+                fixed_eval_metrics: dict[str, float] = {}
+                if (
+                    self.fixed_eval_batch is not None
+                    and (epoch + 1) % self.config.fixed_eval_every == 0
+                ):
+                    fixed_eval_metrics = self._run_fixed_eval(epoch)
                 record: dict[str, Any] = {
                     "epoch": epoch,
                     "global_step": self.global_step,
                     "elapsed_seconds": time.time() - epoch_started,
                     **rollout_metrics,
                     **optimization_metrics,
+                    **fixed_eval_metrics,
                 }
                 self._append_metrics(record)
                 tracker.log(
@@ -654,7 +934,7 @@ class DDPOTrainer:
                         record,
                         learning_rate=float(self.optimizer.param_groups[0]["lr"]),
                     ),
-                    step=epoch,
+                    step=epoch + 1,
                 )
                 if epoch % self.config.log_every == 0:
                     LOGGER.info(

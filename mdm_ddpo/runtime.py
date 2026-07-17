@@ -72,7 +72,7 @@ def resolve_reward_device(config: TrainConfig, policy_device: torch.device) -> t
 def load_model_args(config: TrainConfig) -> SimpleNamespace:
     with open(config.model_args_path, "r", encoding="utf-8") as handle:
         values = json.load(handle)
-    values["batch_size"] = config.rollout_batch_size
+    values["batch_size"] = config.prompts_per_rollout_batch
     values["dataset"] = config.dataset
     values["device"] = (
         int(config.device.split(":", 1)[1])
@@ -127,21 +127,22 @@ def build_data_loader(config: TrainConfig) -> DataLoader:
         device=None,
         autoregressive=False,
     )
-    if len(dataset) < config.rollout_batch_size:
+    prompt_batch_size = config.prompts_per_rollout_batch
+    if len(dataset) < prompt_batch_size:
         raise ValueError(
-            f"Dataset has {len(dataset)} samples, fewer than rollout batch size "
-            f"{config.rollout_batch_size}."
+            f"Dataset has {len(dataset)} samples, fewer than prompt batch size "
+            f"{prompt_batch_size}."
         )
     collate_fn = get_collate_fn(
         config.dataset,
         hml_mode="train",
-        batch_size=config.rollout_batch_size,
+        batch_size=prompt_batch_size,
     )
     generator = torch.Generator()
     generator.manual_seed(config.seed)
     return DataLoader(
         dataset,
-        batch_size=config.rollout_batch_size,
+        batch_size=prompt_batch_size,
         shuffle=True,
         num_workers=config.data_workers,
         drop_last=True,

@@ -48,14 +48,15 @@ class TrainConfig:
     guidance_scale: float = 2.5
     ddim_eta: float = 1.0
     clip_denoised: bool = False
-    rollout_batch_size: int = 4
+    rollout_batch_size: int = 32
     rollout_batches_per_epoch: int = 4
+    samples_per_prompt: int = 4
 
-    train_batch_size: int = 4
+    train_batch_size: int = 32
     inner_epochs: int = 1
     timestep_fraction: float = 1.0
-    gradient_accumulation_steps: int = 1
-    learning_rate: float = 1.0e-4
+    gradient_accumulation_steps: int = 2
+    learning_rate: float = 3.0e-4
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_weight_decay: float = 1.0e-4
@@ -74,7 +75,10 @@ class TrainConfig:
 
     retrieval_weight: float = 1.0
     m2m_weight: float = 1.0
-    reward_embedding_mode: str = "sample"
+    reward_embedding_mode: str = "mean"
+
+    fixed_eval_every: int = 5
+    fixed_eval_seed: int = 20260717
 
     save_every: int = 1
     log_every: int = 1
@@ -109,9 +113,21 @@ class TrainConfig:
             "gradient_accumulation_steps",
             "save_every",
             "log_every",
+            "samples_per_prompt",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"--{name.replace('_', '-')} must be positive.")
+        if self.samples_per_prompt < 2:
+            raise ValueError(
+                "--samples-per-prompt must be at least 2 for grouped advantages."
+            )
+        if self.rollout_batch_size % self.samples_per_prompt != 0:
+            raise ValueError(
+                "--rollout-batch-size must be divisible by "
+                "--samples-per-prompt."
+            )
+        if self.fixed_eval_every < 0:
+            raise ValueError("--fixed-eval-every cannot be negative.")
         if not 0 < self.timestep_fraction <= 1:
             raise ValueError("--timestep-fraction must be in (0, 1].")
         if self.train_mode not in {"lora", "full"}:
@@ -157,6 +173,10 @@ class TrainConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @property
+    def prompts_per_rollout_batch(self) -> int:
+        return self.rollout_batch_size // self.samples_per_prompt
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -239,14 +259,23 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
-    rollout.add_argument("--rollout-batch-size", type=int, default=4)
+    rollout.add_argument("--rollout-batch-size", type=int, default=32)
     rollout.add_argument("--rollout-batches-per-epoch", type=int, default=4)
+    rollout.add_argument(
+        "--samples-per-prompt",
+        type=int,
+        default=4,
+        help=(
+            "Independent motions generated for each prompt. Advantages are "
+            "normalized within these prompt groups."
+        ),
+    )
 
     train = parser.add_argument_group("DDPO optimization")
     train.add_argument(
         "--train-batch-size",
         type=int,
-        default=4,
+        default=32,
         help="Number of rollout samples per PPO forward batch.",
     )
     train.add_argument("--inner-epochs", type=int, default=1)
@@ -254,13 +283,13 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument(
         "--gradient-accumulation-steps",
         type=int,
-        default=1,
+        default=2,
         help=(
             "Number of sample minibatches to accumulate; every selected "
             "diffusion timestep is included before an optimizer step."
         ),
     )
-    train.add_argument("--learning-rate", type=float, default=1.0e-4)
+    train.add_argument("--learning-rate", type=float, default=3.0e-4)
     train.add_argument("--adam-beta1", type=float, default=0.9)
     train.add_argument("--adam-beta2", type=float, default=0.999)
     train.add_argument("--adam-weight-decay", type=float, default=1.0e-4)
@@ -285,8 +314,22 @@ def build_parser() -> argparse.ArgumentParser:
     reward.add_argument(
         "--reward-embedding-mode",
         choices=["sample", "mean"],
-        default="sample",
-        help="'sample' matches RFT_MLD; 'mean' reduces reward variance.",
+        default="mean",
+        help=(
+            "'mean' is the low-variance DDPO default; 'sample' reproduces "
+            "RFT_MLD's stochastic embedding draw."
+        ),
+    )
+    reward.add_argument(
+        "--fixed-eval-every",
+        type=int,
+        default=5,
+        help="Evaluate a fixed prompt/noise pool every N epochs; 0 disables it.",
+    )
+    reward.add_argument(
+        "--fixed-eval-seed",
+        type=int,
+        default=20260717,
     )
 
     output = parser.add_argument_group("output")
@@ -343,6 +386,7 @@ def parse_config(argv: list[str] | None = None) -> TrainConfig:
         config.rollout_batch_size = 2
         config.rollout_batches_per_epoch = 1
         config.train_batch_size = 2
+        config.samples_per_prompt = 2
         config.inner_epochs = 1
         config.data_workers = 0
         config.save_every = 1

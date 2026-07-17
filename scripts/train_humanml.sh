@@ -34,16 +34,20 @@ exec "${PYTHON}" "${PROJECT_ROOT}/train_ddpo.py" \
   --sample-steps 50 \
   --guidance-scale 2.5 \
   --ddim-eta 1.0 \
-  --rollout-batch-size 4 \
+  --rollout-batch-size 32 \
   --rollout-batches-per-epoch 4 \
-  --train-batch-size 4 \
+  --samples-per-prompt 4 \
+  --train-batch-size 32 \
   --inner-epochs 1 \
-  --learning-rate 1e-4 \
+  --gradient-accumulation-steps 2 \
+  --learning-rate 3e-4 \
   --train-mode lora \
   --lora-rank 8 \
   --lora-alpha 8 \
   --retrieval-weight 1.0 \
   --m2m-weight 1.0 \
+  --reward-embedding-mode mean \
+  --fixed-eval-every 5 \
   "${SWANLAB_FLAG}" \
   --swanlab-project "${DDPO_SWANLAB_PROJECT}" \
   --swanlab-run-name "${DDPO_SWANLAB_RUN_NAME}" \

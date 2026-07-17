@@ -15,6 +15,8 @@
 - 实现随机 DDIM transition 的采样及可重算 log-probability。
 - 保存 rollout 中的 `x_t`、`x_{t-1}`、timestep 和旧策略 log-probability。
 - 使用标准 PPO clipped objective 执行 DDPO 更新。
+- 每个文本生成多个独立 motion，并只在同一文本组内标准化 advantage，
+  避免不同文本/GT 难度差异主导策略梯度。
 - 对 HumanML3D padding 帧做掩码，padding 不参与策略似然。
 - 排除确定性的 `t=0` transition，只使用随机 transition 做策略梯度。
 - 支持全参数训练和无额外依赖的参数化 LoRA；默认使用 LoRA。
@@ -60,6 +62,16 @@ reward 是 terminal motion 上的：
 reward = retrieval_weight * cosine(text, generated)
        + m2m_weight       * cosine(gt_motion, generated)
 ```
+
+对每个 prompt 生成 `K` 个 motion，并计算组内 advantage：
+
+```text
+A[i, k] = (reward[i, k] - mean_k(reward[i, k]))
+          / (std_k(reward[i, k]) + eps)
+```
+
+此外，每隔若干 epoch 使用固定 prompt、固定扩散噪声和 MotionReward mean
+embedding 做验证，得到可跨 checkpoint 比较的 `eval/reward_*` 曲线。
 
 ## 环境
 
@@ -113,6 +125,7 @@ python train_ddpo.py \
   --data-workers 0 \
   --sample-steps 4 \
   --rollout-batch-size 2 \
+  --samples-per-prompt 2 \
   --output-dir /tmp/mdm-ddpo-preflight
 ```
 
@@ -126,20 +139,26 @@ python train_ddpo.py \
   --output-dir outputs/humanml_retrieval_m2m \
   --epochs 100 \
   --sample-steps 50 \
-  --rollout-batch-size 4 \
+  --rollout-batch-size 32 \
   --rollout-batches-per-epoch 4 \
-  --train-batch-size 4 \
+  --samples-per-prompt 4 \
+  --train-batch-size 32 \
   --inner-epochs 1 \
-  --gradient-accumulation-steps 1 \
-  --learning-rate 1e-4 \
+  --gradient-accumulation-steps 2 \
+  --learning-rate 3e-4 \
   --guidance-scale 2.5 \
   --ddim-eta 1.0 \
   --train-mode lora \
   --lora-rank 8 \
   --lora-alpha 8 \
   --retrieval-weight 1.0 \
-  --m2m-weight 1.0
+  --m2m-weight 1.0 \
+  --reward-embedding-mode mean
 ```
+
+上述配置每个 rollout batch 包含 8 个不同 prompt，每个 prompt 生成 4 个
+motion；每个 epoch 共 128 个 motion、32 个不同 prompt、2 次 optimizer
+更新，有效优化 batch 为 64。
 
 也可以使用启动脚本：
 
@@ -201,13 +220,15 @@ python train_ddpo.py \
 | `--sample-steps` | 采样步数；0 使用 checkpoint 的 diffusion step 数 |
 | `--ddim-eta` | transition 随机性；DDPO 要求大于 0 |
 | `--guidance-scale` | MDM classifier-free guidance scale |
+| `--samples-per-prompt` | 每个 prompt 的独立生成数；默认 4，组内计算 advantage |
 | `--timestep-fraction` | 每个样本用于 PPO 的 transition 比例 |
 | `--train-batch-size` | 每次 PPO forward 使用的 rollout 样本数 |
 | `--gradient-accumulation-steps` | 累积多少个样本 minibatch；每个 minibatch 的所选 timesteps 会先全部累积 |
 | `--clip-range` | PPO ratio clipping 范围，默认与 ddpo-pytorch 一致为 `1e-4` |
 | `--train-mode` | `lora` 或 `full` |
-| `--reward-embedding-mode sample` | 与 RFT_MLD 一样从 embedding distribution 采样 |
-| `--reward-embedding-mode mean` | 使用 distribution mean，奖励方差更低 |
+| `--reward-embedding-mode mean` | 默认；使用 distribution mean，降低策略梯度中的奖励噪声 |
+| `--reward-embedding-mode sample` | 与 RFT_MLD 一样从 embedding distribution 随机采样 |
+| `--fixed-eval-every` | 固定 prompt/noise 验证间隔；默认每 5 epochs，0 表示关闭 |
 | `--reward-device cpu` | GPU 显存不足时将 MotionReward/T5 放在 CPU |
 | `--data-cache-dir` | 可写共享数据缓存；默认是项目下的 `.cache/mdm` |
 | `--use-swanlab` | 启用 SwanLab epoch 级训练曲线记录；默认关闭 |
@@ -221,14 +242,21 @@ python train_ddpo.py \
 OUTPUT_DIR/
 ├── config.json
 ├── metrics.jsonl
+├── fixed_eval.jsonl        # 固定 prompt/noise 验证及相对 baseline 增量
 ├── swanlab/                 # 启用 SwanLab 时生成
 ├── checkpoint_000000.pt
 └── latest.pt
 ```
 
-SwanLab 中记录的曲线包括 `reward/{total,retrieval,m2m,std}`、
+SwanLab 中记录的曲线包括 `reward/{total,retrieval,m2m,std}`、组内/组间
+reward 方差、`eval/{reward_total,reward_retrieval,reward_m2m}`、
 `ppo/{loss,approx_kl,clip_fraction,ratio}`、
 `optimization/{grad_norm,skipped_updates,learning_rate}`、训练进度和每轮耗时。
+
+`reward/total` 是每轮随机 prompt 和随机 motion 的 rollout 均值，不同 epoch
+之间的 prompt 难度组成不同，因此不应把它当作主要收敛曲线。判断训练是否真正
+改善时，请优先观察固定 prompt、固定噪声的 `eval/reward_total_delta`，并同时
+确认 `eval/reward_retrieval_delta` 和 `eval/reward_m2m_delta` 的方向。
 
 首次加载 train split 时还会生成约 3.5 GB 的共享缓存：
 
