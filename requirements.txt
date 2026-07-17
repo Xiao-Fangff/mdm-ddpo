@@ -1,0 +1,11 @@
+numpy
+torch
+tqdm
+transformers
+sentence-transformers
+omegaconf
+spacy
+swanlab>=0.9,<1
+smplx
+trimesh
+git+https://github.com/openai/CLIP.git

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mdm-ddpo"
+version = "0.1.0"
+description = "DDPO fine-tuning for Motion Diffusion Model with MotionReward"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "torch",
+  "tqdm",
+  "transformers",
+  "sentence-transformers",
+  "omegaconf",
+  "spacy",
+  "swanlab>=0.9,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
