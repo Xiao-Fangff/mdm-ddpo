@@ -27,6 +27,30 @@ class RewardCompositionTest(unittest.TestCase):
         converted = reward._to_reward_normalization(mdm_normalized)
         torch.testing.assert_close(converted, torch.tensor([[[2.0, -0.5]]]))
 
+    def test_mean_embedding_scoring_preserves_rng_state(self):
+        reward = MotionReward.__new__(MotionReward)
+        reward.device = torch.device("cpu")
+        reward.embedding_mode = "mean"
+        torch.manual_seed(123)
+        before = torch.get_rng_state()
+
+        with reward._embedding_rng_context():
+            torch.randn(8)
+
+        torch.testing.assert_close(torch.get_rng_state(), before)
+
+    def test_sample_embedding_scoring_advances_rng_state(self):
+        reward = MotionReward.__new__(MotionReward)
+        reward.device = torch.device("cpu")
+        reward.embedding_mode = "sample"
+        torch.manual_seed(123)
+        before = torch.get_rng_state()
+
+        with reward._embedding_rng_context():
+            torch.randn(8)
+
+        self.assertFalse(torch.equal(torch.get_rng_state(), before))
+
 
 if __name__ == "__main__":
     unittest.main()

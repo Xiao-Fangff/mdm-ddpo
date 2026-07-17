@@ -39,8 +39,10 @@ exec "${PYTHON}" "${PROJECT_ROOT}/train_ddpo.py" \
   --samples-per-prompt 4 \
   --train-batch-size 32 \
   --inner-epochs 1 \
+  --timestep-fraction 0.5 \
   --gradient-accumulation-steps 2 \
   --learning-rate 3e-4 \
+  --advantage-mode group_whiten \
   --train-mode lora \
   --lora-rank 8 \
   --lora-alpha 8 \
@@ -48,6 +50,8 @@ exec "${PYTHON}" "${PROJECT_ROOT}/train_ddpo.py" \
   --m2m-weight 1.0 \
   --reward-embedding-mode mean \
   --fixed-eval-every 5 \
+  --fixed-eval-prompts 32 \
+  --early-stop-patience 8 \
   "${SWANLAB_FLAG}" \
   --swanlab-project "${DDPO_SWANLAB_PROJECT}" \
   --swanlab-run-name "${DDPO_SWANLAB_RUN_NAME}" \

@@ -30,6 +30,7 @@ class TrainConfig:
     reward_t5_path: str = DEFAULT_MOTIONRFT_ROOT + "/deps/sentence-t5-large"
     output_dir: str = "outputs/mdm_ddpo"
     resume: str = ""
+    reset_optimizer_on_resume: bool = False
 
     dataset: str = "humanml"
     split: str = "train"
@@ -54,7 +55,7 @@ class TrainConfig:
 
     train_batch_size: int = 32
     inner_epochs: int = 1
-    timestep_fraction: float = 1.0
+    timestep_fraction: float = 0.5
     gradient_accumulation_steps: int = 2
     learning_rate: float = 3.0e-4
     adam_beta1: float = 0.9
@@ -65,6 +66,7 @@ class TrainConfig:
     clip_range: float = 1.0e-4
     adv_clip_max: float = 5.0
     advantage_epsilon: float = 1.0e-8
+    advantage_mode: str = "group_whiten"
 
     train_mode: str = "lora"
     lora_rank: int = 8
@@ -79,6 +81,9 @@ class TrainConfig:
 
     fixed_eval_every: int = 5
     fixed_eval_seed: int = 20260717
+    fixed_eval_prompts: int = 32
+    early_stop_patience: int = 8
+    early_stop_min_delta: float = 0.0
 
     save_every: int = 1
     log_every: int = 1
@@ -114,6 +119,7 @@ class TrainConfig:
             "save_every",
             "log_every",
             "samples_per_prompt",
+            "fixed_eval_prompts",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"--{name.replace('_', '-')} must be positive.")
@@ -128,6 +134,14 @@ class TrainConfig:
             )
         if self.fixed_eval_every < 0:
             raise ValueError("--fixed-eval-every cannot be negative.")
+        if self.early_stop_patience < 0:
+            raise ValueError("--early-stop-patience cannot be negative.")
+        if self.early_stop_min_delta < 0:
+            raise ValueError("--early-stop-min-delta cannot be negative.")
+        if self.advantage_mode not in {"group_centered", "group_whiten"}:
+            raise ValueError(
+                "--advantage-mode must be 'group_centered' or 'group_whiten'."
+            )
         if not 0 < self.timestep_fraction <= 1:
             raise ValueError("--timestep-fraction must be in (0, 1].")
         if self.train_mode not in {"lora", "full"}:
@@ -209,6 +223,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     paths.add_argument("--output-dir", default=TrainConfig.output_dir)
     paths.add_argument("--resume", default="", help="DDPO checkpoint to resume.")
+    paths.add_argument(
+        "--reset-optimizer-on-resume",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Load policy weights and training position from --resume, but "
+            "start AdamW and GradScaler from fresh state. Recommended when "
+            "migrating an older run to materially different DDPO settings."
+        ),
+    )
 
     data = parser.add_argument_group("data")
     data.add_argument("--dataset", default="humanml", choices=["humanml"])
@@ -279,7 +303,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of rollout samples per PPO forward batch.",
     )
     train.add_argument("--inner-epochs", type=int, default=1)
-    train.add_argument("--timestep-fraction", type=float, default=1.0)
+    train.add_argument(
+        "--timestep-fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Fraction of stochastic diffusion transitions sampled per motion "
+            "for each PPO epoch. The validated 50-step default is 0.5."
+        ),
+    )
     train.add_argument(
         "--gradient-accumulation-steps",
         type=int,
@@ -298,6 +330,16 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--clip-range", type=float, default=1.0e-4)
     train.add_argument("--adv-clip-max", type=float, default=5.0)
     train.add_argument("--advantage-epsilon", type=float, default=1.0e-8)
+    train.add_argument(
+        "--advantage-mode",
+        choices=["group_centered", "group_whiten"],
+        default="group_whiten",
+        help=(
+            "Subtract each prompt's reward mean, then either divide by every "
+            "prompt's own standard deviation (group_whiten, validated default) "
+            "or apply one global scale (group_centered)."
+        ),
+    )
 
     policy = parser.add_argument_group("policy parameters")
     policy.add_argument("--train-mode", choices=["lora", "full"], default="lora")
@@ -330,6 +372,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--fixed-eval-seed",
         type=int,
         default=20260717,
+    )
+    reward.add_argument(
+        "--fixed-eval-prompts",
+        type=int,
+        default=32,
+        help="Number of deterministic prompts in the fixed evaluation pool.",
+    )
+    reward.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=8,
+        help=(
+            "Stop after this many fixed evaluations without a new best reward; "
+            "0 disables early stopping."
+        ),
+    )
+    reward.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum fixed-eval reward increase required to reset patience.",
     )
 
     output = parser.add_argument_group("output")
@@ -387,6 +450,7 @@ def parse_config(argv: list[str] | None = None) -> TrainConfig:
         config.rollout_batches_per_epoch = 1
         config.train_batch_size = 2
         config.samples_per_prompt = 2
+        config.fixed_eval_prompts = 1
         config.inner_epochs = 1
         config.data_workers = 0
         config.save_every = 1

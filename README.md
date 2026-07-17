@@ -17,6 +17,8 @@
 - 使用标准 PPO clipped objective 执行 DDPO 更新。
 - 每个文本生成多个独立 motion，并只在同一文本组内标准化 advantage，
   避免不同文本/GT 难度差异主导策略梯度。
+- 默认每个 motion 随机选取一半的随机 diffusion transitions 做 PPO，减少
+  同一个 terminal reward 在过多 timestep 上产生的共享梯度干扰。
 - 对 HumanML3D padding 帧做掩码，padding 不参与策略似然。
 - 排除确定性的 `t=0` transition，只使用随机 transition 做策略梯度。
 - 支持全参数训练和无额外依赖的参数化 LoRA；默认使用 LoRA。
@@ -32,6 +34,10 @@
   数据统计量重新归一化，避免两个参考项目的 Mean/Std 文件差异造成输入域偏移。
 
 - 支持断点保存与恢复，LoRA 模式只保存可训练参数。
+- 使用 32 个固定 prompt 和固定扩散噪声做确定性验证，自动维护 `best.pt`，
+  并支持按固定验证曲线 early stopping。
+- MotionReward mean embedding 模式隔离其编码器内部 `rsample()` 消耗的随机数，
+  固定验证不会再改变后续 rollout 的 CUDA RNG 序列。
 - 可选接入 SwanLab，按 epoch 记录 reward、PPO、梯度与耗时训练曲线。
 - 数据缓存写入本项目共享的 `.cache/mdm`，不会写入参考仓库。
 
@@ -69,6 +75,9 @@ reward = retrieval_weight * cosine(text, generated)
 A[i, k] = (reward[i, k] - mean_k(reward[i, k]))
           / (std_k(reward[i, k]) + eps)
 ```
+
+这是验证后的默认 `group_whiten` 模式。`group_centered` 模式仍可用于诊断：
+它先逐 prompt 减均值，再统一除以所有 centered rewards 的全局标准差。
 
 此外，每隔若干 epoch 使用固定 prompt、固定扩散噪声和 MotionReward mean
 embedding 做验证，得到可跨 checkpoint 比较的 `eval/reward_*` 曲线。
@@ -144,8 +153,10 @@ python train_ddpo.py \
   --samples-per-prompt 4 \
   --train-batch-size 32 \
   --inner-epochs 1 \
+  --timestep-fraction 0.5 \
   --gradient-accumulation-steps 2 \
   --learning-rate 3e-4 \
+  --advantage-mode group_whiten \
   --guidance-scale 2.5 \
   --ddim-eta 1.0 \
   --train-mode lora \
@@ -153,7 +164,10 @@ python train_ddpo.py \
   --lora-alpha 8 \
   --retrieval-weight 1.0 \
   --m2m-weight 1.0 \
-  --reward-embedding-mode mean
+  --reward-embedding-mode mean \
+  --fixed-eval-every 5 \
+  --fixed-eval-prompts 32 \
+  --early-stop-patience 8
 ```
 
 上述配置每个 rollout batch 包含 8 个不同 prompt，每个 prompt 生成 4 个
@@ -221,14 +235,18 @@ python train_ddpo.py \
 | `--ddim-eta` | transition 随机性；DDPO 要求大于 0 |
 | `--guidance-scale` | MDM classifier-free guidance scale |
 | `--samples-per-prompt` | 每个 prompt 的独立生成数；默认 4，组内计算 advantage |
-| `--timestep-fraction` | 每个样本用于 PPO 的 transition 比例 |
+| `--timestep-fraction` | 每个样本用于 PPO 的 transition 比例；50 步训练验证默认 `0.5` |
 | `--train-batch-size` | 每次 PPO forward 使用的 rollout 样本数 |
 | `--gradient-accumulation-steps` | 累积多少个样本 minibatch；每个 minibatch 的所选 timesteps 会先全部累积 |
 | `--clip-range` | PPO ratio clipping 范围，默认与 ddpo-pytorch 一致为 `1e-4` |
+| `--advantage-mode` | 默认 `group_whiten`；可选 `group_centered` 做全局尺度的组内中心化 |
 | `--train-mode` | `lora` 或 `full` |
 | `--reward-embedding-mode mean` | 默认；使用 distribution mean，降低策略梯度中的奖励噪声 |
 | `--reward-embedding-mode sample` | 与 RFT_MLD 一样从 embedding distribution 随机采样 |
 | `--fixed-eval-every` | 固定 prompt/noise 验证间隔；默认每 5 epochs，0 表示关闭 |
+| `--fixed-eval-prompts` | 固定验证 prompt 数；默认 32，每个 prompt 仍生成 `samples-per-prompt` 个 motion |
+| `--early-stop-patience` | 连续多少次固定验证未创新高后停止；默认 8，0 表示关闭 |
+| `--reset-optimizer-on-resume` | 仅恢复 policy/epoch/RNG，重置 AdamW 与 GradScaler；迁移旧算法配置时使用 |
 | `--reward-device cpu` | GPU 显存不足时将 MotionReward/T5 放在 CPU |
 | `--data-cache-dir` | 可写共享数据缓存；默认是项目下的 `.cache/mdm` |
 | `--use-swanlab` | 启用 SwanLab epoch 级训练曲线记录；默认关闭 |
@@ -245,6 +263,7 @@ OUTPUT_DIR/
 ├── fixed_eval.jsonl        # 固定 prompt/noise 验证及相对 baseline 增量
 ├── swanlab/                 # 启用 SwanLab 时生成
 ├── checkpoint_000000.pt
+├── best.pt                  # 起始 policy 或固定验证 reward 创新高的最佳权重
 └── latest.pt
 ```
 
@@ -257,6 +276,23 @@ reward 方差、`eval/{reward_total,reward_retrieval,reward_m2m}`、
 之间的 prompt 难度组成不同，因此不应把它当作主要收敛曲线。判断训练是否真正
 改善时，请优先观察固定 prompt、固定噪声的 `eval/reward_total_delta`，并同时
 确认 `eval/reward_retrieval_delta` 和 `eval/reward_m2m_delta` 的方向。
+
+在同一随机种子、32 prompts / 128 motions 固定池上的 20-epoch 回归中：
+
+| advantage / timestep | 最佳 `eval_reward_delta` | 最终 `eval_reward_delta` |
+| --- | ---: | ---: |
+| `group_whiten / 0.5` | `+0.002656` | `+0.002656` |
+| `group_whiten / 1.0` | `+0.001586` | `+0.000150` |
+| `group_centered / 0.5` | `+0.000938` | `+0.000676` |
+
+因此默认采用 `group_whiten / 0.5`。固定验证可能连续多次回撤后重新创新高，
+实测曾在连续 6 次未创新高后恢复，所以默认 patience 设为 8，而不是 2。
+另一次迁移回归从旧版全 timestep 训练的 epoch 9 checkpoint 出发，重置 Adam
+并用新默认配置继续 10 epochs；固定池相对该 checkpoint 再提升 `+0.001466`，
+相对原始预训练累计提升 `+0.003309`，说明旧版早期最佳权重可以安全迁移。
+固定验证记录还保存采样步数、物理评估 batch、guidance、eta、精度和奖励权重
+签名；恢复训练时如果这些设置改变，会自动以恢复后的 policy 建立新 baseline，
+避免把两个不同验证过程的数值直接相减。
 
 首次加载 train split 时还会生成约 3.5 GB 的共享缓存：
 
@@ -276,6 +312,21 @@ python train_ddpo.py \
 ```
 
 恢复时 `--train-mode`、LoRA rank/target 和基础 MDM checkpoint 必须与原训练一致。
+CLI 中的 learning rate、Adam betas、weight decay 和 epsilon 会覆盖 checkpoint
+保存的旧超参数，但默认仍恢复 Adam 的动量状态。
+
+如果从旧版训练迁移到新的 advantage/timestep 配置，建议新建输出目录并重置
+optimizer 状态：
+
+```bash
+python train_ddpo.py \
+  --resume outputs/old_run/checkpoint_000009.pt \
+  --reset-optimizer-on-resume \
+  --output-dir outputs/migrated_run \
+  --epochs 100 \
+  --advantage-mode group_whiten \
+  --timestep-fraction 0.5
+```
 
 ## 导出为标准 MDM checkpoint
 

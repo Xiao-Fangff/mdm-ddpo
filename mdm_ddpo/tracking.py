@@ -53,6 +53,13 @@ TRAINING_METRIC_NAMES = {
     "reward_m2m": "reward/m2m",
     "reward_within_prompt_std": "reward/within_prompt_std",
     "reward_between_prompt_std": "reward/between_prompt_std",
+    "reward_centered_std": "reward/centered_std",
+    "reward_group_std_min": "reward/group_std_min",
+    "reward_group_std_median": "reward/group_std_median",
+    "reward_group_std_max": "reward/group_std_max",
+    "potential_group_whiten_scale_max": (
+        "reward/potential_group_whiten_scale_max"
+    ),
     "zero_variance_prompt_fraction": "reward/zero_variance_prompt_fraction",
     "advantage_mean": "ppo/advantage_mean",
     "advantage_std": "ppo/advantage_std",
@@ -79,6 +86,15 @@ TRAINING_METRIC_NAMES = {
     "eval_reward_retrieval_baseline": "eval/reward_retrieval_baseline",
     "eval_reward_m2m_baseline": "eval/reward_m2m_baseline",
     "eval_samples": "eval/samples",
+    "eval_prompts": "eval/prompts",
+    "eval_seed": "eval/seed",
+    "eval_batch_size": "eval/batch_size",
+    "eval_diffusion_steps": "eval/diffusion_steps",
+    "eval_is_best": "eval/is_best",
+    "eval_best_reward": "eval/best_reward_total",
+    "eval_best_reward_delta": "eval/best_reward_total_delta",
+    "eval_best_epoch": "eval/best_epoch",
+    "eval_evals_without_improvement": "eval/evals_without_improvement",
 }
 
 

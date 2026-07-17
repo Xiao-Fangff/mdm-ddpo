@@ -169,6 +169,20 @@ class MotionReward:
         value = distribution.loc if self.embedding_mode == "mean" else latent
         return value.squeeze(0)
 
+    def _embedding_rng_context(self):
+        """Keep deterministic mean rewards from perturbing training RNG."""
+        devices: list[int] = []
+        if self.device.type == "cuda":
+            devices.append(
+                self.device.index
+                if self.device.index is not None
+                else torch.cuda.current_device()
+            )
+        return torch.random.fork_rng(
+            devices=devices,
+            enabled=self.embedding_mode == "mean",
+        )
+
     def _text_embedding(self, texts: list[str]) -> torch.Tensor:
         from motionreward.models.lora_retrieval import process_T5_outputs
 
@@ -228,36 +242,40 @@ class MotionReward:
             dtype=torch.long,
         )
 
-        if self.retrieval_weight != 0:
-            # RFT_MLD invokes the motion encoder independently for each reward.
-            generated_retrieval_embedding = self._motion_embedding(
-                generated,
-                length_list,
-                timestep=clean_timestep,
-            )
-            text_embedding = self._text_embedding(texts)
-            retrieval = F.cosine_similarity(
-                text_embedding,
-                generated_retrieval_embedding,
-                dim=-1,
-            )
-        else:
-            retrieval = torch.zeros(batch, device=self.device)
+        # MotionReward's encoders call dist.rsample() even when we select the
+        # distribution mean. Forking RNG here makes mean-mode scoring truly
+        # deterministic from the training loop's point of view.
+        with self._embedding_rng_context():
+            if self.retrieval_weight != 0:
+                # RFT_MLD invokes the motion encoder independently per reward.
+                generated_retrieval_embedding = self._motion_embedding(
+                    generated,
+                    length_list,
+                    timestep=clean_timestep,
+                )
+                text_embedding = self._text_embedding(texts)
+                retrieval = F.cosine_similarity(
+                    text_embedding,
+                    generated_retrieval_embedding,
+                    dim=-1,
+                )
+            else:
+                retrieval = torch.zeros(batch, device=self.device)
 
-        if self.m2m_weight != 0:
-            gt_embedding = self._motion_embedding(ground_truth, length_list)
-            generated_m2m_embedding = self._motion_embedding(
-                generated,
-                length_list,
-                timestep=clean_timestep,
-            )
-            m2m = F.cosine_similarity(
-                gt_embedding,
-                generated_m2m_embedding,
-                dim=-1,
-            )
-        else:
-            m2m = torch.zeros(batch, device=self.device)
+            if self.m2m_weight != 0:
+                gt_embedding = self._motion_embedding(ground_truth, length_list)
+                generated_m2m_embedding = self._motion_embedding(
+                    generated,
+                    length_list,
+                    timestep=clean_timestep,
+                )
+                m2m = F.cosine_similarity(
+                    gt_embedding,
+                    generated_m2m_embedding,
+                    dim=-1,
+                )
+            else:
+                m2m = torch.zeros(batch, device=self.device)
 
         total = combine_reward_components(
             retrieval,

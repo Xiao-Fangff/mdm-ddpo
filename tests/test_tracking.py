@@ -135,8 +135,14 @@ class SwanLabTrackerTest(unittest.TestCase):
                 "elapsed_seconds": 8.0,
                 "reward_within_prompt_std": 0.2,
                 "reward_between_prompt_std": 0.7,
+                "reward_group_std_min": 0.01,
+                "potential_group_whiten_scale_max": 100.0,
                 "eval_reward": 1.6,
                 "eval_reward_delta": 0.03,
+                "eval_batch_size": 32,
+                "eval_diffusion_steps": 50,
+                "eval_best_reward": 1.62,
+                "eval_best_epoch": 2,
             },
             learning_rate=1.0e-4,
         )
@@ -150,8 +156,17 @@ class SwanLabTrackerTest(unittest.TestCase):
         self.assertEqual(metrics["optimization/learning_rate"], 1.0e-4)
         self.assertEqual(metrics["reward/within_prompt_std"], 0.2)
         self.assertEqual(metrics["reward/between_prompt_std"], 0.7)
+        self.assertEqual(metrics["reward/group_std_min"], 0.01)
+        self.assertEqual(
+            metrics["reward/potential_group_whiten_scale_max"],
+            100.0,
+        )
         self.assertEqual(metrics["eval/reward_total"], 1.6)
         self.assertEqual(metrics["eval/reward_total_delta"], 0.03)
+        self.assertEqual(metrics["eval/batch_size"], 32)
+        self.assertEqual(metrics["eval/diffusion_steps"], 50)
+        self.assertEqual(metrics["eval/best_reward_total"], 1.62)
+        self.assertEqual(metrics["eval/best_epoch"], 2)
 
 
 if __name__ == "__main__":

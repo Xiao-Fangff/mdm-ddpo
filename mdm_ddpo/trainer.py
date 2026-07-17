@@ -47,6 +47,38 @@ from .tracking import SwanLabTracker, format_training_metrics
 LOGGER = logging.getLogger(__name__)
 
 
+def apply_optimizer_hyperparameters(
+    optimizer: torch.optim.Optimizer,
+    config: TrainConfig,
+) -> None:
+    """Make current CLI optimizer settings authoritative after resume."""
+    for parameter_group in optimizer.param_groups:
+        parameter_group.update(
+            {
+                "lr": config.learning_rate,
+                "betas": (config.adam_beta1, config.adam_beta2),
+                "weight_decay": config.adam_weight_decay,
+                "eps": config.adam_epsilon,
+            }
+        )
+
+
+def restore_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    checkpoint: dict[str, Any],
+    config: TrainConfig,
+) -> bool:
+    """Restore optimizer state unless this resume is an algorithm migration."""
+    if config.reset_optimizer_on_resume:
+        return False
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    apply_optimizer_hyperparameters(optimizer, config)
+    if checkpoint.get("scaler"):
+        scaler.load_state_dict(checkpoint["scaler"])
+    return True
+
+
 @dataclass(frozen=True)
 class PromptBatch:
     motion: torch.Tensor
@@ -81,14 +113,17 @@ def compute_grouped_advantages(
     rewards: torch.Tensor,
     prompt_ids: torch.Tensor,
     epsilon: float,
+    mode: str = "group_whiten",
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Whiten rewards within each prompt instead of across prompt difficulty."""
+    """Remove prompt difficulty with a selectable within-group reward scale."""
     if rewards.ndim != 1 or prompt_ids.shape != rewards.shape:
         raise ValueError("Rewards and prompt_ids must be matching 1-D tensors.")
     if epsilon <= 0:
         raise ValueError("Advantage epsilon must be positive.")
+    if mode not in {"group_centered", "group_whiten"}:
+        raise ValueError(f"Unknown grouped advantage mode: {mode!r}.")
 
-    advantages = torch.zeros_like(rewards)
+    centered_rewards = torch.zeros_like(rewards)
     group_means: list[torch.Tensor] = []
     group_stds: list[torch.Tensor] = []
     unique_prompt_ids = torch.unique(prompt_ids, sorted=True)
@@ -101,16 +136,32 @@ def compute_grouped_advantages(
             )
         group_mean = group_rewards.mean()
         group_std = group_rewards.std(unbiased=False)
-        advantages[mask] = (group_rewards - group_mean) / (group_std + epsilon)
+        centered_rewards[mask] = group_rewards - group_mean
         group_means.append(group_mean)
         group_stds.append(group_std)
 
     means = torch.stack(group_means)
     stds = torch.stack(group_stds)
+    centered_std = centered_rewards.std(unbiased=False)
+    if mode == "group_whiten":
+        advantages = torch.zeros_like(rewards)
+        for prompt_id, group_std in zip(unique_prompt_ids, stds):
+            mask = prompt_ids == prompt_id
+            advantages[mask] = centered_rewards[mask] / (group_std + epsilon)
+    else:
+        advantages = centered_rewards / (centered_std + epsilon)
+
     stats = {
         "unique_prompts": float(len(unique_prompt_ids)),
         "reward_within_prompt_std": stds.mean().item(),
         "reward_between_prompt_std": means.std(unbiased=False).item(),
+        "reward_centered_std": centered_std.item(),
+        "reward_group_std_min": stds.min().item(),
+        "reward_group_std_median": stds.median().item(),
+        "reward_group_std_max": stds.max().item(),
+        "potential_group_whiten_scale_max": (
+            1.0 / stds.min().clamp_min(epsilon)
+        ).item(),
         "zero_variance_prompt_fraction": (
             (stds < epsilon).float().mean().item()
         ),
@@ -239,6 +290,9 @@ class DDPOTrainer:
         self.start_epoch = 0
         self.global_step = 0
         self.fixed_eval_baseline: dict[str, float] | None = None
+        self.best_eval_reward: float | None = None
+        self.best_eval_epoch: int | None = None
+        self.evals_without_improvement = 0
         if config.resume:
             self._load_checkpoint(config.resume)
         self.fixed_eval_batch = (
@@ -304,30 +358,87 @@ class DDPOTrainer:
                 self.config.prompts_per_rollout_batch
             ),
             "samples_per_prompt": self.config.samples_per_prompt,
+            "advantage_mode": self.config.advantage_mode,
+            "timestep_fraction": self.config.timestep_fraction,
             "fixed_eval_enabled": self.fixed_eval_batch is not None,
+            "fixed_eval_prompts": self.config.fixed_eval_prompts,
+            "early_stop_patience": self.config.early_stop_patience,
         }
 
     def _build_fixed_eval_batch(self) -> PromptBatch:
         """Select a deterministic prompt pool without advancing training RNG."""
+        from data_loaders.get_data import get_collate_fn
+
+        if len(self.data_loader.dataset) < self.config.fixed_eval_prompts:
+            raise ValueError(
+                "Dataset has fewer samples than --fixed-eval-prompts: "
+                f"{len(self.data_loader.dataset)} < "
+                f"{self.config.fixed_eval_prompts}."
+            )
         rng_state = self._rng_state()
         try:
             seed_everything(self.config.fixed_eval_seed)
             loader = DataLoader(
                 self.data_loader.dataset,
-                batch_size=self.config.prompts_per_rollout_batch,
+                batch_size=self.config.fixed_eval_prompts,
                 shuffle=False,
                 num_workers=0,
                 drop_last=True,
-                collate_fn=self.data_loader.collate_fn,
+                collate_fn=get_collate_fn(
+                    self.config.dataset,
+                    hml_mode="train",
+                    batch_size=self.config.fixed_eval_prompts,
+                ),
             )
             motion, condition = next(iter(loader))
         finally:
             self._restore_rng_state(rng_state)
+        prompt_count = motion.shape[0]
+        if (
+            prompt_count != self.config.fixed_eval_prompts
+            or len(condition["y"]["text"]) != prompt_count
+            or len(condition["y"]["lengths"]) != prompt_count
+        ):
+            raise RuntimeError(
+                "Fixed-eval collate returned an unexpected prompt count: "
+                f"expected={self.config.fixed_eval_prompts}, "
+                f"motion={prompt_count}, "
+                f"text={len(condition['y']['text'])}, "
+                f"lengths={len(condition['y']['lengths'])}."
+            )
         return PromptBatch(
             motion=motion.detach().cpu(),
             lengths=condition["y"]["lengths"].detach().cpu().long(),
             texts=list(condition["y"]["text"]),
         )
+
+    def _fixed_eval_signature(self) -> dict[str, float]:
+        """Describe every setting that changes the deterministic eval pool."""
+        prompt_batch_size = min(
+            self.config.fixed_eval_prompts,
+            self.config.prompts_per_rollout_batch,
+        )
+        precision_code = {"no": 0.0, "fp16": 1.0, "bf16": 2.0}
+        return {
+            "eval_samples": float(
+                self.config.fixed_eval_prompts
+                * self.config.samples_per_prompt
+            ),
+            "eval_prompts": float(self.config.fixed_eval_prompts),
+            "eval_seed": float(self.config.fixed_eval_seed),
+            "eval_prompt_batch_size": float(prompt_batch_size),
+            "eval_batch_size": float(
+                prompt_batch_size * self.config.samples_per_prompt
+            ),
+            "eval_diffusion_steps": float(self.diffusion.num_timesteps),
+            "eval_guidance_scale": float(self.config.guidance_scale),
+            "eval_ddim_eta": float(self.config.ddim_eta),
+            "eval_clip_denoised": float(self.config.clip_denoised),
+            "eval_precision_code": precision_code[self.config.precision],
+            "eval_allow_tf32": float(self.config.allow_tf32),
+            "eval_retrieval_weight": float(self.config.retrieval_weight),
+            "eval_m2m_weight": float(self.config.m2m_weight),
+        }
 
     @torch.no_grad()
     def evaluate_fixed_pool(self) -> dict[str, float]:
@@ -335,79 +446,108 @@ class DDPOTrainer:
         if self.fixed_eval_batch is None:
             raise RuntimeError("Fixed evaluation is disabled.")
 
-        motion, lengths, texts, _ = repeat_prompt_batch(
-            self.fixed_eval_batch.motion,
-            self.fixed_eval_batch.lengths,
-            self.fixed_eval_batch.texts,
-            self.config.samples_per_prompt,
-        )
-        motion = motion.to(self.device, dtype=torch.float32)
-        batch_size, _, _, num_frames = motion.shape
-        model_kwargs = build_model_kwargs(
-            self.model,
-            texts,
-            lengths,
-            num_frames,
-            device=self.device,
-            guidance_scale=self.config.guidance_scale,
-        )
         generator = torch.Generator(device=self.device)
         generator.manual_seed(self.config.fixed_eval_seed)
-        current = torch.randn(
-            motion.shape,
-            device=self.device,
-            dtype=motion.dtype,
-            generator=generator,
-        )
-        for step in tqdm(
-            range(self.diffusion.num_timesteps - 1, -1, -1),
+        prompt_batch_size = self.config.prompts_per_rollout_batch
+        total_prompt_count = len(self.fixed_eval_batch.texts)
+        chunk_count = math.ceil(total_prompt_count / prompt_batch_size)
+        progress = tqdm(
+            total=chunk_count * self.diffusion.num_timesteps,
             desc="fixed evaluation",
             leave=False,
             dynamic_ncols=True,
-        ):
-            timestep = torch.full(
-                (batch_size,),
-                step,
-                device=self.device,
-                dtype=torch.long,
-            )
-            with autocast_context(self.device, self.config.precision):
-                current, _, _ = ddim_step_with_logprob(
-                    self.diffusion,
-                    self.policy_model,
-                    current,
-                    timestep,
-                    model_kwargs=model_kwargs,
-                    eta=self.config.ddim_eta,
-                    mask=model_kwargs["y"]["mask"],
-                    clip_denoised=self.config.clip_denoised,
-                    generator=generator,
-                )
+        )
+        reward_totals: list[torch.Tensor] = []
+        retrieval_totals: list[torch.Tensor] = []
+        m2m_totals: list[torch.Tensor] = []
 
-        generated_motion = current.squeeze(2).permute(0, 2, 1).contiguous()
-        gt_motion = motion.squeeze(2).permute(0, 2, 1).contiguous()
-        previous_mode = self.reward_model.embedding_mode
-        self.reward_model.embedding_mode = "mean"
-        try:
-            reward_output = self.reward_model.score(
-                texts=texts,
-                generated_motion=generated_motion,
-                lengths=lengths,
-                gt_motion=gt_motion,
+        for prompt_start in range(0, total_prompt_count, prompt_batch_size):
+            prompt_end = min(
+                prompt_start + prompt_batch_size,
+                total_prompt_count,
             )
-        finally:
-            self.reward_model.embedding_mode = previous_mode
+            motion, lengths, texts, _ = repeat_prompt_batch(
+                self.fixed_eval_batch.motion[prompt_start:prompt_end],
+                self.fixed_eval_batch.lengths[prompt_start:prompt_end],
+                self.fixed_eval_batch.texts[prompt_start:prompt_end],
+                self.config.samples_per_prompt,
+            )
+            motion = motion.to(self.device, dtype=torch.float32)
+            batch_size, _, _, num_frames = motion.shape
+            model_kwargs = build_model_kwargs(
+                self.model,
+                texts,
+                lengths,
+                num_frames,
+                device=self.device,
+                guidance_scale=self.config.guidance_scale,
+            )
+            current = torch.randn(
+                motion.shape,
+                device=self.device,
+                dtype=motion.dtype,
+                generator=generator,
+            )
+            for step in range(self.diffusion.num_timesteps - 1, -1, -1):
+                timestep = torch.full(
+                    (batch_size,),
+                    step,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                with autocast_context(self.device, self.config.precision):
+                    current, _, _ = ddim_step_with_logprob(
+                        self.diffusion,
+                        self.policy_model,
+                        current,
+                        timestep,
+                        model_kwargs=model_kwargs,
+                        eta=self.config.ddim_eta,
+                        mask=model_kwargs["y"]["mask"],
+                        clip_denoised=self.config.clip_denoised,
+                        generator=generator,
+                    )
+                progress.update(1)
+
+            generated_motion = current.squeeze(2).permute(0, 2, 1).contiguous()
+            gt_motion = motion.squeeze(2).permute(0, 2, 1).contiguous()
+            previous_mode = self.reward_model.embedding_mode
+            self.reward_model.embedding_mode = "mean"
+            try:
+                reward_output = self.reward_model.score(
+                    texts=texts,
+                    generated_motion=generated_motion,
+                    lengths=lengths,
+                    gt_motion=gt_motion,
+                )
+            finally:
+                self.reward_model.embedding_mode = previous_mode
+            reward_totals.append(reward_output.total.detach().float().cpu())
+            retrieval_totals.append(
+                reward_output.retrieval.detach().float().cpu()
+            )
+            m2m_totals.append(reward_output.m2m.detach().float().cpu())
+
+        progress.close()
+        rewards = torch.cat(reward_totals)
+        retrieval_rewards = torch.cat(retrieval_totals)
+        m2m_rewards = torch.cat(m2m_totals)
+        expected_samples = (
+            self.config.fixed_eval_prompts
+            * self.config.samples_per_prompt
+        )
+        if len(rewards) != expected_samples:
+            raise RuntimeError(
+                "Fixed evaluation produced an unexpected sample count: "
+                f"expected={expected_samples}, actual={len(rewards)}."
+            )
 
         return {
-            "eval_reward": reward_output.total.float().mean().item(),
-            "eval_reward_std": reward_output.total.float().std(
-                unbiased=False
-            ).item(),
-            "eval_reward_retrieval": (
-                reward_output.retrieval.float().mean().item()
-            ),
-            "eval_reward_m2m": reward_output.m2m.float().mean().item(),
-            "eval_samples": float(batch_size),
+            "eval_reward": rewards.mean().item(),
+            "eval_reward_std": rewards.std(unbiased=False).item(),
+            "eval_reward_retrieval": retrieval_rewards.mean().item(),
+            "eval_reward_m2m": m2m_rewards.mean().item(),
+            **self._fixed_eval_signature(),
         }
 
     def _next_batch(self) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -525,6 +665,7 @@ class DDPOTrainer:
             trajectory.rewards,
             trajectory.prompt_ids,
             self.config.advantage_epsilon,
+            self.config.advantage_mode,
         )
         if trajectory.group_stats["zero_variance_prompt_fraction"] > 0:
             LOGGER.warning(
@@ -779,13 +920,39 @@ class DDPOTrainer:
     def _initialize_fixed_eval(self) -> dict[str, Any] | None:
         if self.fixed_eval_batch is None:
             return None
+        expected_signature = self._fixed_eval_signature()
+        if (
+            self.fixed_eval_baseline is not None
+            and any(
+                self.fixed_eval_baseline.get(name) != value
+                for name, value in expected_signature.items()
+            )
+        ):
+            LOGGER.warning(
+                "Fixed-eval signature changed; using the current policy as "
+                "a new baseline. previous=%s current=%s",
+                {
+                    name: self.fixed_eval_baseline.get(name)
+                    for name in expected_signature
+                },
+                expected_signature,
+            )
+            self.fixed_eval_baseline = None
+            self.best_eval_reward = None
+            self.best_eval_epoch = None
+            self.evals_without_improvement = 0
         if self.fixed_eval_baseline is None:
             if self.config.resume:
                 LOGGER.warning(
-                    "The resumed checkpoint has no fixed-eval baseline; using "
-                    "the resumed policy as the new baseline."
+                    "Using the resumed policy as the new fixed-eval baseline."
                 )
             self.fixed_eval_baseline = self.evaluate_fixed_pool()
+        initialized_best = self.best_eval_reward is None
+        if self.best_eval_reward is None:
+            self.best_eval_reward = self.fixed_eval_baseline["eval_reward"]
+            self.best_eval_epoch = self.start_epoch - 1
+        if initialized_best:
+            self._save_best_snapshot(self.start_epoch - 1)
         record: dict[str, Any] = {
             "event": "baseline",
             "epoch": self.start_epoch - 1,
@@ -798,6 +965,33 @@ class DDPOTrainer:
 
     def _run_fixed_eval(self, epoch: int) -> dict[str, float]:
         metrics = self._fixed_eval_with_deltas(self.evaluate_fixed_pool())
+        is_best = (
+            self.best_eval_reward is None
+            or metrics["eval_reward"]
+            > self.best_eval_reward + self.config.early_stop_min_delta
+        )
+        if is_best:
+            self.best_eval_reward = metrics["eval_reward"]
+            self.best_eval_epoch = epoch
+            self.evals_without_improvement = 0
+        else:
+            self.evals_without_improvement += 1
+        assert self.best_eval_reward is not None
+        assert self.best_eval_epoch is not None
+        metrics.update(
+            {
+                "eval_is_best": float(is_best),
+                "eval_best_reward": self.best_eval_reward,
+                "eval_best_reward_delta": (
+                    self.best_eval_reward
+                    - self.fixed_eval_baseline["eval_reward"]
+                ),
+                "eval_best_epoch": float(self.best_eval_epoch),
+                "eval_evals_without_improvement": float(
+                    self.evals_without_improvement
+                ),
+            }
+        )
         self._append_fixed_eval(
             {
                 "event": "evaluation",
@@ -840,10 +1034,8 @@ class DDPOTrainer:
                 state["data_loader"].cpu()
             )
 
-    def _save_checkpoint(self, epoch: int) -> Path:
-        checkpoint_path = self.output_dir / f"checkpoint_{epoch:06d}.pt"
-        temporary_path = checkpoint_path.with_suffix(".tmp")
-        payload = {
+    def _checkpoint_payload(self, epoch: int) -> dict[str, Any]:
+        return {
             "epoch": epoch,
             "global_step": self.global_step,
             "config": self.config.to_dict(),
@@ -853,10 +1045,31 @@ class DDPOTrainer:
             "scaler": self.scaler.state_dict(),
             "rng": self._rng_state(),
             "fixed_eval_baseline": self.fixed_eval_baseline,
+            "best_eval_reward": self.best_eval_reward,
+            "best_eval_epoch": self.best_eval_epoch,
+            "evals_without_improvement": self.evals_without_improvement,
         }
-        torch.save(payload, temporary_path)
+
+    def _save_best_snapshot(self, epoch: int) -> Path:
+        best_path = self.output_dir / "best.pt"
+        temporary_path = self.output_dir / "best.tmp"
+        torch.save(self._checkpoint_payload(epoch), temporary_path)
+        os.replace(temporary_path, best_path)
+        LOGGER.info("Saved best fixed-eval checkpoint: %s", best_path)
+        return best_path
+
+    def _save_checkpoint(self, epoch: int, *, mark_best: bool = False) -> Path:
+        checkpoint_path = self.output_dir / f"checkpoint_{epoch:06d}.pt"
+        temporary_path = checkpoint_path.with_suffix(".tmp")
+        torch.save(self._checkpoint_payload(epoch), temporary_path)
         os.replace(temporary_path, checkpoint_path)
         shutil.copy2(checkpoint_path, self.output_dir / "latest.pt")
+        if mark_best:
+            shutil.copy2(checkpoint_path, self.output_dir / "best.pt")
+            LOGGER.info(
+                "Saved best fixed-eval checkpoint: %s",
+                self.output_dir / "best.pt",
+            )
         LOGGER.info("Saved checkpoint: %s", checkpoint_path)
         return checkpoint_path
 
@@ -874,14 +1087,26 @@ class DDPOTrainer:
                 f"current mode={self.config.train_mode!r}."
             )
         load_trainable_state_dict(self.model, checkpoint["policy"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
-        if checkpoint.get("scaler"):
-            self.scaler.load_state_dict(checkpoint["scaler"])
+        restored_optimizer = restore_optimizer_state(
+            self.optimizer,
+            self.scaler,
+            checkpoint,
+            self.config,
+        )
+        if not restored_optimizer:
+            LOGGER.info(
+                "Reset AdamW and GradScaler state while resuming policy weights."
+            )
         if checkpoint.get("rng"):
             self._restore_rng_state(checkpoint["rng"])
         self.start_epoch = int(checkpoint["epoch"]) + 1
         self.global_step = int(checkpoint.get("global_step", 0))
         self.fixed_eval_baseline = checkpoint.get("fixed_eval_baseline")
+        self.best_eval_reward = checkpoint.get("best_eval_reward")
+        self.best_eval_epoch = checkpoint.get("best_eval_epoch")
+        self.evals_without_improvement = int(
+            checkpoint.get("evals_without_improvement", 0)
+        )
         LOGGER.info(
             "Resumed from %s at epoch=%d, global_step=%d",
             checkpoint_path,
@@ -909,6 +1134,7 @@ class DDPOTrainer:
                     step=0,
                 )
             last_saved_epoch = -1
+            completed_epoch = self.start_epoch - 1
             for epoch in range(self.start_epoch, self.config.epochs):
                 epoch_started = time.time()
                 trajectory = self.collect_rollouts(epoch)
@@ -920,6 +1146,13 @@ class DDPOTrainer:
                     and (epoch + 1) % self.config.fixed_eval_every == 0
                 ):
                     fixed_eval_metrics = self._run_fixed_eval(epoch)
+                is_best_eval = bool(fixed_eval_metrics.get("eval_is_best", 0.0))
+                should_early_stop = bool(
+                    fixed_eval_metrics
+                    and self.config.early_stop_patience > 0
+                    and self.evals_without_improvement
+                    >= self.config.early_stop_patience
+                )
                 record: dict[str, Any] = {
                     "epoch": epoch,
                     "global_step": self.global_step,
@@ -941,10 +1174,26 @@ class DDPOTrainer:
                         "epoch metrics: %s",
                         json.dumps(record, sort_keys=True),
                     )
-                if (epoch + 1) % self.config.save_every == 0:
-                    self._save_checkpoint(epoch)
+                if (
+                    (epoch + 1) % self.config.save_every == 0
+                    or is_best_eval
+                    or should_early_stop
+                ):
+                    self._save_checkpoint(epoch, mark_best=is_best_eval)
                     last_saved_epoch = epoch
+                completed_epoch = epoch
+                if should_early_stop:
+                    LOGGER.info(
+                        "Early stopping at epoch=%d after %d fixed "
+                        "evaluations without improvement; best epoch=%d, "
+                        "best reward=%.6f.",
+                        epoch,
+                        self.evals_without_improvement,
+                        self.best_eval_epoch,
+                        self.best_eval_reward,
+                    )
+                    break
 
-            final_epoch = self.config.epochs - 1
+            final_epoch = completed_epoch
             if last_saved_epoch != final_epoch:
                 self._save_checkpoint(final_epoch)
