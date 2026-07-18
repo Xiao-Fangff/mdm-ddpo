@@ -10,5 +10,5 @@ exec "${PYTHON}" "${PROJECT_ROOT}/train_ddpo.py" \
   --device "${DEVICE}" \
   --reward-device same \
   --output-dir "${PROJECT_ROOT}/outputs/preflight" \
+  --fixed-eval-every 0 \
   "$@"
-

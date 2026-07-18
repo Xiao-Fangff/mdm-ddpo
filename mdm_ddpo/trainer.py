@@ -138,6 +138,24 @@ def log_prob_consistency_metrics(
     return metrics
 
 
+def merge_log_prob_audit_metrics(
+    records: list[dict[str, float]],
+) -> dict[str, float]:
+    if not records:
+        raise ValueError("Cannot merge an empty log-probability audit.")
+    names = set(records[0])
+    if any(set(record) != names for record in records[1:]):
+        raise ValueError("Log-probability audit records have different fields.")
+    return {
+        name: (
+            max(record[name] for record in records)
+            if name.endswith("_max")
+            else float(np.mean([record[name] for record in records]))
+        )
+        for name in names
+    }
+
+
 def _tensor_collection_l2_norm(tensors: list[torch.Tensor]) -> float:
     if not tensors:
         return 0.0
@@ -1689,6 +1707,7 @@ class DDPOTrainer:
         log_ratio_parts: list[torch.Tensor] = []
         ratio_parts: list[torch.Tensor] = []
         audit_metrics: dict[str, float] | None = None
+        audit_records: list[dict[str, float]] = []
 
         self.optimizer.zero_grad(set_to_none=True)
         named_trainable_parameters = [
@@ -1747,17 +1766,30 @@ class DDPOTrainer:
                 )
 
                 minibatch_timesteps = selected_timesteps[sample_indices]
-                if audit_metrics is None:
-                    audit_metrics = self._audit_first_update_log_probs(
+                first_update_group_end = min(
+                    self.config.gradient_accumulation_steps,
+                    num_sample_minibatches,
+                )
+                if (
+                    audit_metrics is None
+                    and inner_epoch == 0
+                    and minibatch_position < first_update_group_end
+                ):
+                    audit_records.append(self._audit_first_update_log_probs(
                         trajectory,
                         sample_indices,
                         minibatch_timesteps,
                         model_kwargs,
-                    )
-                    LOGGER.info(
-                        "Initial old/new log-probability audit: %s",
-                        json.dumps(audit_metrics, sort_keys=True),
-                    )
+                    ))
+                    if minibatch_position + 1 == first_update_group_end:
+                        audit_metrics = merge_log_prob_audit_metrics(
+                            audit_records
+                        )
+                        LOGGER.info(
+                            "Initial old/new log-probability audit over the "
+                            "full first optimizer update: %s",
+                            json.dumps(audit_metrics, sort_keys=True),
+                        )
 
                 group_start = (
                     minibatch_position

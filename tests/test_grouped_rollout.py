@@ -18,6 +18,7 @@ from mdm_ddpo.trainer import (
     compute_balanced_validation_metrics,
     compute_grouped_advantages,
     log_prob_consistency_metrics,
+    merge_log_prob_audit_metrics,
     repeat_prompt_batch,
     restore_optimizer_state,
     shuffled_sample_minibatches,
@@ -254,6 +255,17 @@ class GroupedRolloutTest(unittest.TestCase):
                 torch.tensor([0.0, 0.01]),
                 tolerance=1.0e-4,
             )
+
+    def test_log_prob_audit_merges_full_accumulation_group(self):
+        merged = merge_log_prob_audit_metrics(
+            [
+                {"initial_ratio_mean": 1.0, "initial_log_ratio_max": 0.0},
+                {"initial_ratio_mean": 1.0002, "initial_log_ratio_max": 0.0002},
+            ]
+        )
+
+        self.assertAlmostEqual(merged["initial_ratio_mean"], 1.0001)
+        self.assertEqual(merged["initial_log_ratio_max"], 0.0002)
 
     def test_default_training_settings_use_grouped_low_variance_rewards(self):
         config = TrainConfig()

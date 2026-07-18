@@ -2,85 +2,94 @@
 
 最后更新：2026-07-18
 
-## 当前状态
+## 当前实现状态
 
-- 当前代码提交：`31bdcaa Fix long-run DDPO reward drift`。
-- 该提交已完成单元测试、编译、Shell 语法、GPU 冒烟和 50-step DDPO 回归。
-- 当前没有应继续使用的训练进程；迁移训练在 epoch 59 因 early stopping 正常结束。
+retrieval + M2M DDPO 稳定化已按阶段完成，外部
+`motion-diffusion-model` 与 `MotionRFT` 仓库未修改。
 
-## 应保留与应避免的权重
+独立提交：
 
-- 当前最佳 DDPO 权重：
-  `outputs/humanml_ddpo_ep9_migration_validation/best.pt`
-  - checkpoint epoch：19
-  - global step：40
-  - 固定池 reward：1.696524
-  - 相对迁移 baseline（旧 epoch 9）：`+0.001466`
-  - 相对预训练固定池：约 `+0.003309`
-- 同目录的 `latest.pt` 是 epoch 59，固定池 reward 相对 epoch 9 为
-  `-0.000580`，不能作为最终模型。
-- 旧运行 `outputs/humanml_ddpo_group4_lr3e4_mean` 的统一 32-prompt 固定池复评：
-  - epoch 9：`+0.001843`（旧运行最佳）
-  - epoch 69：`-0.003734`
-  - epoch 99：`-0.005231`
+1. `773a2b2 Fix PPO training correctness`
+2. `17e9d96 Add held-out fixed validation`
+3. `6a98e66 Add fixed reward calibration`
+4. `0bdc04c Add calibrated shrinkage advantages`
+5. `94159eb Select balanced validation checkpoints`
+6. `4f0a952 Add native MDM diffusion anchor`
+7. 阶段 7 实验脚本、README 与最终验收提交见当前 HEAD。
 
-## 已确认的实现修复
+## 已实现的关键约束
 
-- MotionReward 的 mean embedding 路径会调用内部 `rsample()`；现已隔离 CPU/CUDA
-  RNG，固定评估不会改变后续 rollout 随机数序列。
-- 固定评估改为 32 prompts / 128 motions，并用独立 collate，避免此前被训练物理
-  batch 截断为 8 prompts。
-- 固定评估记录完整签名（采样步数、物理 eval batch、guidance、eta、精度、奖励权重等）；
-  签名变化时自动以恢复 policy 建立新 baseline。
-- `best.pt` 保存初始 baseline 或后续固定评估最佳权重；不能用 `latest.pt` 代替。
-- 新增 `--reset-optimizer-on-resume`，适用于从旧算法设置迁移。
-- 默认配置：`group_whiten`、`timestep_fraction=0.5`、
-  `fixed_eval_prompts=32`、`early_stop_patience=8`。
+- PPO 使用 sample-level shuffle，不再只打乱连续 minibatch block。
+- rollout 总样本数必须被 train batch size 整除。
+- 每个 rollout 首次 optimizer update 前严格审计 old/new log-prob；真实 MDM smoke
+  中 `max_abs_diff=0`、ratio=1。
+- checkpoint 加载严格要求全部 trainable LoRA tensors 存在。
+- rollout split 固定为 `train`；checkpoint selection 固定使用 held-out `val`；
+  `test` 禁止用于选择 checkpoint。
+- `fixed_eval_pool.pt` 保存 val dataset indices、text、length、GT motion、noise seeds
+  和 pool checksum；默认 128 prompts × 4 motions。
+- calibration 使用原始 MDM（无 LoRA）至少 1024 prompts × 4 motions；训练加载时
+  要求 full calibration 和 checksum 一致。
+- advantage 支持 `group_whiten`、`group_centered`、`group_shrink`、
+  `component_shrink`。shrink floor 只能来自固定 calibration p25/p50。
+- balanced checkpoint 使用固定 global scale：
+  `0.5*z_retrieval + 0.5*z_m2m`；两项 delta 都必须在 paired bootstrap 容差内。
+- 命名 checkpoint 为 `best_balanced.pt`、`best_retrieval.pt`、`best_m2m.pt`、
+  `latest.pt`，不再用 raw total reward 维护 `best.pt`。
+- 原生 MDM diffusion anchor 默认关闭；启用时每个 optimizer update 只计算一次，
+  可自动标定到 PPO gradient 的 0.1/0.2。
 
-## 已验证的训练结果
+## 当前推荐起点
 
-相同 32 prompts / 128 motions 固定池、20 epochs：
+在完成正式 calibration 后：
 
-| advantage / timestep fraction | 最佳 delta | 最终 delta |
-| --- | ---: | ---: |
-| `group_whiten / 0.5` | `+0.002656` | `+0.002656` |
-| `group_whiten / 1.0` | `+0.001586` | `+0.000150` |
-| `group_centered / 0.5` | `+0.000938` | `+0.000676` |
+```text
+advantage_mode=component_shrink
+advantage_std_floor_quantile=p25
+advantage component weights=0.5/0.5
+learning_rate=1e-4
+clip_range=1e-4
+rollout_batch_size=32
+rollout_batches_per_epoch=4
+train_batch_size=32
+gradient_accumulation_steps=2
+timestep_fraction=0.5
+anchor_auto_grad_ratio=0
+```
 
-从旧 epoch 9 出发、重置 Adam、使用新默认设置继续 10 epochs 后，相对 epoch 9
-再提升 `+0.001466`，因此迁移路径是可行的。
+该配置是理论稳定化起点，不是已经由三 seed 长实验确认的最终最优配置。必须先运行
+A0–A4、follow-up 和 anchor × seed 实验。
 
-## 当前主要瓶颈（尚未解决）
+## 已完成验证
 
-训练循环能正常更新，但 MotionReward 的标量优化目标没有稳定转化为真实 HumanML
-质量提升：
+- 全部单元测试、compileall、Shell syntax 和 `git diff --check`。
+- held-out val pool 创建与跨输出目录 resume smoke。
+- calibration 工具原始 MDM、小规模 GPU smoke。
+- component shrink GPU smoke，无非有限梯度。
+- balanced checkpoint GPU smoke，负 component delta 不会覆盖 best balanced。
+- 原生 MDM anchor GPU smoke：
+  - `ppo_grad_norm=0.00328896`
+  - `anchor_grad_norm=0.0106896`
+  - 自动 `lambda=0.0307678`
+  - 实际 grad ratio=`0.1000`
+  - anchor calls=optimizer updates=1
 
-- `group_whiten` 在每个 prompt 仅有 4 个样本时，会把非常小的组内 reward 差异
-  强制归一化为单位 advantage。训练日志中的潜在放大倍数常为 `100-700x`；最佳
-  checkpoint 审计的中位数为 `16.7x`、最大值为 `163x`。
-- PPO clip 只限制单次旧/新策略更新；当前没有相对预训练/reference MDM 的长期 KL
-  正则，因此噪声驱动的微小更新会累计漂移。
-- retrieval 与单一配对 GT 的 M2M 都是局部 surrogate：前者不衡量自然度，后者不适合
-  文本到动作的一对多性。继续训练时出现 retrieval 上升、M2M 下降的漂移现象。
-- 现有固定池来自 train split 的固定 32 条样本，不能代替 held-out HumanML test 指标。
+## 尚未完成的统计实验
 
-快速标准 HumanML test 预检（256 generated samples、单次 replication，仅作诊断）显示
-DDPO best 并无一致收益：
+- 正式 1024×4 reward calibration。
+- A0–A4 各 30 epochs。
+- 最好两组的非全排列 LR/clip follow-up。
+- 最佳配置的 anchor ratio `{0,0.1,0.2}` × seed `{42,43,44}`。
+- 三 seed 平均 retrieval、M2M、balanced score 验收。
+- 标准 HumanML baseline/candidate replication 对比。
 
-| 指标 | 预训练 MDM | DDPO best |
-| --- | ---: | ---: |
-| FID（低更好） | 0.8736 | 0.8705 |
-| Matching Score（低更好） | 3.0070 | 3.0077 |
-| R-precision Top-1（高更好） | 0.5234 | 0.5195 |
-| R-precision Top-2（高更好） | 0.7383 | 0.7227 |
-| Diversity | 9.9565 | 9.9558 |
+这些任务已有脚本，不能用短 smoke 结果代替。
 
-## 后续工作优先级（未实施）
+## 仍需关注的风险
 
-1. 为 DDPO 加入冻结 reference MDM 的显式 KL penalty，抑制累计漂移。
-2. 用 variance floor / shrinkage 替换纯 `group_whiten`，或在 reward spread 太小时跳过
-   该 prompt 的更新；不要把数值噪声放大。
-3. 将 checkpoint 选择切换为 held-out test/validation 的标准 HumanML 指标，并以多随机
-   种子重复评测。
-4. 使用约束式或多目标奖励，至少防止 M2M 低于 reference；若追求可见动作质量，加入
-   自然度、脚滑或物理一致性奖励。
+- retrieval 与 M2M 存在真实 ranking conflict，balanced feasibility 只能限制退化，
+  不能消除目标冲突。
+- PPO clip 仍是单 update 约束；长期保护依赖 anchor 的实证效果。
+- MotionReward 是 surrogate，held-out reward 上升不保证 FID/R-precision 同步改善。
+- 旧版 `best.pt`/`latest.pt` 的历史结论不可直接与新 held-out pool、calibration 和
+  balanced selection 数值比较。

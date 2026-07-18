@@ -1,103 +1,171 @@
 # MDM-DDPO
 
-本项目在不修改参考仓库的前提下，将
-[motion-diffusion-model](/home/zhiwei/projects/motion-diffusion-model)
-的 HumanML3D MDM 与
-[ddpo-pytorch](/home/zhiwei/projects/ddpo-pytorch)
-的 DDPO/PPO 训练方式结合，并接入
-[RFT_MLD](/home/zhiwei/projects/MotionRFT/RFT_MLD)
-所使用的 MotionReward retrieval 与 M2M 奖励。
+本仓库在不修改外部参考仓库的前提下，将 HumanML3D MDM、DDPO/PPO 与
+MotionRFT 的 retrieval + M2M 奖励组合起来，并针对长期训练中的奖励微差放大、
+验证泄漏和原始 MDM 退化问题增加了完整的稳定化与统计评估流程。
 
-## 已实现内容
+外部仓库仅在运行时只读导入：
 
-- 从 MDM checkpoint 和配套 `args.json` 构建模型、数据集与扩散过程。
-- 支持对原始 50 步扩散过程做可变步数 respacing。
-- 实现随机 DDIM transition 的采样及可重算 log-probability。
-- 保存 rollout 中的 `x_t`、`x_{t-1}`、timestep 和旧策略 log-probability。
-- 使用标准 PPO clipped objective 执行 DDPO 更新。
-- 每个文本生成多个独立 motion，并只在同一文本组内标准化 advantage，
-  避免不同文本/GT 难度差异主导策略梯度。
-- 默认每个 motion 随机选取一半的随机 diffusion transitions 做 PPO，减少
-  同一个 terminal reward 在过多 timestep 上产生的共享梯度干扰。
-- 对 HumanML3D padding 帧做掩码，padding 不参与策略似然。
-- 排除确定性的 `t=0` transition，只使用随机 transition 做策略梯度。
-- 支持全参数训练和无额外依赖的参数化 LoRA；默认使用 LoRA。
-- 直接加载 MotionReward Stage-1 backbone，计算：
+- `/home/zhiwei/projects/motion-diffusion-model`
+- `/home/zhiwei/projects/MotionRFT`
+- `/home/zhiwei/projects/ddpo-pytorch` 仅作为算法参考
 
-  - retrieval：文本 embedding 与生成 motion embedding 的余弦相似度；
-  - M2M：配对 GT motion 与生成 motion embedding 的余弦相似度。
+## 稳定化实现
 
-  与 RFT_MLD 训练路径一致，生成 motion 以 `timestep=0` 编码，文本与
-  GT motion 不带 timestep。
+- PPO 在 sample level 生成随机 permutation，再组成等大的 minibatch。
+- 强制 `rollout_batch_size * rollout_batches_per_epoch` 可被
+  `train_batch_size` 整除，避免尾 batch 权重错误。
+- 每个 rollout 的首次 optimizer update 前审计 old/new log-prob；超过阈值会
+  立即停止，而不是带着错误 ratio 继续训练。
+- 严格检查恢复 checkpoint 是否包含全部 trainable LoRA tensors。
+- 记录 `log_ratio`、ratio dispersion、LoRA norm、parameter update norm 和非有限梯度。
+- rollout 始终使用 HumanML3D `train`；checkpoint 选择始终使用 held-out `val`。
+- 固定验证池持久化为 `fixed_eval_pool.pt`，包含 dataset indices、caption、length、
+  随机裁剪后的 GT motion 和逐 prompt diffusion noise seed。
+- 恢复训练或跨实验共享 pool 时校验 SHA-256 pool id；`test` split 禁止用于
+  checkpoint 选择。
+- 默认固定验证使用 128 prompts，每个 prompt 4 motions，并保存逐 prompt 的
+  retrieval/M2M baseline、current 和 paired delta。
+- 使用原始 MDM 的 1024 prompts × 4 motions 离线标定固定 reward scale 和
+  shrinkage floor；训练中不动态更新这些尺度。
+- 提供 `group_shrink` 和 `component_shrink`，避免 group whitening 对极小 reward
+  差异产生数百倍放大。
+- checkpoint 使用 calibration-normalized balanced score，而不是 raw total reward。
+- 可选原生 MDM diffusion loss anchor，每个 optimizer update 只计算一次；支持把
+  anchor 初始梯度自动标定到 PPO 梯度的 10% 或 20%。默认关闭。
+- 可选 SwanLab 曲线记录；JSONL 始终写入本地输出目录。
 
-- 奖励前先把 MDM z-normalized 263-D 特征反归一化，再用 MotionReward
-  数据统计量重新归一化，避免两个参考项目的 Mean/Std 文件差异造成输入域偏移。
+## 核心目标
 
-- 支持断点保存与恢复，LoRA 模式只保存可训练参数。
-- 使用 32 个固定 prompt 和固定扩散噪声做确定性验证，自动维护 `best.pt`，
-  并支持按固定验证曲线 early stopping。
-- MotionReward mean embedding 模式隔离其编码器内部 `rsample()` 消耗的随机数，
-  固定验证不会再改变后续 rollout 的 CUDA RNG 序列。
-- 可选接入 SwanLab，按 epoch 记录 reward、PPO、梯度与耗时训练曲线。
-- 数据缓存写入本项目共享的 `.cache/mdm`，不会写入参考仓库。
-
-## 算法对应关系
-
-对每个随机 DDIM transition：
-
-```text
-x_t --MDM--> predicted x_0 --DDIM(eta > 0)--> Normal(mean_theta, sigma_t)
-```
-
-rollout 时保存旧策略的：
+DDIM rollout 对每个随机 transition 保存：
 
 ```text
 log p_old(x_{t-1} | x_t, text)
 ```
 
-更新时在相同 transition 上重算：
+更新时在完全相同的 `x_t`、`x_{t-1}`、timestep 和 conditioning 上重算：
 
 ```text
-ratio = exp(log p_theta - log p_old)
-loss  = mean(max(-A * ratio, -A * clip(ratio, 1-eps, 1+eps)))
+log_ratio = log p_new - log p_old
+ratio     = exp(log_ratio)
+loss_ppo  = mean(max(-A * ratio,
+                     -A * clip(ratio, 1-eps, 1+eps)))
 ```
 
-reward 是 terminal motion 上的：
+terminal reward 为：
 
 ```text
-reward = retrieval_weight * cosine(text, generated)
-       + m2m_weight       * cosine(gt_motion, generated)
+reward = retrieval_weight * cosine(text, generated_motion)
+       + m2m_weight       * cosine(gt_motion, generated_motion)
 ```
 
-对每个 prompt 生成 `K` 个 motion，并计算组内 advantage：
+MDM 的 263-D motion 会先从 MDM normalization 反归一化，再转换到 MotionReward
+normalization，避免两个项目 Mean/Std 不一致导致输入域偏移。
+
+## Advantage 模式
+
+设同一 prompt 的 centered reward 为 `c = reward - group_mean`。
+
+`group_whiten` 保留用于基线复现：
 
 ```text
-A[i, k] = (reward[i, k] - mean_k(reward[i, k]))
-          / (std_k(reward[i, k]) + eps)
+A = c / (group_std + epsilon)
 ```
 
-这是验证后的默认 `group_whiten` 模式。`group_centered` 模式仍可用于诊断：
-它先逐 prompt 减均值，再统一除以所有 centered rewards 的全局标准差。
+它可能把极小组内差异放大，因此会同时记录
+`potential_group_whiten_scale_max`。
 
-此外，每隔若干 epoch 使用固定 prompt、固定扩散噪声和 MotionReward mean
-embedding 做验证，得到可跨 checkpoint 比较的 `eval/reward_*` 曲线。
+`group_centered` 保留用于消融：
 
-## 环境
+```text
+A = c / global_centered_std
+```
 
-当前机器可直接使用：
+`group_shrink` 使用 calibration 中固定的 total reward floor：
+
+```text
+A = c / sqrt(group_std^2 + std_floor^2)
+```
+
+`component_shrink` 分别处理 retrieval 和 M2M：
+
+```text
+A_ret = centered_ret / sqrt(group_std_ret^2 + floor_ret^2)
+A_m2m = centered_m2m / sqrt(group_std_m2m^2 + floor_m2m^2)
+A     = 0.5 * A_ret + 0.5 * A_m2m
+```
+
+floor 只能来自固定 `reward_calibration.json` 的 p25 或 p50，不会在 minibatch
+中动态估计。训练日志包含两个 component advantage 的 correlation、sign conflict
+fraction、各自 mean-absolute contribution 和 effective maximum scale。
+
+## Fixed validation 与 balanced checkpoint
+
+验证对每个 prompt 先平均 4 个生成 motion，再做 paired baseline delta。每个
+component 都记录：
+
+- mean 与 median；
+- improvement fraction；
+- paired bootstrap standard error；
+- baseline、current 和 delta。
+
+使用 calibration 的全局标准差归一化：
+
+```text
+z_retrieval = retrieval_delta / retrieval_global_scale
+z_m2m       = m2m_delta       / m2m_global_scale
+balanced_score = 0.5 * z_retrieval + 0.5 * z_m2m
+```
+
+可行性阈值为：
+
+```text
+retrieval_delta >= -k * bootstrap_se_retrieval
+m2m_delta       >= -k * bootstrap_se_m2m
+```
+
+默认 `k=1`。只有两个 component 都没有超出统计误差的退化时，当前 policy 才是
+feasible，才允许更新 `best_balanced.pt`。retrieval 与 M2M 的单项最佳仍分别保存，
+便于分析 trade-off。
+
+`early_stop_min_delta_mode=auto` 时，有效最小改进为：
+
+```text
+max(early_stop_min_delta,
+    early_stop_se_multiplier * balanced_score_bootstrap_se)
+```
+
+## 原生 MDM diffusion anchor
+
+anchor 使用真实 HumanML3D motion、当前带 LoRA 的基础 MDM 和原始 1000-step
+diffusion 的 `training_losses`。它不经过 CFG sampling wrapper。
+
+每个 optimizer update 的梯度等价于：
+
+```text
+loss = loss_ppo + lambda_anchor * loss_mdm
+```
+
+anchor 只在 accumulation group 即将 step 时计算一次，不会在每个 DDIM
+transition 上重复计算。两种配置方式互斥：
+
+- `--anchor-lambda X`：固定 lambda；
+- `--anchor-auto-grad-ratio 0.1`：首次 update 自动令
+  `||lambda * grad_anchor|| / ||grad_ppo|| ≈ 0.1`，之后固定该 lambda。
+
+默认两者都是 0，完全关闭 anchor，保持向后兼容。
+
+## 环境和默认资源
+
+当前环境：
 
 ```bash
 /home/zhiwei/anaconda3/envs/motionrft/bin/python
 ```
 
-如需另建环境，可参考 `requirements.txt`。MDM 和 MotionReward 源码通过运行时路径引入，不会复制或修改原仓库。
-
-默认资源路径为：
+默认模型资源：
 
 ```text
-MDM source:
-  /home/zhiwei/projects/motion-diffusion-model
-
 MDM checkpoint:
   /home/zhiwei/projects/motion-diffusion-model/save/humanml_trans_dec_512_bert/model000600000.pt
 
@@ -111,261 +179,347 @@ Sentence-T5:
   /home/zhiwei/projects/MotionRFT/deps/sentence-t5-large
 ```
 
-## 预检
+## 1. 生成 reward calibration
 
-预检会真实加载 HumanML3D、MDM、LoRA、MotionReward 与 T5，但不执行 rollout：
-
-```bash
-python train_ddpo.py \
-  --preflight \
-  --device cuda:0 \
-  --reward-device same \
-  --output-dir outputs/preflight
-```
-
-如果只想验证 CPU 接口：
+正式训练前先在原始 MDM 上运行一次：
 
 ```bash
-python train_ddpo.py \
-  --preflight \
-  --device cpu \
-  --reward-device cpu \
-  --precision no \
-  --data-workers 0 \
-  --sample-steps 4 \
-  --rollout-batch-size 2 \
-  --samples-per-prompt 2 \
-  --output-dir /tmp/mdm-ddpo-preflight
-```
+cd /home/zhiwei/projects/mdm-ddpo
 
-## 正式训练
-
-```bash
-python train_ddpo.py \
-  --device cuda:0 \
-  --reward-device same \
-  --precision bf16 \
-  --output-dir outputs/humanml_retrieval_m2m \
-  --epochs 100 \
-  --sample-steps 50 \
-  --rollout-batch-size 32 \
-  --rollout-batches-per-epoch 4 \
+CUDA_VISIBLE_DEVICES=7 \
+python tools/calibrate_reward_stats.py \
+  --output reward_calibration.json \
+  --pool-path artifacts/reward_calibration_pool.pt \
+  --samples-output artifacts/reward_calibration_samples.pt \
+  --split train \
+  --prompts 1024 \
   --samples-per-prompt 4 \
-  --train-batch-size 32 \
-  --inner-epochs 1 \
-  --timestep-fraction 0.5 \
-  --gradient-accumulation-steps 2 \
-  --learning-rate 3e-4 \
-  --advantage-mode group_whiten \
-  --guidance-scale 2.5 \
-  --ddim-eta 1.0 \
-  --train-mode lora \
-  --lora-rank 8 \
-  --lora-alpha 8 \
-  --retrieval-weight 1.0 \
-  --m2m-weight 1.0 \
-  --reward-embedding-mode mean \
-  --fixed-eval-every 5 \
-  --fixed-eval-prompts 32 \
-  --early-stop-patience 8
+  --batch-size 32 \
+  --sample-steps 50 \
+  --device cuda:0 \
+  --reward-device same \
+  --precision bf16
 ```
 
-上述配置每个 rollout batch 包含 8 个不同 prompt，每个 prompt 生成 4 个
-motion；每个 epoch 共 128 个 motion、32 个不同 prompt、2 次 optimizer
-更新，有效优化 batch 为 64。
+生产 calibration 强制至少 1024×4。`--allow-small-run` 仅用于工具 smoke；其 JSON
+会标记 `full_calibration=false`，训练端会拒绝加载。
 
-也可以使用启动脚本：
+输出统计包括：
+
+- retrieval、M2M 和 total 的 `global_scale`；
+- 每个 component 组内 std 的 p25/p50/mean/min/max；
+- 组内 range 的 p25/p50/mean/min/max；
+- raw/global Pearson correlation；
+- group-centered correlation；
+- prompt 内成对 ranking conflict fraction 和 tie fraction。
+
+## 2. 预检和 smoke test
+
+不执行 rollout 的预检：
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 DEVICE=cuda:0 bash scripts/train_humanml.sh
+CUDA_VISIBLE_DEVICES=7 DEVICE=cuda:0 bash scripts/preflight.sh
 ```
 
-启用 SwanLab 在线记录：
+带固定验证和一次 optimizer update 的 smoke：
 
 ```bash
-MDM_DDPO_USE_SWANLAB=1 \
-MDM_DDPO_SWANLAB_PROJECT=mdm-ddpo \
-MDM_DDPO_SWANLAB_RUN_NAME=humanml-retrieval-m2m \
-CUDA_VISIBLE_DEVICES=3 DEVICE=cuda:0 \
-bash scripts/train_humanml.sh
+CUDA_VISIBLE_DEVICES=7 \
+DEVICE=cuda:0 \
+REWARD_DEVICE=same \
+OUTPUT_DIR=/tmp/mdm-ddpo-smoke \
+MDM_DDPO_REWARD_CALIBRATION_PATH=$PWD/reward_calibration.json \
+MDM_DDPO_FIXED_EVAL_POOL_PATH=$PWD/artifacts/humanml_val_fixed_eval_pool.pt \
+bash scripts/train_humanml.sh \
+  --dry-run \
+  --fixed-eval-every 1
 ```
 
-启动脚本仍兼容旧的 `USE_SWANLAB`、`SWANLAB_PROJECT` 等变量，但推荐使用
-`MDM_DDPO_SWANLAB_*` 前缀，避免与 SwanLab SDK 自身的环境配置名称冲突。
-
-也可以直接向 Python 入口传参：
-
-```bash
-python train_ddpo.py \
-  --use-swanlab \
-  --swanlab-project mdm-ddpo \
-  --swanlab-run-name humanml-retrieval-m2m \
-  --swanlab-mode online \
-  --output-dir outputs/humanml_retrieval_m2m
-```
-
-SwanLab 默认关闭，不影响原有训练和 `metrics.jsonl`。`--swanlab-mode`
-支持 `online`、`offline`、`local` 和 `disabled`；本地日志默认写入
-`OUTPUT_DIR/swanlab`。`--preflight` 不会创建 SwanLab run。
-
-额外参数会原样传给 Python 入口：
-
-```bash
-bash scripts/train_humanml.sh --epochs 20 --rollout-batch-size 8
-```
-
-## 端到端冒烟训练
-
-`--dry-run` 会执行一个 batch、4 个采样步和一个训练 epoch：
+若 calibration 尚未生成，只测试训练接口，可显式关闭 fixed validation，并使用
+非 shrink advantage：
 
 ```bash
 python train_ddpo.py \
   --dry-run \
   --device cuda:0 \
   --reward-device same \
-  --precision bf16 \
-  --output-dir /tmp/mdm-ddpo-dryrun
+  --fixed-eval-every 0 \
+  --advantage-mode group_centered \
+  --output-dir /tmp/mdm-ddpo-interface-smoke
 ```
 
-## 关键参数
+## 3. 推荐训练命令
 
-| 参数 | 含义 |
+在完成 calibration 后，推荐先从 component shrink、无 anchor 开始：
+
+```bash
+cd /home/zhiwei/projects/mdm-ddpo
+
+CUDA_VISIBLE_DEVICES=7 \
+DEVICE=cuda:0 \
+REWARD_DEVICE=same \
+OUTPUT_DIR=$PWD/outputs/humanml_component_shrink_p25 \
+MDM_DDPO_USE_SWANLAB=1 \
+MDM_DDPO_SWANLAB_MODE=online \
+MDM_DDPO_SWANLAB_PROJECT=mdm-ddpo \
+MDM_DDPO_SWANLAB_RUN_NAME=humanml-component-shrink-p25 \
+MDM_DDPO_REWARD_CALIBRATION_PATH=$PWD/reward_calibration.json \
+MDM_DDPO_FIXED_EVAL_POOL_PATH=$PWD/artifacts/humanml_val_fixed_eval_pool.pt \
+bash scripts/train_humanml.sh \
+  --epochs 100 \
+  --sample-steps 50 \
+  --rollout-batch-size 32 \
+  --rollout-batches-per-epoch 4 \
+  --samples-per-prompt 4 \
+  --train-batch-size 32 \
+  --gradient-accumulation-steps 2 \
+  --inner-epochs 1 \
+  --timestep-fraction 0.5 \
+  --learning-rate 1e-4 \
+  --clip-range 1e-4 \
+  --advantage-mode component_shrink \
+  --advantage-std-floor-quantile p25 \
+  --advantage-retrieval-weight 0.5 \
+  --advantage-m2m-weight 0.5 \
+  --fixed-eval-every 5 \
+  --fixed-eval-prompts 128 \
+  --fixed-eval-samples-per-prompt 4 \
+  --early-stop-min-delta-mode auto \
+  --early-stop-patience 8 \
+  --anchor-auto-grad-ratio 0
+```
+
+该配置每个 epoch rollout 128 motions / 32 prompts；PPO physical batch 为 32，
+gradient accumulation 为 2，因此每个 optimizer update 的有效样本数为 64，
+每个 epoch 共 2 次 optimizer updates。
+
+`rollout_batch_size * rollout_batches_per_epoch` 必须能被 `train_batch_size`
+整除。增大 physical batch 时，若保持有效 update size 不变，应同步减小
+`gradient_accumulation_steps`，不需要按 batch size 线性放大学习率。
+
+## 4. 固定消融 A0–A4
+
+以下脚本保证：无 `--resume`、独立输出目录、原始 MDM、零 LoRA、同一 fixed val
+pool、固定 30 epochs、关闭 early stopping：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 \
+DEVICE=cuda:0 \
+REWARD_DEVICE=same \
+REWARD_CALIBRATION_PATH=$PWD/reward_calibration.json \
+FIXED_EVAL_POOL_PATH=$PWD/artifacts/humanml_val_fixed_eval_pool.pt \
+OUTPUT_ROOT=$PWD/outputs/stability_ablations \
+bash scripts/run_stability_ablations.sh
+```
+
+矩阵为：
+
+| ID | advantage | floor | learning rate | clip range |
+| --- | --- | --- | ---: | ---: |
+| A0 | `group_whiten` | — | `3e-4` | `1e-4` |
+| A1 | `group_centered` | — | `1e-4` | `1e-4` |
+| A2 | `group_shrink` | p25 | `1e-4` | `1e-4` |
+| A3 | `group_shrink` | p50 | `1e-4` | `1e-4` |
+| A4 | `component_shrink` | p25 | `1e-4` | `1e-4` |
+
+脚本结束后生成：
+
+```text
+outputs/stability_ablations/ablation_comparison.csv
+outputs/stability_ablations/ablation_comparison.md
+```
+
+也可手工汇总任意 runs：
+
+```bash
+python tools/summarize_experiments.py \
+  outputs/stability_ablations/A* \
+  --output-prefix outputs/stability_ablations/ablation_comparison
+```
+
+## 5. 选择最好两组后缩小 LR/clip 范围
+
+不要直接运行 2×3×3 全排列。规划工具先按 feasible best balanced score 选前两组，
+再依据训练期间的 `clip_fraction_mean` 与 `ratio_std_mean / clip_range` 生成单因素
+优先的子集，候选值严格来自：
+
+```text
+learning rate = {3e-5, 1e-4, 3e-4}
+clip range    = {1e-4, 3e-4, 1e-3}
+```
+
+```bash
+python tools/plan_followup_sweeps.py \
+  outputs/stability_ablations/A* \
+  --output-json outputs/followup_plan/followup_plan.json \
+  --output-script outputs/followup_plan/run_followups.sh \
+  --run-output-root outputs/followup_sweeps
+
+# 先检查 JSON 和 shell，再执行：
+bash outputs/followup_plan/run_followups.sh
+```
+
+规划规则：高 clip fraction / 大 ratio dispersion 优先降低 LR 或放宽 clip；几乎没有
+clipping 且 ratio dispersion 很小时优先提高 LR；中间区域一次只改变 LR 或 clip。
+
+## 6. 最佳配置的 anchor × seed 复现
+
+将最佳 run 目录传给脚本，会运行：
+
+```text
+anchor grad ratio = {0, 0.1, 0.2}
+seed              = {42, 43, 44}
+```
+
+共 9 个独立、从原始 MDM 开始的 30-epoch runs：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 \
+DEVICE=cuda:0 \
+REWARD_DEVICE=same \
+REWARD_CALIBRATION_PATH=$PWD/reward_calibration.json \
+FIXED_EVAL_POOL_PATH=$PWD/artifacts/humanml_val_fixed_eval_pool.pt \
+OUTPUT_ROOT=$PWD/outputs/anchor_seed_sweep \
+bash scripts/run_anchor_seed_sweep.sh outputs/followup_sweeps/BEST_RUN
+```
+
+输出 `anchor_seed_comparison.csv/.md`，再按 seed 聚合 retrieval delta、M2M delta
+和 balanced score 的均值与标准误。
+
+## 参数速查
+
+| 参数 | 说明 |
 | --- | --- |
-| `--sample-steps` | 采样步数；0 使用 checkpoint 的 diffusion step 数 |
-| `--ddim-eta` | transition 随机性；DDPO 要求大于 0 |
-| `--guidance-scale` | MDM classifier-free guidance scale |
-| `--samples-per-prompt` | 每个 prompt 的独立生成数；默认 4，组内计算 advantage |
-| `--timestep-fraction` | 每个样本用于 PPO 的 transition 比例；50 步训练验证默认 `0.5` |
-| `--train-batch-size` | 每次 PPO forward 使用的 rollout 样本数 |
-| `--gradient-accumulation-steps` | 累积多少个样本 minibatch；每个 minibatch 的所选 timesteps 会先全部累积 |
-| `--clip-range` | PPO ratio clipping 范围，默认与 ddpo-pytorch 一致为 `1e-4` |
-| `--advantage-mode` | 默认 `group_whiten`；可选 `group_centered` 做全局尺度的组内中心化 |
-| `--train-mode` | `lora` 或 `full` |
-| `--reward-embedding-mode mean` | 默认；使用 distribution mean，降低策略梯度中的奖励噪声 |
-| `--reward-embedding-mode sample` | 与 RFT_MLD 一样从 embedding distribution 随机采样 |
-| `--fixed-eval-every` | 固定 prompt/noise 验证间隔；默认每 5 epochs，0 表示关闭 |
-| `--fixed-eval-prompts` | 固定验证 prompt 数；默认 32，每个 prompt 仍生成 `samples-per-prompt` 个 motion |
-| `--early-stop-patience` | 连续多少次固定验证未创新高后停止；默认 8，0 表示关闭 |
-| `--reset-optimizer-on-resume` | 仅恢复 policy/epoch/RNG，重置 AdamW 与 GradScaler；迁移旧算法配置时使用 |
-| `--reward-device cpu` | GPU 显存不足时将 MotionReward/T5 放在 CPU |
-| `--data-cache-dir` | 可写共享数据缓存；默认是项目下的 `.cache/mdm` |
-| `--use-swanlab` | 启用 SwanLab epoch 级训练曲线记录；默认关闭 |
-| `--swanlab-mode` | SwanLab 运行模式：`online`、`offline`、`local` 或 `disabled` |
+| `--reward-calibration-path` | 固定 calibration JSON；fixed checkpoint selection 和 shrink 模式必需 |
+| `--split` | rollout split；只能为 `train` |
+| `--eval-split` | fixed validation split；checkpoint selection 只能使用 `val` |
+| `--fixed-eval-pool-path` | 跨 run 共享的精确 fixed pool；恢复时必须匹配 pool id |
+| `--fixed-eval-prompts` | 默认 128 |
+| `--fixed-eval-samples-per-prompt` | 默认 4，与 rollout K 独立 |
+| `--fixed-eval-bootstrap-samples` | paired bootstrap 次数，默认 2000 |
+| `--advantage-mode` | `group_whiten`、`group_centered`、`group_shrink`、`component_shrink` |
+| `--advantage-std-floor-quantile` | calibration floor 的 `p25` 或 `p50` |
+| `--advantage-retrieval-weight` | component advantage 固定权重，默认 0.5 |
+| `--advantage-m2m-weight` | component advantage 固定权重，默认 0.5 |
+| `--clip-range` | PPO ratio clipping，候选 `1e-4/3e-4/1e-3` |
+| `--log-prob-audit-tolerance` | 首次 update old/new log-prob 最大允许差异，默认 `1e-4` |
+| `--checkpoint-feasible-se-multiplier` | component 可行性容差的 bootstrap SE 倍数，默认 1 |
+| `--early-stop-min-delta-mode` | `fixed` 或 `auto`；默认 `auto` |
+| `--early-stop-se-multiplier` | auto min delta 的 balanced SE 倍数 |
+| `--anchor-lambda` | 固定 diffusion anchor 系数；默认 0 |
+| `--anchor-auto-grad-ratio` | 初始 anchor/PPO 梯度目标比；默认 0 |
+| `--anchor-batch-size` | 每次 update 的 distinct real motions；0 使用最多一个 train batch |
+| `--timestep-fraction` | 每个 motion 用于 PPO 的随机 transition 比例；默认 0.5 |
+| `--train-batch-size` | PPO physical sample batch |
+| `--gradient-accumulation-steps` | 组成一次 optimizer update 的 PPO minibatch 数 |
+| `--reset-optimizer-on-resume` | 算法迁移时恢复 policy/RNG，但重置 AdamW/GradScaler |
+| `--reward-device cpu` | 显存不足时把 MotionReward/T5 放到 CPU |
 
-默认精度为 BF16。RTX 3090 的真实冒烟测试中 BF16 梯度有限；FP16 个别 minibatch 可能溢出，因此训练循环会检测非有限梯度、跳过对应更新并给出告警。
+## 训练指标
 
-## 输出
+重要 SwanLab/JSONL 指标：
+
+- `audit/*`：首次 old/new log-prob 和 ratio 一致性；
+- `ppo/log_ratio_{mean,std,abs_max}`、`ppo/ratio_std`、`ppo/clip_fraction`；
+- `optimization/{grad_norm,lora_norm,update_norm,skipped_updates}`；
+- `advantage/{std_floor,effective_shrink_scale_max,component_correlation,component_conflict_fraction}`；
+- `advantage/{retrieval,m2m}_contribution_mean_abs`；
+- `eval/reward_{retrieval,m2m}_delta`、paired bootstrap SE 和 improvement fraction；
+- `eval/normalized_{retrieval,m2m}_delta`；
+- `eval/balanced_score`、`eval/balanced_score_bootstrap_se`、`eval/feasible`；
+- `anchor/{loss,weighted_loss,grad_norm,ppo_grad_norm,grad_ratio,lambda,calls}`。
+
+随机 rollout 的 `reward/total` 会受到每轮 prompt 难度组成影响，不应作为主要模型
+选择依据。优先观察 held-out paired component deltas、balanced score 和 feasibility。
+
+## 输出文件
 
 ```text
 OUTPUT_DIR/
 ├── config.json
 ├── metrics.jsonl
-├── fixed_eval.jsonl        # 固定 prompt/noise 验证及相对 baseline 增量
-├── swanlab/                 # 启用 SwanLab 时生成
-├── checkpoint_000000.pt
-├── best.pt                  # 起始 policy 或固定验证 reward 创新高的最佳权重
-└── latest.pt
+├── fixed_eval_pool.pt
+├── fixed_eval.jsonl
+├── fixed_eval_per_prompt.jsonl
+├── checkpoint_000004.pt
+├── best_balanced.pt
+├── best_retrieval.pt
+├── best_m2m.pt
+├── latest.pt
+└── swanlab/
 ```
 
-SwanLab 中记录的曲线包括 `reward/{total,retrieval,m2m,std}`、组内/组间
-reward 方差、`eval/{reward_total,reward_retrieval,reward_m2m}`、
-`ppo/{loss,approx_kl,clip_fraction,ratio}`、
-`optimization/{grad_norm,skipped_updates,learning_rate}`、训练进度和每轮耗时。
+`latest.pt` 每个 epoch 都更新；numbered checkpoint 按 `save_every`、best 更新、early
+stop 或最终 epoch 保存。checkpoint 包含 optimizer、GradScaler、RNG、fixed baseline、
+pool id、calibration id、balanced best 状态和自动标定后的 anchor lambda。
 
-`reward/total` 是每轮随机 prompt 和随机 motion 的 rollout 均值，不同 epoch
-之间的 prompt 难度组成不同，因此不应把它当作主要收敛曲线。判断训练是否真正
-改善时，请优先观察固定 prompt、固定噪声的 `eval/reward_total_delta`，并同时
-确认 `eval/reward_retrieval_delta` 和 `eval/reward_m2m_delta` 的方向。
-
-在同一随机种子、32 prompts / 128 motions 固定池上的 20-epoch 回归中：
-
-| advantage / timestep | 最佳 `eval_reward_delta` | 最终 `eval_reward_delta` |
-| --- | ---: | ---: |
-| `group_whiten / 0.5` | `+0.002656` | `+0.002656` |
-| `group_whiten / 1.0` | `+0.001586` | `+0.000150` |
-| `group_centered / 0.5` | `+0.000938` | `+0.000676` |
-
-因此默认采用 `group_whiten / 0.5`。固定验证可能连续多次回撤后重新创新高，
-实测曾在连续 6 次未创新高后恢复，所以默认 patience 设为 8，而不是 2。
-另一次迁移回归从旧版全 timestep 训练的 epoch 9 checkpoint 出发，重置 Adam
-并用新默认配置继续 10 epochs；固定池相对该 checkpoint 再提升 `+0.001466`，
-相对原始预训练累计提升 `+0.003309`，说明旧版早期最佳权重可以安全迁移。
-固定验证记录还保存采样步数、物理评估 batch、guidance、eta、精度和奖励权重
-签名；恢复训练时如果这些设置改变，会自动以恢复后的 policy 建立新 baseline，
-避免把两个不同验证过程的数值直接相减。
-
-首次加载 train split 时还会生成约 3.5 GB 的共享缓存：
-
-```text
-.cache/mdm/
-├── dataset/t2m_train.npy
-└── glove -> MotionRFT/deps/glove
-```
-
-checkpoint 包含 epoch、global step、可训练 policy 参数、optimizer、GradScaler 和随机数状态。恢复训练：
+恢复训练：
 
 ```bash
 python train_ddpo.py \
-  --resume outputs/humanml_retrieval_m2m/latest.pt \
-  --output-dir outputs/humanml_retrieval_m2m \
+  --resume outputs/run/latest.pt \
+  --output-dir outputs/run \
+  --reward-calibration-path reward_calibration.json \
   --epochs 200
 ```
 
-恢复时 `--train-mode`、LoRA rank/target 和基础 MDM checkpoint 必须与原训练一致。
-CLI 中的 learning rate、Adam betas、weight decay 和 epsilon 会覆盖 checkpoint
-保存的旧超参数，但默认仍恢复 Adam 的动量状态。
+恢复时会严格校验 train mode、全部 trainable tensors、calibration id 和 fixed pool id。
+跨输出目录恢复会复制已有的三个 best checkpoint。旧版没有 balanced state 的
+checkpoint 会以恢复后的 policy 建立新 baseline，并给出明确警告。
 
-如果从旧版训练迁移到新的 advantage/timestep 配置，建议新建输出目录并重置
-optimizer 状态：
+## 导出与标准 HumanML 快速评测
 
-```bash
-python train_ddpo.py \
-  --resume outputs/old_run/checkpoint_000009.pt \
-  --reset-optimizer-on-resume \
-  --output-dir outputs/migrated_run \
-  --epochs 100 \
-  --advantage-mode group_whiten \
-  --timestep-fraction 0.5
-```
-
-## 导出为标准 MDM checkpoint
-
-DDPO checkpoint 默认只保存 LoRA 与 optimizer 状态。导出工具会把 LoRA 合并到
-基础 MDM，并在目标目录写入标准 checkpoint 和 `args.json`：
+导出 LoRA 到标准 MDM checkpoint：
 
 ```bash
 python export_ddpo.py \
-  --checkpoint outputs/humanml_retrieval_m2m/latest.pt \
-  --output outputs/exported_mdm/model_ddpo.pt
+  --checkpoint outputs/run/best_balanced.pt \
+  --output outputs/exported/model_ddpo.pt
 ```
 
-导出后可直接使用参考 MDM 的生成入口：
+标准 HumanML `debug` 评测包含 5 次 replication。脚本先把 baseline checkpoint
+复制到本仓库输出目录，因此不会向外部 MDM 仓库写文件：
 
 ```bash
-cd /home/zhiwei/projects/motion-diffusion-model
-python sample/generate.py \
-  --model_path /home/zhiwei/projects/mdm-ddpo/outputs/exported_mdm/model_ddpo.pt \
-  --text_prompt "a person walks forward" \
-  --motion_length 6 \
-  --guidance_param 2.5
+CUDA_VISIBLE_DEVICES=7 EVAL_DEVICE=0 \
+bash scripts/run_standard_humanml_eval.sh \
+  outputs/run/best_balanced.pt \
+  outputs/humanml_standard_eval/run
 ```
+
+验收时比较 baseline 与 candidate 的 FID、Matching Score、R-precision 和 Diversity；
+候选退化应不超过 baseline 自身 replication confidence interval。正式论文结果应使用
+更完整的 `wo_mm` 或项目约定评测，而不是只报告 debug。
+
+## 消融比较表模板
+
+| Run | Seed | Advantage | Floor | LR | Clip | Anchor ratio | Best epoch | Retrieval Δ | M2M Δ | Balanced | Balanced SE | Feasible | Clip fraction | Ratio std |
+| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| A0 | 42 | group_whiten | — | 3e-4 | 1e-4 | 0 |  |  |  |  |  |  |  |  |
+| A1 | 42 | group_centered | — | 1e-4 | 1e-4 | 0 |  |  |  |  |  |  |  |  |
+| A2 | 42 | group_shrink | p25 | 1e-4 | 1e-4 | 0 |  |  |  |  |  |  |  |  |
+| A3 | 42 | group_shrink | p50 | 1e-4 | 1e-4 | 0 |  |  |  |  |  |  |  |  |
+| A4 | 42 | component_shrink | p25 | 1e-4 | 1e-4 | 0 |  |  |  |  |  |  |  |  |
 
 ## 测试
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q mdm_ddpo train_ddpo.py export_ddpo.py tests
+python -m compileall -q mdm_ddpo tools train_ddpo.py export_ddpo.py tests
+bash -n scripts/*.sh
 ```
 
-当前测试覆盖 DDIM log-prob 重算及梯度、padding mask、确定性末步、LoRA 初始等价性和奖励组合。
+测试覆盖 DDIM log-prob、padding、sample-level shuffle、严格 checkpoint loading、
+fixed pool 持久化、paired bootstrap、calibration checksum、shrinkage 数值稳定性、
+balanced feasibility、anchor 自动梯度标定、每 update 一次 anchor 以及实验汇总/规划。
 
-## 本机验证结果
+## 已知限制
 
-- CPU 真实预检成功：HumanML3D 训练样本 24,546，MDM 与 MotionReward checkpoint 均成功加载。
-- 注入 50 个 LoRA adapter，可训练参数 606,264，占完整模型参数约 0.649%。
-- RTX 3090 BF16 默认奖励冒烟成功：旧/新策略首次重算
-  `ratio=1.0`、`approx_kl=0`、无非有限梯度。
-- 原生 50 步、全部 49 个随机 transition 回归成功。
-- LoRA checkpoint 约 7.1 MB，所有保存参数有限，50 个 LoRA-B 均得到更新。
-- checkpoint 恢复后成功从 epoch 1、global step 1 继续训练并保存下一 checkpoint。
-- LoRA 合并导出得到 156 个标准 MDM state tensors，并通过原 MDM loader 重新加载。
+- 1024×4 calibration、A0–A4、follow-up 和 9 组 anchor/seed 是长时间 GPU 实验，
+  仓库提供可复现脚本，但代码提交本身不能替代这些统计结果。
+- validation 改善不保证标准 HumanML evaluator 的所有指标同步改善，因此最终配置
+  必须通过标准评测门槛。
+- retrieval 与 M2M 可能存在真实 ranking conflict；`component_shrink` 和 feasible
+  balanced checkpoint 限制其破坏，但不能从理论上消除任务目标冲突。
+- PPO clip 约束单次 update，不等价于对原始 MDM 的长期 KL 约束；diffusion anchor
+  是当前的长期保护机制，仍需用 0/0.1/0.2 与三个 seed 验证收益。

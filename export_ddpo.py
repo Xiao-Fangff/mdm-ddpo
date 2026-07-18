@@ -81,7 +81,7 @@ def main() -> None:
     dummy_data = SimpleNamespace(
         dataset=SimpleNamespace(num_actions=1)
     )
-    model, _, _ = build_mdm(
+    model, _, _, _ = build_mdm(
         config,
         model_args,
         dummy_data,
