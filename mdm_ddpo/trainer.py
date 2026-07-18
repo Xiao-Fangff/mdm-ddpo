@@ -17,6 +17,7 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 from tqdm.auto import tqdm
 
+from .calibration import RewardCalibration, load_reward_calibration
 from .config import TrainConfig
 from .diffusion import ddim_step_with_logprob
 from .lora import (
@@ -172,6 +173,9 @@ class FixedEvalResult:
     total_per_prompt: torch.Tensor
     retrieval_per_prompt: torch.Tensor
     m2m_per_prompt: torch.Tensor
+    total_by_prompt: torch.Tensor | None = None
+    retrieval_by_prompt: torch.Tensor | None = None
+    m2m_by_prompt: torch.Tensor | None = None
 
 
 def _update_hash_with_tensor(
@@ -547,6 +551,11 @@ class DDPOTrainer:
         )
 
         self.reward_model = MotionReward(config, self.reward_device)
+        self.reward_calibration: RewardCalibration | None = (
+            load_reward_calibration(config.reward_calibration_path)
+            if config.reward_calibration_path
+            else None
+        )
         self.start_epoch = 0
         self.global_step = 0
         self.fixed_eval_baseline: dict[str, Any] | None = None
@@ -646,6 +655,11 @@ class DDPOTrainer:
             "early_stop_patience": self.config.early_stop_patience,
             "log_prob_audit_tolerance": (
                 self.config.log_prob_audit_tolerance
+            ),
+            "reward_calibration_id": (
+                self.reward_calibration.calibration_id
+                if self.reward_calibration is not None
+                else ""
             ),
         }
 
@@ -952,16 +966,20 @@ class DDPOTrainer:
             self.fixed_eval_pool.prompt_count,
             self.config.fixed_eval_samples_per_prompt,
         )
+        total_by_prompt = rewards.reshape(group_shape)
+        retrieval_by_prompt = retrieval_rewards.reshape(group_shape)
+        m2m_by_prompt = m2m_rewards.reshape(group_shape)
         return FixedEvalResult(
             metrics={
                 "eval_reward_std": rewards.std(unbiased=False).item(),
                 **self._fixed_eval_signature(),
             },
-            total_per_prompt=rewards.reshape(group_shape).mean(dim=1),
-            retrieval_per_prompt=(
-                retrieval_rewards.reshape(group_shape).mean(dim=1)
-            ),
-            m2m_per_prompt=m2m_rewards.reshape(group_shape).mean(dim=1),
+            total_per_prompt=total_by_prompt.mean(dim=1),
+            retrieval_per_prompt=retrieval_by_prompt.mean(dim=1),
+            m2m_per_prompt=m2m_by_prompt.mean(dim=1),
+            total_by_prompt=total_by_prompt,
+            retrieval_by_prompt=retrieval_by_prompt,
+            m2m_by_prompt=m2m_by_prompt,
         )
 
     def _next_batch(self) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -1679,6 +1697,11 @@ class DDPOTrainer:
                 if self.fixed_eval_pool is not None
                 else None
             ),
+            "reward_calibration_id": (
+                self.reward_calibration.calibration_id
+                if self.reward_calibration is not None
+                else None
+            ),
             "best_eval_reward": self.best_eval_reward,
             "best_eval_epoch": self.best_eval_epoch,
             "evals_without_improvement": self.evals_without_improvement,
@@ -1719,6 +1742,20 @@ class DDPOTrainer:
             raise ValueError(
                 f"Checkpoint train_mode={checkpoint_mode!r} does not match "
                 f"current mode={self.config.train_mode!r}."
+            )
+        checkpoint_calibration_id = checkpoint.get("reward_calibration_id")
+        current_calibration_id = (
+            self.reward_calibration.calibration_id
+            if self.reward_calibration is not None
+            else None
+        )
+        if (
+            checkpoint_calibration_id is not None
+            and checkpoint_calibration_id != current_calibration_id
+        ):
+            raise ValueError(
+                "Checkpoint reward calibration does not match the current "
+                "--reward-calibration-path."
             )
         load_trainable_state_dict(self.model, checkpoint["policy"])
         restored_optimizer = restore_optimizer_state(
