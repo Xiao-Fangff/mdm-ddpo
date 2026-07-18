@@ -143,6 +143,11 @@ class SwanLabTrackerTest(unittest.TestCase):
                 "reward_between_prompt_std": 0.7,
                 "reward_group_std_min": 0.01,
                 "potential_group_whiten_scale_max": 100.0,
+                "effective_shrink_scale_max": 12.0,
+                "component_advantage_correlation": -0.2,
+                "component_advantage_conflict_fraction": 0.4,
+                "component_advantage_retrieval_contribution_mean_abs": 0.3,
+                "component_advantage_m2m_contribution_mean_abs": 0.25,
                 "eval_reward": 1.6,
                 "eval_reward_delta": 0.03,
                 "eval_reward_retrieval_delta_median": 0.01,
@@ -176,6 +181,17 @@ class SwanLabTrackerTest(unittest.TestCase):
         self.assertEqual(
             metrics["reward/potential_group_whiten_scale_max"],
             100.0,
+        )
+        self.assertEqual(metrics["advantage/effective_shrink_scale_max"], 12.0)
+        self.assertEqual(metrics["advantage/component_correlation"], -0.2)
+        self.assertEqual(metrics["advantage/component_conflict_fraction"], 0.4)
+        self.assertEqual(
+            metrics["advantage/retrieval_contribution_mean_abs"],
+            0.3,
+        )
+        self.assertEqual(
+            metrics["advantage/m2m_contribution_mean_abs"],
+            0.25,
         )
         self.assertEqual(metrics["eval/reward_total"], 1.6)
         self.assertEqual(metrics["eval/reward_total_delta"], 0.03)

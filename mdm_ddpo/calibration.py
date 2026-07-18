@@ -177,6 +177,9 @@ class RewardCalibration:
     def global_scale(self, component: str) -> float:
         return float(self.payload["components"][component]["global_scale"])
 
+    def reward_weight(self, component: str) -> float:
+        return float(self.payload["reward_weights"][component])
+
     def within_group_std_floor(self, component: str, quantile: str) -> float:
         if quantile not in {"p25", "p50"}:
             raise ValueError("Calibration floor quantile must be 'p25' or 'p50'.")

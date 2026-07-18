@@ -14,6 +14,7 @@ from mdm_ddpo.trainer import (
     FixedEvalResult,
     Trajectory,
     apply_optimizer_hyperparameters,
+    compute_component_shrink_advantages,
     compute_grouped_advantages,
     log_prob_consistency_metrics,
     repeat_prompt_batch,
@@ -123,6 +124,65 @@ class GroupedRolloutTest(unittest.TestCase):
             places=6,
         )
 
+    def test_group_shrink_uses_fixed_quadrature_floor(self):
+        advantages, stats = compute_grouped_advantages(
+            torch.tensor([0.0, 2.0]),
+            torch.tensor([0, 0]),
+            epsilon=1.0e-8,
+            mode="group_shrink",
+            std_floor=2.0,
+        )
+
+        expected = 1.0 / (5.0**0.5)
+        torch.testing.assert_close(
+            advantages,
+            torch.tensor([-expected, expected]),
+        )
+        self.assertEqual(stats["advantage_std_floor"], 2.0)
+        self.assertAlmostEqual(
+            stats["effective_shrink_scale_max"],
+            1.0 / (5.0**0.5),
+        )
+
+    def test_group_shrink_does_not_explode_for_tiny_group_std(self):
+        advantages, stats = compute_grouped_advantages(
+            torch.tensor([1.0, 1.0 + 1.0e-9], dtype=torch.float64),
+            torch.tensor([0, 0]),
+            epsilon=1.0e-12,
+            mode="group_shrink",
+            std_floor=0.1,
+        )
+
+        self.assertLess(advantages.abs().max().item(), 1.0e-7)
+        self.assertLessEqual(stats["effective_shrink_scale_max"], 10.0)
+
+    def test_component_shrink_logs_conflicting_component_contributions(self):
+        advantages, stats = compute_component_shrink_advantages(
+            torch.tensor([0.0, 2.0]),
+            torch.tensor([2.0, 0.0]),
+            torch.tensor([0, 0]),
+            epsilon=1.0e-8,
+            retrieval_std_floor=1.0,
+            m2m_std_floor=1.0,
+            retrieval_weight=0.5,
+            m2m_weight=0.5,
+        )
+
+        torch.testing.assert_close(advantages, torch.zeros(2))
+        self.assertAlmostEqual(
+            stats["component_advantage_correlation"],
+            -1.0,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            stats["component_advantage_conflict_fraction"],
+            1.0,
+        )
+        self.assertGreater(
+            stats["component_advantage_retrieval_contribution_mean_abs"],
+            0.0,
+        )
+
     def test_constant_prompt_reward_produces_zero_advantage(self):
         advantages, stats = compute_grouped_advantages(
             torch.tensor([2.0, 2.0, 1.0, 3.0]),
@@ -207,6 +267,15 @@ class GroupedRolloutTest(unittest.TestCase):
         self.assertEqual(config.eval_split, "val")
         self.assertEqual(config.fixed_eval_prompts, 128)
         self.assertEqual(config.fixed_eval_samples_per_prompt, 4)
+        self.assertEqual(config.advantage_retrieval_weight, 0.5)
+        self.assertEqual(config.advantage_m2m_weight, 0.5)
+
+    def test_shrink_advantages_require_fixed_calibration(self):
+        for mode in ("group_shrink", "component_shrink"):
+            with self.subTest(mode=mode):
+                config = TrainConfig(advantage_mode=mode)
+                with self.assertRaisesRegex(ValueError, "calibration"):
+                    config.validate()
 
     def test_checkpoint_selection_rejects_test_split(self):
         config = TrainConfig(eval_split="test", fixed_eval_every=1)

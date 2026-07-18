@@ -378,14 +378,17 @@ def compute_grouped_advantages(
     prompt_ids: torch.Tensor,
     epsilon: float,
     mode: str = "group_whiten",
+    std_floor: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Remove prompt difficulty with a selectable within-group reward scale."""
     if rewards.ndim != 1 or prompt_ids.shape != rewards.shape:
         raise ValueError("Rewards and prompt_ids must be matching 1-D tensors.")
     if epsilon <= 0:
         raise ValueError("Advantage epsilon must be positive.")
-    if mode not in {"group_centered", "group_whiten"}:
+    if mode not in {"group_centered", "group_whiten", "group_shrink"}:
         raise ValueError(f"Unknown grouped advantage mode: {mode!r}.")
+    if mode == "group_shrink" and (std_floor is None or std_floor <= 0):
+        raise ValueError("group_shrink requires a positive fixed std floor.")
 
     centered_rewards = torch.zeros_like(rewards)
     group_means: list[torch.Tensor] = []
@@ -412,8 +415,15 @@ def compute_grouped_advantages(
         for prompt_id, group_std in zip(unique_prompt_ids, stds):
             mask = prompt_ids == prompt_id
             advantages[mask] = centered_rewards[mask] / (group_std + epsilon)
-    else:
+    elif mode == "group_centered":
         advantages = centered_rewards / (centered_std + epsilon)
+    else:
+        assert std_floor is not None
+        advantages = torch.zeros_like(rewards)
+        for prompt_id, group_std in zip(unique_prompt_ids, stds):
+            mask = prompt_ids == prompt_id
+            denominator = torch.sqrt(group_std.square() + std_floor**2)
+            advantages[mask] = centered_rewards[mask] / denominator
 
     stats = {
         "unique_prompts": float(len(unique_prompt_ids)),
@@ -430,7 +440,116 @@ def compute_grouped_advantages(
             (stds < epsilon).float().mean().item()
         ),
     }
+    if mode == "group_shrink":
+        assert std_floor is not None
+        stats.update(
+            {
+                "advantage_std_floor": float(std_floor),
+                "effective_shrink_scale_max": (
+                    1.0 / torch.sqrt(stds.min().square() + std_floor**2)
+                ).item(),
+            }
+        )
     return advantages, stats
+
+
+def _pearson_tensor(first: torch.Tensor, second: torch.Tensor) -> float:
+    first = first.detach().float().reshape(-1)
+    second = second.detach().float().reshape(-1)
+    first = first - first.mean()
+    second = second - second.mean()
+    denominator = first.square().sum().sqrt() * second.square().sum().sqrt()
+    if denominator <= 0:
+        return 0.0
+    return (first * second).sum().div(denominator).item()
+
+
+def compute_component_shrink_advantages(
+    retrieval_rewards: torch.Tensor,
+    m2m_rewards: torch.Tensor,
+    prompt_ids: torch.Tensor,
+    *,
+    epsilon: float,
+    retrieval_std_floor: float,
+    m2m_std_floor: float,
+    retrieval_weight: float = 0.5,
+    m2m_weight: float = 0.5,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Shrink reward components independently before fixed-weight combining."""
+    if retrieval_rewards.shape != m2m_rewards.shape:
+        raise ValueError("Retrieval and M2M reward tensors must match.")
+    if retrieval_rewards.ndim != 1 or prompt_ids.shape != retrieval_rewards.shape:
+        raise ValueError("Component rewards and prompt ids must be matching 1-D tensors.")
+    if retrieval_std_floor <= 0 or m2m_std_floor <= 0:
+        raise ValueError("Component shrinkage floors must be positive.")
+    if retrieval_weight < 0 or m2m_weight < 0:
+        raise ValueError("Component advantage weights must be non-negative.")
+    if retrieval_weight == 0 and m2m_weight == 0:
+        raise ValueError("At least one component advantage weight must be non-zero.")
+
+    retrieval_advantages, retrieval_stats = compute_grouped_advantages(
+        retrieval_rewards,
+        prompt_ids,
+        epsilon,
+        mode="group_shrink",
+        std_floor=retrieval_std_floor,
+    )
+    m2m_advantages, m2m_stats = compute_grouped_advantages(
+        m2m_rewards,
+        prompt_ids,
+        epsilon,
+        mode="group_shrink",
+        std_floor=m2m_std_floor,
+    )
+    retrieval_contribution = retrieval_weight * retrieval_advantages
+    m2m_contribution = m2m_weight * m2m_advantages
+    combined = retrieval_contribution + m2m_contribution
+    comparable = (
+        retrieval_advantages.abs() > epsilon
+    ) & (m2m_advantages.abs() > epsilon)
+    conflict = comparable & (retrieval_advantages * m2m_advantages < 0)
+    stats = {
+        "component_advantage_correlation": _pearson_tensor(
+            retrieval_advantages,
+            m2m_advantages,
+        ),
+        "component_advantage_conflict_fraction": (
+            conflict.float().sum().div(comparable.float().sum()).item()
+            if comparable.any()
+            else 0.0
+        ),
+        "component_advantage_retrieval_weight": float(retrieval_weight),
+        "component_advantage_m2m_weight": float(m2m_weight),
+        "component_advantage_retrieval_std_floor": float(
+            retrieval_std_floor
+        ),
+        "component_advantage_m2m_std_floor": float(m2m_std_floor),
+        "component_advantage_retrieval_std": (
+            retrieval_advantages.std(unbiased=False).item()
+        ),
+        "component_advantage_m2m_std": (
+            m2m_advantages.std(unbiased=False).item()
+        ),
+        "component_advantage_retrieval_contribution_mean_abs": (
+            retrieval_contribution.abs().mean().item()
+        ),
+        "component_advantage_m2m_contribution_mean_abs": (
+            m2m_contribution.abs().mean().item()
+        ),
+        "component_advantage_retrieval_group_std_median": (
+            retrieval_stats["reward_group_std_median"]
+        ),
+        "component_advantage_m2m_group_std_median": (
+            m2m_stats["reward_group_std_median"]
+        ),
+        "component_advantage_retrieval_effective_scale_max": (
+            retrieval_stats["effective_shrink_scale_max"]
+        ),
+        "component_advantage_m2m_effective_scale_max": (
+            m2m_stats["effective_shrink_scale_max"]
+        ),
+    }
+    return combined, stats
 
 
 @dataclass
@@ -556,6 +675,24 @@ class DDPOTrainer:
             if config.reward_calibration_path
             else None
         )
+        if (
+            config.advantage_mode == "group_shrink"
+            and self.reward_calibration is not None
+            and (
+                not math.isclose(
+                    self.reward_calibration.reward_weight("retrieval"),
+                    config.retrieval_weight,
+                )
+                or not math.isclose(
+                    self.reward_calibration.reward_weight("m2m"),
+                    config.m2m_weight,
+                )
+            )
+        ):
+            raise ValueError(
+                "group_shrink total reward weights must match the reward "
+                "weights stored in reward_calibration.json."
+            )
         self.start_epoch = 0
         self.global_step = 0
         self.fixed_eval_baseline: dict[str, Any] | None = None
@@ -640,6 +777,24 @@ class DDPOTrainer:
             ),
             "samples_per_prompt": self.config.samples_per_prompt,
             "advantage_mode": self.config.advantage_mode,
+            "advantage_std_floor_quantile": (
+                self.config.advantage_std_floor_quantile
+            ),
+            "advantage_total_std_floor": (
+                self._advantage_std_floor("total")
+                if self.config.advantage_mode == "group_shrink"
+                else 0.0
+            ),
+            "advantage_retrieval_std_floor": (
+                self._advantage_std_floor("retrieval")
+                if self.config.advantage_mode == "component_shrink"
+                else 0.0
+            ),
+            "advantage_m2m_std_floor": (
+                self._advantage_std_floor("m2m")
+                if self.config.advantage_mode == "component_shrink"
+                else 0.0
+            ),
             "timestep_fraction": self.config.timestep_fraction,
             "fixed_eval_enabled": self.fixed_eval_pool is not None,
             "fixed_eval_prompts": self.config.fixed_eval_prompts,
@@ -1093,18 +1248,60 @@ class DDPOTrainer:
             for batch_index in range(self.config.rollout_batches_per_epoch)
         ]
         trajectory = Trajectory.concatenate(batches)
-        trajectory.advantages, trajectory.group_stats = compute_grouped_advantages(
-            trajectory.rewards,
-            trajectory.prompt_ids,
-            self.config.advantage_epsilon,
-            self.config.advantage_mode,
-        )
+        if self.config.advantage_mode == "component_shrink":
+            trajectory.advantages, component_stats = (
+                compute_component_shrink_advantages(
+                    trajectory.retrieval_rewards,
+                    trajectory.m2m_rewards,
+                    trajectory.prompt_ids,
+                    epsilon=self.config.advantage_epsilon,
+                    retrieval_std_floor=self._advantage_std_floor(
+                        "retrieval"
+                    ),
+                    m2m_std_floor=self._advantage_std_floor("m2m"),
+                    retrieval_weight=(
+                        self.config.advantage_retrieval_weight
+                    ),
+                    m2m_weight=self.config.advantage_m2m_weight,
+                )
+            )
+            _, total_stats = compute_grouped_advantages(
+                trajectory.rewards,
+                trajectory.prompt_ids,
+                self.config.advantage_epsilon,
+                mode="group_centered",
+            )
+            trajectory.group_stats = {**total_stats, **component_stats}
+        else:
+            trajectory.advantages, trajectory.group_stats = (
+                compute_grouped_advantages(
+                    trajectory.rewards,
+                    trajectory.prompt_ids,
+                    self.config.advantage_epsilon,
+                    self.config.advantage_mode,
+                    std_floor=(
+                        self._advantage_std_floor("total")
+                        if self.config.advantage_mode == "group_shrink"
+                        else None
+                    ),
+                )
+            )
         if trajectory.group_stats["zero_variance_prompt_fraction"] > 0:
             LOGGER.warning(
                 "%.1f%% of prompt groups have effectively zero reward variance.",
                 100.0 * trajectory.group_stats["zero_variance_prompt_fraction"],
             )
         return trajectory
+
+    def _advantage_std_floor(self, component: str) -> float:
+        if self.reward_calibration is None:
+            raise RuntimeError(
+                "A loaded reward calibration is required for shrinkage."
+            )
+        return self.reward_calibration.within_group_std_floor(
+            component,
+            self.config.advantage_std_floor_quantile,
+        )
 
     def _selected_timesteps(
         self,

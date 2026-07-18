@@ -69,6 +69,9 @@ class TrainConfig:
     adv_clip_max: float = 5.0
     advantage_epsilon: float = 1.0e-8
     advantage_mode: str = "group_whiten"
+    advantage_std_floor_quantile: str = "p25"
+    advantage_retrieval_weight: float = 0.5
+    advantage_m2m_weight: float = 0.5
     log_prob_audit_tolerance: float = 1.0e-4
 
     train_mode: str = "lora"
@@ -167,9 +170,37 @@ class TrainConfig:
             raise ValueError("--early-stop-patience cannot be negative.")
         if self.early_stop_min_delta < 0:
             raise ValueError("--early-stop-min-delta cannot be negative.")
-        if self.advantage_mode not in {"group_centered", "group_whiten"}:
+        if self.advantage_mode not in {
+            "group_centered",
+            "group_whiten",
+            "group_shrink",
+            "component_shrink",
+        }:
             raise ValueError(
-                "--advantage-mode must be 'group_centered' or 'group_whiten'."
+                "--advantage-mode must be group_centered, group_whiten, "
+                "group_shrink, or component_shrink."
+            )
+        if self.advantage_std_floor_quantile not in {"p25", "p50"}:
+            raise ValueError(
+                "--advantage-std-floor-quantile must be 'p25' or 'p50'."
+            )
+        if self.advantage_mode in {"group_shrink", "component_shrink"}:
+            if not self.reward_calibration_path:
+                raise ValueError(
+                    f"--advantage-mode {self.advantage_mode} requires "
+                    "--reward-calibration-path."
+                )
+        if (
+            self.advantage_retrieval_weight < 0
+            or self.advantage_m2m_weight < 0
+            or (
+                self.advantage_retrieval_weight == 0
+                and self.advantage_m2m_weight == 0
+            )
+        ):
+            raise ValueError(
+                "Component advantage weights must be non-negative and not "
+                "both zero."
             )
         if not 0 < self.timestep_fraction <= 1:
             raise ValueError("--timestep-fraction must be in (0, 1].")
@@ -396,13 +427,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument(
         "--advantage-mode",
-        choices=["group_centered", "group_whiten"],
+        choices=[
+            "group_centered",
+            "group_whiten",
+            "group_shrink",
+            "component_shrink",
+        ],
         default="group_whiten",
         help=(
             "Subtract each prompt's reward mean, then either divide by every "
             "prompt's own standard deviation (group_whiten, validated default) "
-            "or apply one global scale (group_centered)."
+            "apply one global scale (group_centered), use a fixed calibrated "
+            "shrinkage floor (group_shrink), or shrink retrieval/M2M "
+            "separately before combining them (component_shrink)."
         ),
+    )
+    train.add_argument(
+        "--advantage-std-floor-quantile",
+        choices=["p25", "p50"],
+        default="p25",
+        help="Calibration within-group std quantile used as shrinkage floor.",
+    )
+    train.add_argument(
+        "--advantage-retrieval-weight",
+        type=float,
+        default=0.5,
+    )
+    train.add_argument(
+        "--advantage-m2m-weight",
+        type=float,
+        default=0.5,
     )
 
     policy = parser.add_argument_group("policy parameters")

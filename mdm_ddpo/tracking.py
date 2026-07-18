@@ -60,7 +60,41 @@ TRAINING_METRIC_NAMES = {
     "potential_group_whiten_scale_max": (
         "reward/potential_group_whiten_scale_max"
     ),
+    "advantage_std_floor": "advantage/std_floor",
+    "effective_shrink_scale_max": "advantage/effective_shrink_scale_max",
     "zero_variance_prompt_fraction": "reward/zero_variance_prompt_fraction",
+    "component_advantage_correlation": "advantage/component_correlation",
+    "component_advantage_conflict_fraction": (
+        "advantage/component_conflict_fraction"
+    ),
+    "component_advantage_retrieval_weight": (
+        "advantage/retrieval_weight"
+    ),
+    "component_advantage_m2m_weight": "advantage/m2m_weight",
+    "component_advantage_retrieval_std_floor": (
+        "advantage/retrieval_std_floor"
+    ),
+    "component_advantage_m2m_std_floor": "advantage/m2m_std_floor",
+    "component_advantage_retrieval_std": "advantage/retrieval_std",
+    "component_advantage_m2m_std": "advantage/m2m_std",
+    "component_advantage_retrieval_contribution_mean_abs": (
+        "advantage/retrieval_contribution_mean_abs"
+    ),
+    "component_advantage_m2m_contribution_mean_abs": (
+        "advantage/m2m_contribution_mean_abs"
+    ),
+    "component_advantage_retrieval_group_std_median": (
+        "advantage/retrieval_group_std_median"
+    ),
+    "component_advantage_m2m_group_std_median": (
+        "advantage/m2m_group_std_median"
+    ),
+    "component_advantage_retrieval_effective_scale_max": (
+        "advantage/retrieval_effective_scale_max"
+    ),
+    "component_advantage_m2m_effective_scale_max": (
+        "advantage/m2m_effective_scale_max"
+    ),
     "advantage_mean": "ppo/advantage_mean",
     "advantage_std": "ppo/advantage_std",
     "loss": "ppo/loss",
