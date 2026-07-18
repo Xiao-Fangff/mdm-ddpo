@@ -148,6 +148,53 @@ def _tensor_collection_l2_norm(tensors: list[torch.Tensor]) -> float:
     return squared_norm.sqrt().item()
 
 
+def gradient_l2_norm(
+    gradients: list[torch.Tensor | None],
+    *,
+    scale: float = 1.0,
+) -> float:
+    if scale <= 0:
+        raise ValueError("Gradient scale must be positive.")
+    values = [
+        gradient.detach().float() / scale
+        for gradient in gradients
+        if gradient is not None
+    ]
+    return _tensor_collection_l2_norm(values)
+
+
+def calibrate_anchor_lambda(
+    ppo_grad_norm: float,
+    anchor_grad_norm: float,
+    target_ratio: float,
+    *,
+    epsilon: float = 1.0e-12,
+) -> float:
+    if target_ratio < 0:
+        raise ValueError("Anchor gradient target ratio cannot be negative.")
+    if (
+        not math.isfinite(ppo_grad_norm)
+        or not math.isfinite(anchor_grad_norm)
+        or ppo_grad_norm <= epsilon
+        or anchor_grad_norm <= epsilon
+    ):
+        raise ValueError(
+            "Cannot calibrate anchor lambda from zero or non-finite gradients."
+        )
+    return target_ratio * ppo_grad_norm / anchor_grad_norm
+
+
+class NativeMDMTrainingModel(torch.nn.Module):
+    """Transparent adapter expected by MDM's native training_losses code."""
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        return self.model(*args, **kwargs)
+
+
 FIXED_EVAL_POOL_VERSION = 1
 
 
@@ -676,7 +723,12 @@ class DDPOTrainer:
         self.model_args = load_model_args(config)
         self.data_loader = build_data_loader(config)
         self.data_iterator: Any | None = None
-        self.model, self.diffusion, self.sample_steps = build_mdm(
+        (
+            self.model,
+            self.diffusion,
+            self.base_diffusion,
+            self.sample_steps,
+        ) = build_mdm(
             config,
             self.model_args,
             self.data_loader,
@@ -696,6 +748,19 @@ class DDPOTrainer:
             config.guidance_scale,
         )
         self.policy_model.eval()
+        self.anchor_enabled = bool(
+            config.anchor_lambda > 0
+            or config.anchor_auto_grad_ratio > 0
+        )
+        self.anchor_model = (
+            NativeMDMTrainingModel(self.model)
+            if self.anchor_enabled
+            else None
+        )
+        self.anchor_lambda_effective = float(config.anchor_lambda)
+        self.anchor_lambda_calibrated = bool(
+            config.anchor_auto_grad_ratio <= 0
+        )
 
         trainable_parameters = [
             parameter for parameter in self.model.parameters() if parameter.requires_grad
@@ -876,6 +941,13 @@ class DDPOTrainer:
                 self.reward_calibration.calibration_id
                 if self.reward_calibration is not None
                 else ""
+            ),
+            "anchor_enabled": self.anchor_enabled,
+            "anchor_lambda": self.config.anchor_lambda,
+            "anchor_auto_grad_ratio": self.config.anchor_auto_grad_ratio,
+            "anchor_batch_size": (
+                self.config.anchor_batch_size
+                or self.config.train_batch_size
             ),
         }
 
@@ -1429,6 +1501,167 @@ class DDPOTrainer:
             self.config.log_prob_audit_tolerance,
         )
 
+    def _anchor_sample_indices(
+        self,
+        trajectory: Trajectory,
+        group_sample_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        target_count = (
+            self.config.anchor_batch_size
+            or self.config.train_batch_size
+        )
+        selected: list[int] = []
+        seen_prompt_ids: set[int] = set()
+        for sample_index in group_sample_indices.tolist():
+            prompt_id = int(trajectory.prompt_ids[sample_index])
+            if prompt_id in seen_prompt_ids:
+                continue
+            seen_prompt_ids.add(prompt_id)
+            selected.append(sample_index)
+            if len(selected) >= target_count:
+                break
+        if not selected:
+            raise RuntimeError("Anchor update found no distinct real motions.")
+        return torch.tensor(selected, dtype=torch.long)
+
+    def _compute_anchor_loss(
+        self,
+        trajectory: Trajectory,
+        sample_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.anchor_model is None:
+            raise RuntimeError("The MDM diffusion anchor is disabled.")
+        gt_motion = trajectory.gt_motion[sample_indices].to(
+            self.device,
+            dtype=torch.float32,
+            non_blocking=self.config.pin_memory,
+        )
+        motion = gt_motion.permute(0, 2, 1).unsqueeze(2).contiguous()
+        lengths = trajectory.lengths[sample_indices]
+        index_values = sample_indices.tolist()
+        texts = [trajectory.texts[index] for index in index_values]
+        cached_text_embeddings = [
+            trajectory.text_embeddings[index] for index in index_values
+        ]
+        model_kwargs = build_model_kwargs(
+            self.model,
+            texts,
+            lengths,
+            motion.shape[-1],
+            device=self.device,
+            guidance_scale=1.0,
+            cached_text_embeddings=cached_text_embeddings,
+        )
+        timesteps = torch.randint(
+            0,
+            self.base_diffusion.num_timesteps,
+            (motion.shape[0],),
+            device=self.device,
+        )
+        self.anchor_model.train()
+        try:
+            with autocast_context(self.device, self.config.precision):
+                terms = self.base_diffusion.training_losses(
+                    self.anchor_model,
+                    motion,
+                    timesteps,
+                    model_kwargs=model_kwargs,
+                    dataset=self.data_loader.dataset,
+                )
+                anchor_loss = terms["loss"].mean()
+        finally:
+            self.anchor_model.eval()
+            self.model.eval()
+            self.policy_model.eval()
+        if not torch.isfinite(anchor_loss):
+            raise FloatingPointError("Native MDM anchor loss is non-finite.")
+        return anchor_loss
+
+    def _add_anchor_gradients(
+        self,
+        trajectory: Trajectory,
+        group_sample_indices: torch.Tensor,
+        trainable_parameters: list[torch.Tensor],
+    ) -> dict[str, float]:
+        scale = (
+            float(self.scaler.get_scale())
+            if self.scaler.is_enabled()
+            else 1.0
+        )
+        ppo_grad_norm = gradient_l2_norm(
+            [parameter.grad for parameter in trainable_parameters],
+            scale=scale,
+        )
+        anchor_indices = self._anchor_sample_indices(
+            trajectory,
+            group_sample_indices,
+        )
+        anchor_loss = self._compute_anchor_loss(
+            trajectory,
+            anchor_indices,
+        )
+        anchor_gradients = list(
+            torch.autograd.grad(
+                anchor_loss,
+                trainable_parameters,
+                allow_unused=True,
+            )
+        )
+        anchor_grad_norm = gradient_l2_norm(anchor_gradients)
+        if not math.isfinite(anchor_grad_norm):
+            raise FloatingPointError("Native MDM anchor gradients are non-finite.")
+        if (
+            self.config.anchor_auto_grad_ratio > 0
+            and not self.anchor_lambda_calibrated
+        ):
+            self.anchor_lambda_effective = calibrate_anchor_lambda(
+                ppo_grad_norm,
+                anchor_grad_norm,
+                self.config.anchor_auto_grad_ratio,
+            )
+            self.anchor_lambda_calibrated = True
+            LOGGER.info(
+                "Calibrated anchor lambda=%.8g for target grad ratio=%.4f "
+                "(ppo_grad_norm=%.6g, anchor_grad_norm=%.6g).",
+                self.anchor_lambda_effective,
+                self.config.anchor_auto_grad_ratio,
+                ppo_grad_norm,
+                anchor_grad_norm,
+            )
+        weighted_grad_norm = (
+            self.anchor_lambda_effective * anchor_grad_norm
+        )
+        with torch.no_grad():
+            for parameter, anchor_gradient in zip(
+                trainable_parameters,
+                anchor_gradients,
+            ):
+                if anchor_gradient is None:
+                    continue
+                contribution = (
+                    anchor_gradient.detach()
+                    * self.anchor_lambda_effective
+                    * scale
+                )
+                if parameter.grad is None:
+                    parameter.grad = contribution.clone()
+                else:
+                    parameter.grad.add_(contribution)
+        return {
+            "anchor_loss": anchor_loss.detach().float().item(),
+            "anchor_weighted_loss": (
+                anchor_loss.detach().float().item()
+                * self.anchor_lambda_effective
+            ),
+            "anchor_grad_norm": anchor_grad_norm,
+            "anchor_weighted_grad_norm": weighted_grad_norm,
+            "ppo_grad_norm": ppo_grad_norm,
+            "anchor_grad_ratio": weighted_grad_norm / max(ppo_grad_norm, 1.0e-12),
+            "anchor_lambda": self.anchor_lambda_effective,
+            "anchor_batch_samples": float(len(anchor_indices)),
+            "anchor_calls": 1.0,
+        }
+
     def optimize(self, trajectory: Trajectory) -> dict[str, float]:
         if trajectory.advantages is None:
             raise ValueError("Advantages must be computed before optimization.")
@@ -1440,6 +1673,19 @@ class DDPOTrainer:
             "update_norm": [],
             "skipped_updates": [],
         }
+        if self.anchor_enabled:
+            for name in (
+                "anchor_loss",
+                "anchor_weighted_loss",
+                "anchor_grad_norm",
+                "anchor_weighted_grad_norm",
+                "ppo_grad_norm",
+                "anchor_grad_ratio",
+                "anchor_lambda",
+                "anchor_batch_samples",
+                "anchor_calls",
+            ):
+                metric_values[name] = []
         log_ratio_parts: list[torch.Tensor] = []
         ratio_parts: list[torch.Tensor] = []
         audit_metrics: dict[str, float] | None = None
@@ -1593,6 +1839,17 @@ class DDPOTrainer:
                         and minibatch_position + 1 == group_end
                     )
                     if should_step:
+                        if self.anchor_enabled:
+                            group_sample_indices = torch.cat(
+                                sample_minibatches[group_start:group_end]
+                            )
+                            anchor_metrics = self._add_anchor_gradients(
+                                trajectory,
+                                group_sample_indices,
+                                trainable_parameters,
+                            )
+                            for name, value in anchor_metrics.items():
+                                metric_values[name].append(value)
                         self.scaler.unscale_(self.optimizer)
                         grad_norm = clip_grad_norm_(
                             trainable_parameters,
@@ -1642,7 +1899,11 @@ class DDPOTrainer:
         all_log_ratios = torch.cat(log_ratio_parts)
         all_ratios = torch.cat(ratio_parts)
         result = {
-            name: float(np.mean(values)) if values else 0.0
+            name: (
+                float(np.sum(values))
+                if name == "anchor_calls"
+                else float(np.mean(values))
+            ) if values else 0.0
             for name, values in metric_values.items()
         }
         result.update(
@@ -2044,6 +2305,8 @@ class DDPOTrainer:
                 if self.fixed_eval_pool is not None
                 else None
             ),
+            "anchor_lambda_effective": self.anchor_lambda_effective,
+            "anchor_lambda_calibrated": self.anchor_lambda_calibrated,
             "reward_calibration_id": (
                 self.reward_calibration.calibration_id
                 if self.reward_calibration is not None
@@ -2138,6 +2401,22 @@ class DDPOTrainer:
             self._restore_rng_state(checkpoint["rng"])
         self.start_epoch = int(checkpoint["epoch"]) + 1
         self.global_step = int(checkpoint.get("global_step", 0))
+        checkpoint_anchor_target = float(
+            checkpoint.get("config", {}).get("anchor_auto_grad_ratio", 0.0)
+        )
+        if (
+            self.config.anchor_auto_grad_ratio > 0
+            and math.isclose(
+                checkpoint_anchor_target,
+                self.config.anchor_auto_grad_ratio,
+            )
+        ):
+            self.anchor_lambda_effective = float(
+                checkpoint.get("anchor_lambda_effective", 0.0)
+            )
+            self.anchor_lambda_calibrated = bool(
+                checkpoint.get("anchor_lambda_calibrated", False)
+            )
         self.fixed_eval_baseline = checkpoint.get("fixed_eval_baseline")
         baseline_per_prompt = checkpoint.get("fixed_eval_baseline_per_prompt")
         self.fixed_eval_baseline_per_prompt = (

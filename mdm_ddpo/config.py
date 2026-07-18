@@ -73,6 +73,9 @@ class TrainConfig:
     advantage_retrieval_weight: float = 0.5
     advantage_m2m_weight: float = 0.5
     log_prob_audit_tolerance: float = 1.0e-4
+    anchor_lambda: float = 0.0
+    anchor_auto_grad_ratio: float = 0.0
+    anchor_batch_size: int = 0
 
     train_mode: str = "lora"
     lora_rank: int = 8
@@ -149,6 +152,17 @@ class TrainConfig:
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"--{name.replace('_', '-')} must be positive.")
+        if self.anchor_lambda < 0:
+            raise ValueError("--anchor-lambda cannot be negative.")
+        if self.anchor_auto_grad_ratio < 0:
+            raise ValueError("--anchor-auto-grad-ratio cannot be negative.")
+        if self.anchor_lambda > 0 and self.anchor_auto_grad_ratio > 0:
+            raise ValueError(
+                "Use either a fixed --anchor-lambda or "
+                "--anchor-auto-grad-ratio, not both."
+            )
+        if self.anchor_batch_size < 0:
+            raise ValueError("--anchor-batch-size cannot be negative.")
         if self.samples_per_prompt < 2:
             raise ValueError(
                 "--samples-per-prompt must be at least 2 for grouped advantages."
@@ -441,6 +455,30 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum allowed absolute old/new log-probability difference "
             "before the first optimizer update for each rollout."
+        ),
+    )
+    train.add_argument(
+        "--anchor-lambda",
+        type=float,
+        default=0.0,
+        help="Fixed coefficient for the optional native MDM diffusion anchor.",
+    )
+    train.add_argument(
+        "--anchor-auto-grad-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Calibrate anchor lambda once so its initial gradient norm is "
+            "this fraction of the PPO gradient norm (for example 0.1 or 0.2)."
+        ),
+    )
+    train.add_argument(
+        "--anchor-batch-size",
+        type=int,
+        default=0,
+        help=(
+            "Distinct real motions per optimizer update used by the anchor; "
+            "0 uses up to --train-batch-size."
         ),
     )
     train.add_argument(

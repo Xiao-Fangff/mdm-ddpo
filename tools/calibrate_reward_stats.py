@@ -234,7 +234,7 @@ def main(argv: list[str] | None = None) -> None:
 
     data_loader = build_data_loader(config)
     model_args = load_model_args(config)
-    model, diffusion, sample_steps = build_mdm(
+    model, diffusion, _, sample_steps = build_mdm(
         config,
         model_args,
         data_loader,

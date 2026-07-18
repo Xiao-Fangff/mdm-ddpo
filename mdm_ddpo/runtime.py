@@ -206,7 +206,7 @@ def build_mdm(
     model_args: SimpleNamespace,
     data_loader: DataLoader,
     device: torch.device,
-) -> tuple[nn.Module, Any, int]:
+) -> tuple[nn.Module, Any, Any, int]:
     from utils.model_util import create_model_and_diffusion, load_saved_model
 
     # MDM's BERT path is relative in the reference source.
@@ -220,7 +220,7 @@ def build_mdm(
     diffusion = _build_respaced_diffusion(base_diffusion, model_args, sample_steps)
     model.to(device)
     model.eval()
-    return model, diffusion, sample_steps
+    return model, diffusion, base_diffusion, sample_steps
 
 
 class ClassifierFreeGuidance(nn.Module):

@@ -138,6 +138,12 @@ class SwanLabTrackerTest(unittest.TestCase):
                 "ratio_std": 0.003,
                 "lora_norm": 2.0,
                 "update_norm": 0.01,
+                "anchor_loss": 0.8,
+                "anchor_weighted_loss": 0.08,
+                "anchor_grad_norm": 2.0,
+                "ppo_grad_norm": 4.0,
+                "anchor_grad_ratio": 0.1,
+                "anchor_lambda": 0.04,
                 "elapsed_seconds": 8.0,
                 "reward_within_prompt_std": 0.2,
                 "reward_between_prompt_std": 0.7,
@@ -179,6 +185,12 @@ class SwanLabTrackerTest(unittest.TestCase):
         self.assertEqual(metrics["ppo/ratio_std"], 0.003)
         self.assertEqual(metrics["optimization/lora_norm"], 2.0)
         self.assertEqual(metrics["optimization/update_norm"], 0.01)
+        self.assertEqual(metrics["anchor/loss"], 0.8)
+        self.assertEqual(metrics["anchor/weighted_loss"], 0.08)
+        self.assertEqual(metrics["anchor/grad_norm"], 2.0)
+        self.assertEqual(metrics["anchor/ppo_grad_norm"], 4.0)
+        self.assertEqual(metrics["anchor/grad_ratio"], 0.1)
+        self.assertEqual(metrics["anchor/lambda"], 0.04)
         self.assertEqual(metrics["time/epoch_seconds"], 8.0)
         self.assertEqual(metrics["optimization/learning_rate"], 1.0e-4)
         self.assertEqual(metrics["reward/within_prompt_std"], 0.2)
