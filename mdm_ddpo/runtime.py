@@ -134,11 +134,21 @@ def build_dataset(config: TrainConfig, *, split: str) -> Any:
     )
 
 
-def build_data_loader(config: TrainConfig) -> DataLoader:
+def build_data_loader(
+    config: TrainConfig,
+    *,
+    prompt_batch_size: int | None = None,
+) -> DataLoader:
     from data_loaders.get_data import get_collate_fn
 
     dataset = build_dataset(config, split=config.split)
-    prompt_batch_size = config.prompts_per_rollout_batch
+    prompt_batch_size = (
+        config.prompts_per_rollout_batch
+        if prompt_batch_size is None
+        else int(prompt_batch_size)
+    )
+    if prompt_batch_size <= 0:
+        raise ValueError("HumanML prompt batch size must be positive.")
     if len(dataset) < prompt_batch_size:
         raise ValueError(
             f"Dataset has {len(dataset)} samples, fewer than prompt batch size "

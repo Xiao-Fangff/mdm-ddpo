@@ -131,6 +131,8 @@ class SwanLabTrackerTest(unittest.TestCase):
                 "reward": 0.4,
                 "reward_retrieval": 0.3,
                 "reward_m2m": 0.5,
+                "reward_step": 0.7,
+                "step_mae": 0.8,
                 "loss": -0.1,
                 "log_ratio_mean": 0.001,
                 "log_ratio_std": 0.002,
@@ -154,6 +156,8 @@ class SwanLabTrackerTest(unittest.TestCase):
                 "component_advantage_conflict_fraction": 0.4,
                 "component_advantage_retrieval_contribution_mean_abs": 0.3,
                 "component_advantage_m2m_contribution_mean_abs": 0.25,
+                "component_advantage_step_contribution_mean_abs": 0.1,
+                "component_advantage_retrieval_step_correlation": -0.3,
                 "eval_reward": 1.6,
                 "eval_reward_delta": 0.03,
                 "eval_reward_retrieval_delta_median": 0.01,
@@ -170,6 +174,12 @@ class SwanLabTrackerTest(unittest.TestCase):
                 "eval_diffusion_steps": 50,
                 "eval_best_reward": 1.62,
                 "eval_best_epoch": 2,
+                "eval_step_reward": 0.72,
+                "eval_step_reward_delta": 0.08,
+                "eval_step_mae": 0.75,
+                "eval_step_mae_delta": -0.2,
+                "eval_normalized_step_delta": 0.4,
+                "eval_is_best_step": 1.0,
             },
             learning_rate=1.0e-4,
         )
@@ -178,6 +188,8 @@ class SwanLabTrackerTest(unittest.TestCase):
         self.assertEqual(metrics["reward/total"], 0.4)
         self.assertEqual(metrics["reward/retrieval"], 0.3)
         self.assertEqual(metrics["reward/m2m"], 0.5)
+        self.assertEqual(metrics["reward/step"], 0.7)
+        self.assertEqual(metrics["step/mae"], 0.8)
         self.assertEqual(metrics["ppo/loss"], -0.1)
         self.assertEqual(metrics["ppo/log_ratio_mean"], 0.001)
         self.assertEqual(metrics["ppo/log_ratio_std"], 0.002)
@@ -211,6 +223,14 @@ class SwanLabTrackerTest(unittest.TestCase):
             metrics["advantage/m2m_contribution_mean_abs"],
             0.25,
         )
+        self.assertEqual(
+            metrics["advantage/step_contribution_mean_abs"],
+            0.1,
+        )
+        self.assertEqual(
+            metrics["advantage/retrieval_step_correlation"],
+            -0.3,
+        )
         self.assertEqual(metrics["eval/reward_total"], 1.6)
         self.assertEqual(metrics["eval/reward_total_delta"], 0.03)
         self.assertEqual(metrics["eval/reward_retrieval_delta_median"], 0.01)
@@ -233,6 +253,12 @@ class SwanLabTrackerTest(unittest.TestCase):
         self.assertEqual(metrics["eval/diffusion_steps"], 50)
         self.assertEqual(metrics["eval/best_reward_total"], 1.62)
         self.assertEqual(metrics["eval/best_epoch"], 2)
+        self.assertEqual(metrics["step_eval/reward"], 0.72)
+        self.assertEqual(metrics["step_eval/reward_delta"], 0.08)
+        self.assertEqual(metrics["step_eval/mae"], 0.75)
+        self.assertEqual(metrics["step_eval/mae_delta"], -0.2)
+        self.assertEqual(metrics["step_eval/normalized_reward_delta"], 0.4)
+        self.assertEqual(metrics["step_eval/is_best_step"], 1.0)
 
 
 if __name__ == "__main__":

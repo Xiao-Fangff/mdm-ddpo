@@ -1,7 +1,12 @@
 import torch
 import unittest
 
-from mdm_ddpo.rewards import MotionReward, combine_reward_components
+from mdm_ddpo.rewards import (
+    MotionReward,
+    RewardOutput,
+    add_step_reward,
+    combine_reward_components,
+)
 
 
 class RewardCompositionTest(unittest.TestCase):
@@ -26,6 +31,26 @@ class RewardCompositionTest(unittest.TestCase):
 
         converted = reward._to_reward_normalization(mdm_normalized)
         torch.testing.assert_close(converted, torch.tensor([[[2.0, -0.5]]]))
+
+    def test_step_reward_is_additive_and_mask_diagnostics_are_preserved(self):
+        base = RewardOutput(
+            total=torch.tensor([1.0, 2.0]),
+            retrieval=torch.tensor([0.4, 0.5]),
+            m2m=torch.tensor([0.6, 1.5]),
+        )
+        combined = add_step_reward(
+            base,
+            step=torch.tensor([0.0, 1.0]),
+            step_mask=torch.tensor([False, True]),
+            detected_steps=torch.tensor([-1, 3]),
+            target_steps=torch.tensor([-1, 3]),
+            absolute_error=torch.tensor([-1, 0]),
+            step_weight=0.5,
+        )
+
+        torch.testing.assert_close(combined.total, torch.tensor([1.0, 2.5]))
+        self.assertEqual(combined.step_mask.tolist(), [False, True])
+        self.assertEqual(combined.detected_steps.tolist(), [-1, 3])
 
     def test_mean_embedding_scoring_preserves_rng_state(self):
         reward = MotionReward.__new__(MotionReward)

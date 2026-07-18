@@ -16,12 +16,22 @@ class RewardOutput:
     total: torch.Tensor
     retrieval: torch.Tensor
     m2m: torch.Tensor
+    step: torch.Tensor | None = None
+    step_mask: torch.Tensor | None = None
+    detected_steps: torch.Tensor | None = None
+    target_steps: torch.Tensor | None = None
+    step_absolute_error: torch.Tensor | None = None
 
     def means(self) -> dict[str, float]:
         return {
             "reward": self.total.float().mean().item(),
             "reward_retrieval": self.retrieval.float().mean().item(),
             "reward_m2m": self.m2m.float().mean().item(),
+            **(
+                {"reward_step": self.step.float().mean().item()}
+                if self.step is not None
+                else {}
+            ),
         }
 
 
@@ -35,6 +45,39 @@ def combine_reward_components(
     if retrieval.shape != m2m.shape:
         raise ValueError("Retrieval and M2M rewards must have the same shape.")
     return retrieval_weight * retrieval + m2m_weight * m2m
+
+
+def add_step_reward(
+    reward: RewardOutput,
+    *,
+    step: torch.Tensor,
+    step_mask: torch.Tensor,
+    detected_steps: torch.Tensor,
+    target_steps: torch.Tensor,
+    absolute_error: torch.Tensor,
+    step_weight: float,
+) -> RewardOutput:
+    if step.shape != reward.total.shape:
+        raise ValueError("Step reward must match the base reward shape.")
+    for value in (
+        step_mask,
+        detected_steps,
+        target_steps,
+        absolute_error,
+    ):
+        if value.shape != reward.total.shape:
+            raise ValueError("Step reward diagnostics must match base rewards.")
+    total = reward.total + float(step_weight) * step.to(reward.total)
+    return RewardOutput(
+        total=total,
+        retrieval=reward.retrieval,
+        m2m=reward.m2m,
+        step=step.to(reward.total),
+        step_mask=step_mask.to(device=reward.total.device, dtype=torch.bool),
+        detected_steps=detected_steps.to(reward.total.device),
+        target_steps=target_steps.to(reward.total.device),
+        step_absolute_error=absolute_error.to(reward.total.device),
+    )
 
 
 class MotionReward:

@@ -51,6 +51,13 @@ TRAINING_METRIC_NAMES = {
     "reward_std": "reward/std",
     "reward_retrieval": "reward/retrieval",
     "reward_m2m": "reward/m2m",
+    "reward_step": "reward/step",
+    "step_exact_fraction": "step/exact_fraction",
+    "step_within_one_fraction": "step/within_one_fraction",
+    "step_mae": "step/mae",
+    "step_detected_mean": "step/detected_mean",
+    "step_target_mean": "step/target_mean",
+    "step_rollout_samples": "step/rollout_samples",
     "reward_within_prompt_std": "reward/within_prompt_std",
     "reward_between_prompt_std": "reward/between_prompt_std",
     "reward_centered_std": "reward/centered_std",
@@ -95,6 +102,31 @@ TRAINING_METRIC_NAMES = {
     "component_advantage_m2m_effective_scale_max": (
         "advantage/m2m_effective_scale_max"
     ),
+    "component_advantage_step_weight": "advantage/step_weight",
+    "component_advantage_step_std_floor": "advantage/step_std_floor",
+    "component_advantage_step_std": "advantage/step_std",
+    "component_advantage_step_contribution_mean_abs": (
+        "advantage/step_contribution_mean_abs"
+    ),
+    "component_advantage_step_group_std_median": (
+        "advantage/step_group_std_median"
+    ),
+    "component_advantage_step_effective_scale_max": (
+        "advantage/step_effective_scale_max"
+    ),
+    "component_advantage_retrieval_step_correlation": (
+        "advantage/retrieval_step_correlation"
+    ),
+    "component_advantage_m2m_step_correlation": (
+        "advantage/m2m_step_correlation"
+    ),
+    "component_advantage_retrieval_step_conflict_fraction": (
+        "advantage/retrieval_step_conflict_fraction"
+    ),
+    "component_advantage_m2m_step_conflict_fraction": (
+        "advantage/m2m_step_conflict_fraction"
+    ),
+    "component_advantage_step_samples": "advantage/step_samples",
     "advantage_mean": "ppo/advantage_mean",
     "advantage_std": "ppo/advantage_std",
     "loss": "ppo/loss",
@@ -194,16 +226,57 @@ TRAINING_METRIC_NAMES = {
     "eval_is_best_balanced": "eval/is_best_balanced",
     "eval_is_best_retrieval": "eval/is_best_retrieval",
     "eval_is_best_m2m": "eval/is_best_m2m",
+    "eval_is_best_step": "step_eval/is_best_step",
     "eval_best_balanced_score": "eval/best_balanced_score",
     "eval_best_balanced_epoch": "eval/best_balanced_epoch",
     "eval_best_retrieval_delta": "eval/best_retrieval_delta",
     "eval_best_retrieval_epoch": "eval/best_retrieval_epoch",
     "eval_best_m2m_delta": "eval/best_m2m_delta",
     "eval_best_m2m_epoch": "eval/best_m2m_epoch",
+    "eval_best_step_delta": "step_eval/best_reward_delta",
+    "eval_best_step_epoch": "step_eval/best_epoch",
     "eval_best_reward": "eval/best_reward_total",
     "eval_best_reward_delta": "eval/best_reward_total_delta",
     "eval_best_epoch": "eval/best_epoch",
     "eval_evals_without_improvement": "eval/evals_without_improvement",
+    "step_eval_reward_std": "step_eval/reward_std",
+    "step_eval_detected_mean": "step_eval/detected_mean",
+    "step_eval_target_mean": "step_eval/target_mean",
+    "step_eval_samples": "step_eval/samples",
+    "step_eval_prompts": "step_eval/prompts",
+    "step_eval_samples_per_prompt": "step_eval/samples_per_prompt",
+    "step_eval_seed": "step_eval/seed",
+    "eval_step_total": "step_eval/total",
+    "eval_step_total_delta": "step_eval/total_delta",
+    "eval_step_retrieval": "step_eval/retrieval",
+    "eval_step_retrieval_delta": "step_eval/retrieval_delta",
+    "eval_step_m2m": "step_eval/m2m",
+    "eval_step_m2m_delta": "step_eval/m2m_delta",
+    "eval_step_reward": "step_eval/reward",
+    "eval_step_reward_baseline": "step_eval/reward_baseline",
+    "eval_step_reward_delta": "step_eval/reward_delta",
+    "eval_step_reward_delta_median": "step_eval/reward_delta_median",
+    "eval_step_reward_improvement_fraction": (
+        "step_eval/reward_improvement_fraction"
+    ),
+    "eval_step_reward_delta_bootstrap_se": (
+        "step_eval/reward_delta_bootstrap_se"
+    ),
+    "eval_step_exact_fraction": "step_eval/exact_fraction",
+    "eval_step_exact_fraction_delta": "step_eval/exact_fraction_delta",
+    "eval_step_within_one_fraction": "step_eval/within_one_fraction",
+    "eval_step_within_one_fraction_delta": (
+        "step_eval/within_one_fraction_delta"
+    ),
+    "eval_step_mae": "step_eval/mae",
+    "eval_step_mae_baseline": "step_eval/mae_baseline",
+    "eval_step_mae_delta": "step_eval/mae_delta",
+    "eval_step_mae_improvement_fraction": (
+        "step_eval/mae_improvement_fraction"
+    ),
+    "eval_step_detected_mean": "step_eval/detected_mean_per_prompt",
+    "eval_step_detected_mean_delta": "step_eval/detected_mean_delta",
+    "eval_normalized_step_delta": "step_eval/normalized_reward_delta",
 }
 
 

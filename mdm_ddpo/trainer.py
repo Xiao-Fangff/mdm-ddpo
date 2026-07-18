@@ -27,7 +27,7 @@ from .lora import (
     parameter_counts,
     trainable_state_dict,
 )
-from .rewards import MotionReward, RewardOutput
+from .rewards import MotionReward, RewardOutput, add_step_reward
 from .runtime import (
     autocast_context,
     bootstrap_external_repositories,
@@ -44,6 +44,23 @@ from .runtime import (
     split_text_embeddings,
 )
 from .tracking import SwanLabTracker, format_training_metrics
+from .step_calibration import (
+    StepRewardCalibration,
+    load_step_reward_calibration,
+)
+from .step_data import (
+    FixedStepEvalPool,
+    StepMotionDataset,
+    build_step_data_loader,
+    create_fixed_step_eval_pool,
+    load_fixed_step_eval_pool,
+    load_humanml_stats,
+    load_step_manifest,
+    save_fixed_step_eval_pool,
+    stratified_step_split,
+    target_histogram,
+)
+from .step_reward import HardStepDetector, compute_step_count_reward
 
 
 LOGGER = logging.getLogger(__name__)
@@ -243,6 +260,24 @@ class FixedEvalResult:
     m2m_by_prompt: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class FixedStepEvalResult:
+    metrics: dict[str, Any]
+    total_per_prompt: torch.Tensor
+    retrieval_per_prompt: torch.Tensor
+    m2m_per_prompt: torch.Tensor
+    step_reward_per_prompt: torch.Tensor
+    exact_per_prompt: torch.Tensor
+    within_one_per_prompt: torch.Tensor
+    mae_per_prompt: torch.Tensor
+    detected_mean_per_prompt: torch.Tensor
+    total_by_prompt: torch.Tensor | None = None
+    retrieval_by_prompt: torch.Tensor | None = None
+    m2m_by_prompt: torch.Tensor | None = None
+    step_reward_by_prompt: torch.Tensor | None = None
+    detected_steps_by_prompt: torch.Tensor | None = None
+
+
 def _update_hash_with_tensor(
     digest: Any,
     tensor: torch.Tensor,
@@ -407,6 +442,40 @@ def summarize_fixed_eval_component(
         f"{name}_delta": delta.mean().item(),
         f"{name}_delta_median": torch.quantile(delta, 0.5).item(),
         f"{name}_improvement_fraction": (delta > 0).float().mean().item(),
+        f"{name}_delta_bootstrap_se": bootstrap_standard_error(
+            delta,
+            samples=bootstrap_samples,
+            seed=seed + 1,
+        ),
+    }
+
+
+def summarize_fixed_eval_error(
+    name: str,
+    current: torch.Tensor,
+    baseline: torch.Tensor,
+    *,
+    bootstrap_samples: int,
+    seed: int,
+) -> dict[str, float]:
+    """Summarize a paired validation metric where lower is better."""
+    current = current.detach().float().cpu().reshape(-1)
+    baseline = baseline.detach().float().cpu().reshape(-1)
+    if current.shape != baseline.shape or current.numel() == 0:
+        raise ValueError("Fixed-eval current and baseline errors must match.")
+    delta = current - baseline
+    return {
+        name: current.mean().item(),
+        f"{name}_median": torch.quantile(current, 0.5).item(),
+        f"{name}_bootstrap_se": bootstrap_standard_error(
+            current,
+            samples=bootstrap_samples,
+            seed=seed,
+        ),
+        f"{name}_baseline": baseline.mean().item(),
+        f"{name}_delta": delta.mean().item(),
+        f"{name}_delta_median": torch.quantile(delta, 0.5).item(),
+        f"{name}_improvement_fraction": (delta < 0).float().mean().item(),
         f"{name}_delta_bootstrap_se": bootstrap_standard_error(
             delta,
             samples=bootstrap_samples,
@@ -584,6 +653,10 @@ def compute_component_shrink_advantages(
     m2m_std_floor: float,
     retrieval_weight: float = 0.5,
     m2m_weight: float = 0.5,
+    step_rewards: torch.Tensor | None = None,
+    step_mask: torch.Tensor | None = None,
+    step_std_floor: float | None = None,
+    step_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Shrink reward components independently before fixed-weight combining."""
     if retrieval_rewards.shape != m2m_rewards.shape:
@@ -592,10 +665,22 @@ def compute_component_shrink_advantages(
         raise ValueError("Component rewards and prompt ids must be matching 1-D tensors.")
     if retrieval_std_floor <= 0 or m2m_std_floor <= 0:
         raise ValueError("Component shrinkage floors must be positive.")
-    if retrieval_weight < 0 or m2m_weight < 0:
+    if retrieval_weight < 0 or m2m_weight < 0 or step_weight < 0:
         raise ValueError("Component advantage weights must be non-negative.")
-    if retrieval_weight == 0 and m2m_weight == 0:
+    if retrieval_weight == 0 and m2m_weight == 0 and step_weight == 0:
         raise ValueError("At least one component advantage weight must be non-zero.")
+    if (step_rewards is None) != (step_mask is None):
+        raise ValueError("Step rewards and step mask must be provided together.")
+    if step_rewards is not None:
+        if step_rewards.shape != retrieval_rewards.shape:
+            raise ValueError("Step rewards must match retrieval rewards.")
+        assert step_mask is not None
+        if step_mask.shape != retrieval_rewards.shape:
+            raise ValueError("Step mask must match component rewards.")
+        if step_weight > 0 and (step_std_floor is None or step_std_floor <= 0):
+            raise ValueError(
+                "A positive step component weight requires a fixed std floor."
+            )
 
     retrieval_advantages, retrieval_stats = compute_grouped_advantages(
         retrieval_rewards,
@@ -659,6 +744,94 @@ def compute_component_shrink_advantages(
             m2m_stats["effective_shrink_scale_max"]
         ),
     }
+    if step_rewards is not None and step_weight > 0:
+        assert step_mask is not None
+        assert step_std_floor is not None
+        active = step_mask.bool()
+        for prompt_id in torch.unique(prompt_ids, sorted=True):
+            prompt_active = active[prompt_ids == prompt_id]
+            if prompt_active.any() and not prompt_active.all():
+                raise ValueError(
+                    "Step reward mask must be constant within every prompt group."
+                )
+        if active.any():
+            active_advantages, step_stats = compute_grouped_advantages(
+                step_rewards[active],
+                prompt_ids[active],
+                epsilon,
+                mode="group_shrink",
+                std_floor=step_std_floor,
+            )
+            step_advantages = torch.zeros_like(step_rewards)
+            step_advantages[active] = active_advantages
+            step_contribution = step_weight * step_advantages
+            combined = combined + step_contribution
+            retrieval_step_comparable = (
+                retrieval_advantages[active].abs() > epsilon
+            ) & (active_advantages.abs() > epsilon)
+            m2m_step_comparable = (
+                m2m_advantages[active].abs() > epsilon
+            ) & (active_advantages.abs() > epsilon)
+
+            def conflict_fraction(
+                first: torch.Tensor,
+                second: torch.Tensor,
+                comparable_mask: torch.Tensor,
+            ) -> float:
+                if not comparable_mask.any():
+                    return 0.0
+                conflict_mask = comparable_mask & (first * second < 0)
+                return conflict_mask.float().sum().div(
+                    comparable_mask.float().sum()
+                ).item()
+
+            stats.update(
+                {
+                    "component_advantage_step_weight": float(step_weight),
+                    "component_advantage_step_std_floor": float(step_std_floor),
+                    "component_advantage_step_std": (
+                        active_advantages.std(unbiased=False).item()
+                    ),
+                    "component_advantage_step_contribution_mean_abs": (
+                        step_contribution[active].abs().mean().item()
+                    ),
+                    "component_advantage_step_group_std_median": (
+                        step_stats["reward_group_std_median"]
+                    ),
+                    "component_advantage_step_effective_scale_max": (
+                        step_stats["effective_shrink_scale_max"]
+                    ),
+                    "component_advantage_retrieval_step_correlation": (
+                        _pearson_tensor(
+                            retrieval_advantages[active],
+                            active_advantages,
+                        )
+                    ),
+                    "component_advantage_m2m_step_correlation": (
+                        _pearson_tensor(
+                            m2m_advantages[active],
+                            active_advantages,
+                        )
+                    ),
+                    "component_advantage_retrieval_step_conflict_fraction": (
+                        conflict_fraction(
+                            retrieval_advantages[active],
+                            active_advantages,
+                            retrieval_step_comparable,
+                        )
+                    ),
+                    "component_advantage_m2m_step_conflict_fraction": (
+                        conflict_fraction(
+                            m2m_advantages[active],
+                            active_advantages,
+                            m2m_step_comparable,
+                        )
+                    ),
+                    "component_advantage_step_samples": float(active.sum()),
+                }
+            )
+        else:
+            stats["component_advantage_step_samples"] = 0.0
     return combined, stats
 
 
@@ -676,6 +849,11 @@ class Trajectory:
     lengths: torch.Tensor
     gt_motion: torch.Tensor
     prompt_ids: torch.Tensor
+    step_rewards: torch.Tensor | None = None
+    step_mask: torch.Tensor | None = None
+    detected_steps: torch.Tensor | None = None
+    target_steps: torch.Tensor | None = None
+    step_absolute_error: torch.Tensor | None = None
     advantages: torch.Tensor | None = None
     group_stats: dict[str, float] | None = None
 
@@ -693,6 +871,16 @@ class Trajectory:
             )
             prompt_id_parts.append(local_ids + prompt_offset)
             prompt_offset += len(unique_ids)
+
+        def concatenate_optional(name: str) -> torch.Tensor | None:
+            values = [getattr(batch, name) for batch in batches]
+            if all(value is None for value in values):
+                return None
+            if any(value is None for value in values):
+                raise ValueError(
+                    f"Trajectory field {name!r} is missing from some batches."
+                )
+            return torch.cat(values, dim=0)  # type: ignore[arg-type]
 
         return cls(
             latents=torch.cat([batch.latents for batch in batches], dim=0),
@@ -719,6 +907,11 @@ class Trajectory:
             lengths=torch.cat([batch.lengths for batch in batches], dim=0),
             gt_motion=torch.cat([batch.gt_motion for batch in batches], dim=0),
             prompt_ids=torch.cat(prompt_id_parts, dim=0),
+            step_rewards=concatenate_optional("step_rewards"),
+            step_mask=concatenate_optional("step_mask"),
+            detected_steps=concatenate_optional("detected_steps"),
+            target_steps=concatenate_optional("target_steps"),
+            step_absolute_error=concatenate_optional("step_absolute_error"),
         )
 
 
@@ -739,8 +932,14 @@ class DDPOTrainer:
             json.dump(config.to_dict(), handle, indent=2, sort_keys=True)
 
         self.model_args = load_model_args(config)
-        self.data_loader = build_data_loader(config)
+        self.data_loader = build_data_loader(
+            config,
+            prompt_batch_size=config.humanml_prompts_per_rollout_batch,
+        )
         self.data_iterator: Any | None = None
+        self.step_data_loader: Any | None = None
+        self.step_data_iterator: Any | None = None
+        self.step_eval_records: list[Any] = []
         (
             self.model,
             self.diffusion,
@@ -803,6 +1002,28 @@ class DDPOTrainer:
             if config.reward_calibration_path
             else None
         )
+        self.step_reward_calibration: StepRewardCalibration | None = (
+            load_step_reward_calibration(config.step_reward_calibration_path)
+            if config.step_reward_calibration_path
+            else None
+        )
+        self.step_detector: HardStepDetector | None = None
+        self.step_mdm_mean: torch.Tensor | None = None
+        self.step_mdm_std: torch.Tensor | None = None
+        if config.enable_step_reward:
+            if self.step_reward_calibration is not None:
+                self.step_reward_calibration.validate_settings(
+                    detector_config=config.step_detector_config(),
+                    reward_config=config.step_reward_config(),
+                )
+            self.step_detector = HardStepDetector(
+                backend=config.step_detector_backend,
+                fps=config.step_detector_fps,
+                motion_rule_root=config.step_detector_root,
+                lead_threshold=config.step_detector_lead_threshold,
+                rgdno_threshold=config.step_detector_rgdno_threshold,
+            )
+            self._initialize_step_training_data()
         if (
             config.advantage_mode == "group_shrink"
             and self.reward_calibration is not None
@@ -832,7 +1053,14 @@ class DDPOTrainer:
         self.best_retrieval_epoch: int | None = None
         self.best_m2m_delta: float | None = None
         self.best_m2m_epoch: int | None = None
+        self.fixed_step_eval_baseline_per_prompt: (
+            dict[str, torch.Tensor] | None
+        ) = None
+        self.best_step_reward_delta: float | None = None
+        self.best_step_epoch: int | None = None
         self.evals_without_improvement = 0
+        self.fixed_step_eval_pool: FixedStepEvalPool | None = None
+        self.checkpoint_fixed_step_eval_pool_id: str | None = None
         if config.resume:
             self._load_checkpoint(config.resume)
         self.fixed_eval_pool = (
@@ -840,6 +1068,21 @@ class DDPOTrainer:
             if config.fixed_eval_every > 0
             else None
         )
+        self.fixed_step_eval_pool = (
+            self._load_or_create_fixed_step_eval_pool()
+            if config.enable_step_reward and config.fixed_eval_every > 0
+            else None
+        )
+        if (
+            self.fixed_step_eval_pool is not None
+            and self.checkpoint_fixed_step_eval_pool_id is not None
+            and self.fixed_step_eval_pool.pool_id
+            != self.checkpoint_fixed_step_eval_pool_id
+        ):
+            raise ValueError(
+                "Resume checkpoint fixed step-eval pool does not match "
+                "fixed_step_eval_pool.pt."
+            )
         if (
             self.fixed_eval_pool is not None
             and self.checkpoint_fixed_eval_pool_id is not None
@@ -856,6 +1099,7 @@ class DDPOTrainer:
                 "best_balanced.pt",
                 "best_retrieval.pt",
                 "best_m2m.pt",
+                "best_step.pt",
             ):
                 source = resume_dir / name
                 target = self.output_dir / name
@@ -939,6 +1183,13 @@ class DDPOTrainer:
                 if self.config.advantage_mode == "component_shrink"
                 else 0.0
             ),
+            "advantage_step_std_floor": (
+                self._advantage_std_floor("step")
+                if self.config.enable_step_reward
+                and self.config.advantage_mode == "component_shrink"
+                and self.config.advantage_step_weight > 0
+                else 0.0
+            ),
             "timestep_fraction": self.config.timestep_fraction,
             "fixed_eval_enabled": self.fixed_eval_pool is not None,
             "fixed_eval_prompts": self.config.fixed_eval_prompts,
@@ -967,7 +1218,154 @@ class DDPOTrainer:
                 self.config.anchor_batch_size
                 or self.config.train_batch_size
             ),
+            "step_reward_enabled": self.config.enable_step_reward,
+            "step_prompt_ratio": (
+                self.config.step_prompts_per_rollout_batch
+                / self.config.prompts_per_rollout_batch
+            ),
+            "step_prompts_per_rollout_batch": (
+                self.config.step_prompts_per_rollout_batch
+            ),
+            "humanml_prompts_per_rollout_batch": (
+                self.config.humanml_prompts_per_rollout_batch
+            ),
+            "step_targets": list(self.config.step_target_values),
+            "step_detector": self.config.step_detector_config(),
+            "step_reward": self.config.step_reward_config(),
+            "step_reward_weight": self.config.step_reward_weight,
+            "step_reward_calibration_id": (
+                self.step_reward_calibration.calibration_id
+                if self.step_reward_calibration is not None
+                else ""
+            ),
+            "fixed_step_eval_pool_id": (
+                self.fixed_step_eval_pool.pool_id
+                if self.fixed_step_eval_pool is not None
+                else ""
+            ),
         }
+
+    def _initialize_step_training_data(self) -> None:
+        mean, std = load_humanml_stats(self.config.mdm_root)
+        records = load_step_manifest(
+            self.config.step_data_manifest,
+            motion_root=self.config.step_motion_root,
+            targets=self.config.step_target_values,
+            min_frames=self.config.step_min_frames,
+            max_frames=self.config.step_max_frames,
+        )
+        training, evaluation = stratified_step_split(
+            records,
+            eval_per_target=self.config.step_eval_samples_per_target,
+            split_seed=self.config.step_split_seed,
+            prompt_seed=self.config.step_prompt_seed,
+        )
+        dataset = StepMotionDataset(
+            training,
+            mean=mean,
+            std=std,
+            max_frames=self.config.step_max_frames,
+        )
+        self.step_data_loader = build_step_data_loader(
+            dataset,
+            batch_size=self.config.step_prompts_per_rollout_batch,
+            seed=self.config.seed + 7919,
+            workers=self.config.data_workers,
+            pin_memory=self.config.pin_memory,
+        )
+        self.step_eval_records = list(evaluation)
+        self.step_mdm_mean = torch.as_tensor(
+            mean,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.step_mdm_std = torch.as_tensor(
+            std,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        LOGGER.info(
+            "Step mixed data: train=%d, held_out_val=%d, targets=%s, "
+            "target_histogram=%s, prompts_per_batch=%d/%d.",
+            len(training),
+            len(evaluation),
+            self.config.step_target_values,
+            target_histogram(training),
+            self.config.step_prompts_per_rollout_batch,
+            self.config.prompts_per_rollout_batch,
+        )
+
+    def _load_or_create_fixed_step_eval_pool(self) -> FixedStepEvalPool:
+        if self.step_mdm_mean is None or self.step_mdm_std is None:
+            raise RuntimeError("Step training data has not been initialized.")
+        output_path = self.output_dir / "fixed_step_eval_pool.pt"
+        configured_path = (
+            Path(self.config.fixed_step_eval_pool_path).expanduser().resolve()
+            if self.config.fixed_step_eval_pool_path
+            else None
+        )
+        source_path: Path | None = None
+        if configured_path is not None and configured_path.exists():
+            source_path = configured_path
+        elif output_path.exists():
+            source_path = output_path
+        elif self.config.resume:
+            candidate = (
+                Path(self.config.resume).expanduser().resolve().parent
+                / "fixed_step_eval_pool.pt"
+            )
+            if candidate.exists():
+                source_path = candidate
+            else:
+                raise FileNotFoundError(
+                    "Cannot resume step validation because "
+                    "fixed_step_eval_pool.pt is missing next to the checkpoint."
+                )
+        if source_path is None:
+            pool = create_fixed_step_eval_pool(
+                self.step_eval_records,
+                mean=self.step_mdm_mean.detach().cpu().numpy(),
+                std=self.step_mdm_std.detach().cpu().numpy(),
+                max_frames=self.config.step_max_frames,
+                noise_seed=self.config.fixed_eval_seed + 104729,
+                detector_backend=self.config.step_detector_backend,
+            )
+            if configured_path is not None:
+                save_fixed_step_eval_pool(pool, configured_path)
+        else:
+            pool = load_fixed_step_eval_pool(source_path)
+        expected_count = (
+            len(self.config.step_target_values)
+            * self.config.step_eval_samples_per_target
+        )
+        target_counts = {
+            target: int((pool.target_steps == target).sum())
+            for target in self.config.step_target_values
+        }
+        if (
+            pool.prompt_count != expected_count
+            or pool.detector_backend != self.config.step_detector_backend
+            or pool.noise_seed != self.config.fixed_eval_seed + 104729
+            or set(pool.target_steps.tolist())
+            != set(self.config.step_target_values)
+            or any(
+                count != self.config.step_eval_samples_per_target
+                for count in target_counts.values()
+            )
+        ):
+            raise ValueError(
+                "Fixed step-eval pool does not match current step settings."
+            )
+        if configured_path is not None and not configured_path.exists():
+            save_fixed_step_eval_pool(pool, configured_path)
+        if output_path != source_path:
+            save_fixed_step_eval_pool(pool, output_path)
+        LOGGER.info(
+            "Fixed step validation pool: prompts=%d, pool_id=%s",
+            pool.prompt_count,
+            pool.pool_id,
+        )
+        return pool
 
     def _create_fixed_eval_pool(self) -> FixedEvalPool:
         """Materialize exact held-out samples without advancing training RNG."""
@@ -1109,7 +1507,7 @@ class DDPOTrainer:
             self.config.prompts_per_rollout_batch,
         )
         precision_code = {"no": 0.0, "fp16": 1.0, "bf16": 2.0}
-        return {
+        signature = {
             "eval_samples": float(
                 self.fixed_eval_pool.prompt_count
                 * self.config.fixed_eval_samples_per_prompt
@@ -1134,7 +1532,35 @@ class DDPOTrainer:
             "eval_allow_tf32": float(self.config.allow_tf32),
             "eval_retrieval_weight": float(self.config.retrieval_weight),
             "eval_m2m_weight": float(self.config.m2m_weight),
-    }
+        }
+        step_pool = getattr(self, "fixed_step_eval_pool", None)
+        if step_pool is not None:
+            signature.update(
+                {
+                    "step_eval_samples": float(
+                        step_pool.prompt_count
+                        * self.config.fixed_eval_samples_per_prompt
+                    ),
+                    "step_eval_prompts": float(
+                        step_pool.prompt_count
+                    ),
+                    "step_eval_samples_per_prompt": float(
+                        self.config.fixed_eval_samples_per_prompt
+                    ),
+                    "step_eval_seed": float(
+                        step_pool.noise_seed
+                    ),
+                    "step_eval_pool_id": step_pool.pool_id,
+                    "step_eval_detector_backend": (
+                        step_pool.detector_backend
+                    ),
+                    "step_eval_reward_weight": float(
+                        self.config.step_reward_weight
+                    ),
+                    "step_eval_reward_mode": self.config.step_reward_mode,
+                }
+            )
+        return signature
 
     @torch.no_grad()
     def evaluate_fixed_pool(self) -> FixedEvalResult:
@@ -1288,25 +1714,297 @@ class DDPOTrainer:
             m2m_by_prompt=m2m_by_prompt,
         )
 
+    @torch.no_grad()
+    def evaluate_fixed_step_pool(self) -> FixedStepEvalResult:
+        """Evaluate held-out step prompts with fixed noise and hard counts."""
+        if self.fixed_step_eval_pool is None:
+            raise RuntimeError("Fixed step evaluation is disabled.")
+        if (
+            self.step_detector is None
+            or self.step_mdm_mean is None
+            or self.step_mdm_std is None
+        ):
+            raise RuntimeError("Step detector is not initialized.")
+
+        prompt_batch_size = self.config.prompts_per_rollout_batch
+        total_prompt_count = self.fixed_step_eval_pool.prompt_count
+        chunk_count = math.ceil(total_prompt_count / prompt_batch_size)
+        progress = tqdm(
+            total=chunk_count * self.diffusion.num_timesteps,
+            desc="fixed step evaluation",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        total_parts: list[torch.Tensor] = []
+        retrieval_parts: list[torch.Tensor] = []
+        m2m_parts: list[torch.Tensor] = []
+        step_reward_parts: list[torch.Tensor] = []
+        detected_parts: list[torch.Tensor] = []
+        target_parts: list[torch.Tensor] = []
+
+        for prompt_start in range(0, total_prompt_count, prompt_batch_size):
+            prompt_end = min(prompt_start + prompt_batch_size, total_prompt_count)
+            motion, lengths, texts, _ = repeat_prompt_batch(
+                self.fixed_step_eval_pool.motion[prompt_start:prompt_end],
+                self.fixed_step_eval_pool.lengths[prompt_start:prompt_end],
+                self.fixed_step_eval_pool.texts[prompt_start:prompt_end],
+                self.config.fixed_eval_samples_per_prompt,
+            )
+            target_steps = self.fixed_step_eval_pool.target_steps[
+                prompt_start:prompt_end
+            ].repeat_interleave(self.config.fixed_eval_samples_per_prompt)
+            motion = motion.to(self.device, dtype=torch.float32)
+            batch_size, _, _, num_frames = motion.shape
+            model_kwargs = build_model_kwargs(
+                self.model,
+                texts,
+                lengths,
+                num_frames,
+                device=self.device,
+                guidance_scale=self.config.guidance_scale,
+            )
+            prompt_shape = tuple(self.fixed_step_eval_pool.motion.shape[1:])
+            prompt_generators: list[torch.Generator] = []
+            noise_parts: list[torch.Tensor] = []
+            for prompt_index in range(prompt_start, prompt_end):
+                generator = torch.Generator(device=self.device)
+                generator.manual_seed(
+                    int(
+                        self.fixed_step_eval_pool.prompt_noise_seeds[
+                            prompt_index
+                        ]
+                    )
+                )
+                prompt_generators.append(generator)
+                noise_parts.append(
+                    torch.randn(
+                        (
+                            self.config.fixed_eval_samples_per_prompt,
+                            *prompt_shape,
+                        ),
+                        device=self.device,
+                        dtype=motion.dtype,
+                        generator=generator,
+                    )
+                )
+            current = torch.cat(noise_parts, dim=0)
+            for step in range(self.diffusion.num_timesteps - 1, -1, -1):
+                timestep = torch.full(
+                    (batch_size,),
+                    step,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                transition_noise = torch.cat(
+                    [
+                        torch.randn(
+                            (
+                                self.config.fixed_eval_samples_per_prompt,
+                                *prompt_shape,
+                            ),
+                            device=self.device,
+                            dtype=motion.dtype,
+                            generator=generator,
+                        )
+                        for generator in prompt_generators
+                    ],
+                    dim=0,
+                )
+                with autocast_context(self.device, self.config.precision):
+                    current, _, _ = ddim_step_with_logprob(
+                        self.diffusion,
+                        self.policy_model,
+                        current,
+                        timestep,
+                        model_kwargs=model_kwargs,
+                        eta=self.config.ddim_eta,
+                        mask=model_kwargs["y"]["mask"],
+                        clip_denoised=self.config.clip_denoised,
+                        noise=transition_noise,
+                    )
+                progress.update(1)
+
+            generated_motion = current.squeeze(2).permute(0, 2, 1).contiguous()
+            gt_motion = motion.squeeze(2).permute(0, 2, 1).contiguous()
+            previous_mode = self.reward_model.embedding_mode
+            self.reward_model.embedding_mode = "mean"
+            try:
+                base_reward = self.reward_model.score(
+                    texts=texts,
+                    generated_motion=generated_motion,
+                    lengths=lengths,
+                    gt_motion=gt_motion,
+                )
+            finally:
+                self.reward_model.embedding_mode = previous_mode
+            detected = self.step_detector.count_normalized(
+                generated_motion,
+                lengths,
+                mean=self.step_mdm_mean,
+                std=self.step_mdm_std,
+            )
+            step_output = compute_step_count_reward(
+                detected,
+                target_steps.to(self.device),
+                mode=self.config.step_reward_mode,
+                temperature=self.config.step_reward_temperature,
+                linear_tolerance=self.config.step_reward_linear_tolerance,
+            )
+            combined = base_reward.total + (
+                self.config.step_reward_weight * step_output.reward
+            )
+            total_parts.append(combined.detach().float().cpu())
+            retrieval_parts.append(base_reward.retrieval.detach().float().cpu())
+            m2m_parts.append(base_reward.m2m.detach().float().cpu())
+            step_reward_parts.append(step_output.reward.detach().float().cpu())
+            detected_parts.append(detected.detach().long().cpu())
+            target_parts.append(target_steps.detach().long().cpu())
+
+        progress.close()
+        total = torch.cat(total_parts)
+        retrieval = torch.cat(retrieval_parts)
+        m2m = torch.cat(m2m_parts)
+        step_reward = torch.cat(step_reward_parts)
+        detected_steps = torch.cat(detected_parts)
+        target_steps = torch.cat(target_parts)
+        group_shape = (
+            self.fixed_step_eval_pool.prompt_count,
+            self.config.fixed_eval_samples_per_prompt,
+        )
+        total_by_prompt = total.reshape(group_shape)
+        retrieval_by_prompt = retrieval.reshape(group_shape)
+        m2m_by_prompt = m2m.reshape(group_shape)
+        step_reward_by_prompt = step_reward.reshape(group_shape)
+        detected_by_prompt = detected_steps.reshape(group_shape)
+        target_by_prompt = target_steps.reshape(group_shape)
+        error_by_prompt = (detected_by_prompt - target_by_prompt).abs().float()
+        return FixedStepEvalResult(
+            metrics={
+                "step_eval_reward_std": step_reward.std(unbiased=False).item(),
+                "step_eval_detected_mean": detected_steps.float().mean().item(),
+                "step_eval_target_mean": target_steps.float().mean().item(),
+                "step_eval_samples": float(len(step_reward)),
+                "step_eval_prompts": float(
+                    self.fixed_step_eval_pool.prompt_count
+                ),
+                "step_eval_samples_per_prompt": float(
+                    self.config.fixed_eval_samples_per_prompt
+                ),
+                "step_eval_seed": float(
+                    self.fixed_step_eval_pool.noise_seed
+                ),
+                "step_eval_pool_id": self.fixed_step_eval_pool.pool_id,
+                "step_eval_detector_backend": (
+                    self.fixed_step_eval_pool.detector_backend
+                ),
+                "step_eval_reward_weight": float(
+                    self.config.step_reward_weight
+                ),
+                "step_eval_reward_mode": self.config.step_reward_mode,
+            },
+            total_per_prompt=total_by_prompt.mean(dim=1),
+            retrieval_per_prompt=retrieval_by_prompt.mean(dim=1),
+            m2m_per_prompt=m2m_by_prompt.mean(dim=1),
+            step_reward_per_prompt=step_reward_by_prompt.mean(dim=1),
+            exact_per_prompt=(error_by_prompt == 0).float().mean(dim=1),
+            within_one_per_prompt=(error_by_prompt <= 1).float().mean(dim=1),
+            mae_per_prompt=error_by_prompt.mean(dim=1),
+            detected_mean_per_prompt=detected_by_prompt.float().mean(dim=1),
+            total_by_prompt=total_by_prompt,
+            retrieval_by_prompt=retrieval_by_prompt,
+            m2m_by_prompt=m2m_by_prompt,
+            step_reward_by_prompt=step_reward_by_prompt,
+            detected_steps_by_prompt=detected_by_prompt,
+        )
+
     def _next_batch(self) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.data_iterator is None:
             self.data_iterator = iter(self.data_loader)
         try:
-            return next(self.data_iterator)
+            human_motion, human_condition = next(self.data_iterator)
         except StopIteration:
             self.data_iterator = iter(self.data_loader)
-            return next(self.data_iterator)
+            human_motion, human_condition = next(self.data_iterator)
+        human_count = human_motion.shape[0]
+        human_condition["y"]["target_steps"] = torch.full(
+            (human_count,),
+            -1,
+            dtype=torch.long,
+        )
+        human_condition["y"]["step_mask"] = torch.zeros(
+            human_count,
+            dtype=torch.bool,
+        )
+        if not self.config.enable_step_reward:
+            return human_motion, human_condition
+        if self.step_data_loader is None:
+            raise RuntimeError("Step data loader is missing.")
+        if self.step_data_iterator is None:
+            self.step_data_iterator = iter(self.step_data_loader)
+        try:
+            step_motion, step_condition = next(self.step_data_iterator)
+        except StopIteration:
+            self.step_data_iterator = iter(self.step_data_loader)
+            step_motion, step_condition = next(self.step_data_iterator)
+        target_frames = human_motion.shape[-1]
+        if step_motion.shape[-1] > target_frames:
+            step_motion = step_motion[..., :target_frames]
+            step_condition["y"]["lengths"] = step_condition["y"][
+                "lengths"
+            ].clamp_max(target_frames)
+        elif step_motion.shape[-1] < target_frames:
+            padding = target_frames - step_motion.shape[-1]
+            step_motion = torch.nn.functional.pad(step_motion, (0, padding))
+        motion = torch.cat([human_motion, step_motion], dim=0)
+        lengths = torch.cat(
+            [
+                human_condition["y"]["lengths"],
+                step_condition["y"]["lengths"],
+            ]
+        )
+        target_steps = torch.cat(
+            [
+                human_condition["y"]["target_steps"],
+                step_condition["y"]["target_steps"],
+            ]
+        )
+        step_mask = torch.cat(
+            [
+                human_condition["y"]["step_mask"],
+                step_condition["y"]["step_mask"],
+            ]
+        )
+        texts = list(human_condition["y"]["text"]) + list(
+            step_condition["y"]["text"]
+        )
+        permutation = torch.randperm(len(motion))
+        return motion[permutation], {
+            "y": {
+                "lengths": lengths[permutation],
+                "text": [texts[index] for index in permutation.tolist()],
+                "target_steps": target_steps[permutation],
+                "step_mask": step_mask[permutation],
+            }
+        }
 
     @torch.no_grad()
     def _rollout_batch(self, epoch: int, batch_index: int) -> Trajectory:
         motion, condition = self._next_batch()
         lengths = condition["y"]["lengths"].long()
         texts = list(condition["y"]["text"])
+        prompt_target_steps = condition["y"]["target_steps"].long()
+        prompt_step_mask = condition["y"]["step_mask"].bool()
         motion, lengths, texts, prompt_ids = repeat_prompt_batch(
             motion,
             lengths,
             texts,
             self.config.samples_per_prompt,
+        )
+        target_steps = prompt_target_steps.repeat_interleave(
+            self.config.samples_per_prompt
+        )
+        step_mask = prompt_step_mask.repeat_interleave(
+            self.config.samples_per_prompt
         )
         motion = motion.to(
             self.device,
@@ -1373,6 +2071,47 @@ class DDPOTrainer:
             lengths=lengths,
             gt_motion=gt_motion,
         )
+        step_reward = torch.zeros(batch_size, device=self.device)
+        detected_steps = torch.full(
+            (batch_size,),
+            -1,
+            device=self.device,
+            dtype=torch.long,
+        )
+        step_absolute_error = torch.full_like(detected_steps, -1)
+        if step_mask.any():
+            if (
+                self.step_detector is None
+                or self.step_mdm_mean is None
+                or self.step_mdm_std is None
+            ):
+                raise RuntimeError("Step detector is not initialized.")
+            active = step_mask.to(self.device)
+            active_detected = self.step_detector.count_normalized(
+                generated_motion[active],
+                lengths[step_mask],
+                mean=self.step_mdm_mean,
+                std=self.step_mdm_std,
+            )
+            active_output = compute_step_count_reward(
+                active_detected,
+                target_steps[step_mask].to(self.device),
+                mode=self.config.step_reward_mode,
+                temperature=self.config.step_reward_temperature,
+                linear_tolerance=self.config.step_reward_linear_tolerance,
+            )
+            step_reward[active] = active_output.reward
+            detected_steps[active] = active_output.detected_steps
+            step_absolute_error[active] = active_output.absolute_error
+        reward_output = add_step_reward(
+            reward_output,
+            step=step_reward,
+            step_mask=step_mask.to(self.device),
+            detected_steps=detected_steps,
+            target_steps=target_steps.to(self.device),
+            absolute_error=step_absolute_error,
+            step_weight=self.config.step_reward_weight,
+        )
 
         return Trajectory(
             latents=torch.stack(latents, dim=1),
@@ -1387,6 +2126,13 @@ class DDPOTrainer:
             lengths=lengths.detach().cpu(),
             gt_motion=gt_motion.detach().float().cpu(),
             prompt_ids=prompt_ids,
+            step_rewards=reward_output.step.detach().float().cpu(),
+            step_mask=reward_output.step_mask.detach().cpu(),
+            detected_steps=reward_output.detected_steps.detach().cpu(),
+            target_steps=reward_output.target_steps.detach().cpu(),
+            step_absolute_error=(
+                reward_output.step_absolute_error.detach().cpu()
+            ),
         )
 
     def collect_rollouts(self, epoch: int) -> Trajectory:
@@ -1414,6 +2160,19 @@ class DDPOTrainer:
                         self.config.advantage_retrieval_weight
                     ),
                     m2m_weight=self.config.advantage_m2m_weight,
+                    step_rewards=trajectory.step_rewards,
+                    step_mask=trajectory.step_mask,
+                    step_std_floor=(
+                        self._advantage_std_floor("step")
+                        if self.config.enable_step_reward
+                        and self.config.advantage_step_weight > 0
+                        else None
+                    ),
+                    step_weight=(
+                        self.config.advantage_step_weight
+                        if self.config.enable_step_reward
+                        else 0.0
+                    ),
                 )
             )
             _, total_stats = compute_grouped_advantages(
@@ -1445,6 +2204,15 @@ class DDPOTrainer:
         return trajectory
 
     def _advantage_std_floor(self, component: str) -> float:
+        if component == "step":
+            if self.step_reward_calibration is None:
+                raise RuntimeError(
+                    "A loaded step reward calibration is required for "
+                    "step component shrinkage."
+                )
+            return self.step_reward_calibration.within_group_std_floor(
+                self.config.advantage_std_floor_quantile
+            )
         if self.reward_calibration is None:
             raise RuntimeError(
                 "A loaded reward calibration is required for shrinkage."
@@ -1530,7 +2298,20 @@ class DDPOTrainer:
         )
         selected: list[int] = []
         seen_prompt_ids: set[int] = set()
-        for sample_index in group_sample_indices.tolist():
+        candidate_indices = group_sample_indices.tolist()
+        if trajectory.step_mask is not None:
+            group_index_set = set(candidate_indices)
+            candidate_indices.extend(
+                index
+                for index in range(len(trajectory.prompt_ids))
+                if index not in group_index_set
+            )
+        for sample_index in candidate_indices:
+            if (
+                trajectory.step_mask is not None
+                and bool(trajectory.step_mask[sample_index])
+            ):
+                continue
             prompt_id = int(trajectory.prompt_ids[sample_index])
             if prompt_id in seen_prompt_ids:
                 continue
@@ -1961,7 +2742,7 @@ class DDPOTrainer:
         advantages = trajectory.advantages
         assert advantages is not None
         group_stats = trajectory.group_stats or {}
-        return {
+        result = {
             "reward": trajectory.rewards.mean().item(),
             "reward_std": trajectory.rewards.std(unbiased=False).item(),
             "reward_retrieval": trajectory.retrieval_rewards.mean().item(),
@@ -1972,6 +2753,33 @@ class DDPOTrainer:
             "samples_per_prompt": float(self.config.samples_per_prompt),
             **group_stats,
         }
+        if trajectory.step_mask is not None and trajectory.step_mask.any():
+            assert trajectory.step_rewards is not None
+            assert trajectory.detected_steps is not None
+            assert trajectory.target_steps is not None
+            assert trajectory.step_absolute_error is not None
+            active = trajectory.step_mask.bool()
+            errors = trajectory.step_absolute_error[active].float()
+            result.update(
+                {
+                    "reward_step": trajectory.step_rewards[active].mean().item(),
+                    "step_exact_fraction": (errors == 0).float().mean().item(),
+                    "step_within_one_fraction": (
+                        (errors <= 1).float().mean().item()
+                    ),
+                    "step_mae": errors.mean().item(),
+                    "step_detected_mean": (
+                        trajectory.detected_steps[active].float().mean().item()
+                    ),
+                    "step_target_mean": (
+                        trajectory.target_steps[active].float().mean().item()
+                    ),
+                    "step_rollout_samples": float(active.sum()),
+                }
+            )
+        else:
+            result["step_rollout_samples"] = 0.0
+        return result
 
     def _append_metrics(self, record: dict[str, Any]) -> None:
         with open(self.output_dir / "metrics.jsonl", "a", encoding="utf-8") as handle:
@@ -2037,6 +2845,69 @@ class DDPOTrainer:
         ) as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
+    def _append_fixed_step_eval_per_prompt(
+        self,
+        *,
+        event: str,
+        epoch: int,
+        evaluation: FixedStepEvalResult,
+    ) -> None:
+        if self.fixed_step_eval_pool is None:
+            raise RuntimeError("Fixed step evaluation is disabled.")
+        if self.fixed_step_eval_baseline_per_prompt is None:
+            raise RuntimeError("Fixed step evaluation baseline is missing.")
+        entries = []
+        for index in range(self.fixed_step_eval_pool.prompt_count):
+            entry: dict[str, Any] = {
+                "pool_position": index,
+                "manifest_index": int(
+                    self.fixed_step_eval_pool.manifest_indices[index]
+                ),
+                "sample_id": self.fixed_step_eval_pool.sample_ids[index],
+                "text": self.fixed_step_eval_pool.texts[index],
+                "length": int(self.fixed_step_eval_pool.lengths[index]),
+                "target_steps": int(
+                    self.fixed_step_eval_pool.target_steps[index]
+                ),
+            }
+            current_values = {
+                "total": evaluation.total_per_prompt[index].item(),
+                "retrieval": evaluation.retrieval_per_prompt[index].item(),
+                "m2m": evaluation.m2m_per_prompt[index].item(),
+                "step_reward": evaluation.step_reward_per_prompt[index].item(),
+                "exact_fraction": evaluation.exact_per_prompt[index].item(),
+                "within_one_fraction": (
+                    evaluation.within_one_per_prompt[index].item()
+                ),
+                "mae": evaluation.mae_per_prompt[index].item(),
+                "detected_mean": (
+                    evaluation.detected_mean_per_prompt[index].item()
+                ),
+            }
+            for name, current in current_values.items():
+                baseline = self.fixed_step_eval_baseline_per_prompt[name][
+                    index
+                ].item()
+                entry[f"{name}_baseline"] = baseline
+                entry[f"{name}_current"] = current
+                entry[f"{name}_delta"] = current - baseline
+            entries.append(entry)
+        record = {
+            "event": event,
+            "epoch": epoch,
+            "global_step": self.global_step,
+            "eval_split": self.fixed_step_eval_pool.split,
+            "eval_pool_id": self.fixed_step_eval_pool.pool_id,
+            "detector_backend": self.fixed_step_eval_pool.detector_backend,
+            "prompts": entries,
+        }
+        with open(
+            self.output_dir / "fixed_step_eval_per_prompt.jsonl",
+            "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
     def _fixed_eval_with_deltas(
         self,
         evaluation: FixedEvalResult,
@@ -2093,6 +2964,94 @@ class DDPOTrainer:
         )
         return result
 
+    def _fixed_step_eval_with_deltas(
+        self,
+        evaluation: FixedStepEvalResult,
+    ) -> dict[str, Any]:
+        if self.fixed_step_eval_baseline_per_prompt is None:
+            raise RuntimeError(
+                "Fixed step evaluation baseline has not been initialized."
+            )
+        result = dict(evaluation.metrics)
+        components = (
+            (
+                "eval_step_total",
+                evaluation.total_per_prompt,
+                self.fixed_step_eval_baseline_per_prompt["total"],
+            ),
+            (
+                "eval_step_retrieval",
+                evaluation.retrieval_per_prompt,
+                self.fixed_step_eval_baseline_per_prompt["retrieval"],
+            ),
+            (
+                "eval_step_m2m",
+                evaluation.m2m_per_prompt,
+                self.fixed_step_eval_baseline_per_prompt["m2m"],
+            ),
+            (
+                "eval_step_reward",
+                evaluation.step_reward_per_prompt,
+                self.fixed_step_eval_baseline_per_prompt["step_reward"],
+            ),
+            (
+                "eval_step_exact_fraction",
+                evaluation.exact_per_prompt,
+                self.fixed_step_eval_baseline_per_prompt["exact_fraction"],
+            ),
+            (
+                "eval_step_within_one_fraction",
+                evaluation.within_one_per_prompt,
+                self.fixed_step_eval_baseline_per_prompt[
+                    "within_one_fraction"
+                ],
+            ),
+        )
+        for offset, (name, current, baseline) in enumerate(components):
+            result.update(
+                summarize_fixed_eval_component(
+                    name,
+                    current,
+                    baseline,
+                    bootstrap_samples=self.config.fixed_eval_bootstrap_samples,
+                    seed=self.config.fixed_eval_seed + 20_000 + 100 * offset,
+                )
+            )
+        result.update(
+            summarize_fixed_eval_error(
+                "eval_step_mae",
+                evaluation.mae_per_prompt,
+                self.fixed_step_eval_baseline_per_prompt["mae"],
+                bootstrap_samples=self.config.fixed_eval_bootstrap_samples,
+                seed=self.config.fixed_eval_seed + 30_000,
+            )
+        )
+        detected_baseline = self.fixed_step_eval_baseline_per_prompt[
+            "detected_mean"
+        ]
+        result.update(
+            {
+                "eval_step_detected_mean": (
+                    evaluation.detected_mean_per_prompt.mean().item()
+                ),
+                "eval_step_detected_mean_baseline": (
+                    detected_baseline.mean().item()
+                ),
+                "eval_step_detected_mean_delta": (
+                    evaluation.detected_mean_per_prompt
+                    - detected_baseline
+                ).mean().item(),
+            }
+        )
+        if self.step_reward_calibration is None:
+            result["eval_normalized_step_delta"] = 0.0
+        else:
+            result["eval_normalized_step_delta"] = (
+                result["eval_step_reward_delta"]
+                / self.step_reward_calibration.global_scale()
+            )
+        return result
+
     def _initialize_fixed_eval(self) -> dict[str, Any] | None:
         if self.fixed_eval_pool is None:
             return None
@@ -2101,6 +3060,15 @@ class DDPOTrainer:
             self.fixed_eval_baseline is not None
             and (
                 self.fixed_eval_baseline_per_prompt is None
+                or (
+                    getattr(self, "fixed_step_eval_pool", None) is not None
+                    and getattr(
+                        self,
+                        "fixed_step_eval_baseline_per_prompt",
+                        None,
+                    )
+                    is None
+                )
                 or any(
                     self.fixed_eval_baseline.get(name) != value
                     for name, value in expected_signature.items()
@@ -2124,6 +3092,9 @@ class DDPOTrainer:
             self.best_retrieval_epoch = None
             self.best_m2m_delta = None
             self.best_m2m_epoch = None
+            self.fixed_step_eval_baseline_per_prompt = None
+            self.best_step_reward_delta = None
+            self.best_step_epoch = None
             self.evals_without_improvement = 0
         if self.fixed_eval_baseline is None:
             if self.config.resume:
@@ -2153,7 +3124,74 @@ class DDPOTrainer:
                 ),
                 m2m_per_prompt=self.fixed_eval_baseline_per_prompt["m2m"],
             )
+        step_baseline_evaluation: FixedStepEvalResult | None = None
+        if getattr(self, "fixed_step_eval_pool", None) is not None:
+            if self.fixed_step_eval_baseline_per_prompt is None:
+                step_baseline_evaluation = self.evaluate_fixed_step_pool()
+                self.fixed_step_eval_baseline_per_prompt = {
+                    "total": step_baseline_evaluation.total_per_prompt.clone(),
+                    "retrieval": (
+                        step_baseline_evaluation.retrieval_per_prompt.clone()
+                    ),
+                    "m2m": step_baseline_evaluation.m2m_per_prompt.clone(),
+                    "step_reward": (
+                        step_baseline_evaluation.step_reward_per_prompt.clone()
+                    ),
+                    "exact_fraction": (
+                        step_baseline_evaluation.exact_per_prompt.clone()
+                    ),
+                    "within_one_fraction": (
+                        step_baseline_evaluation.within_one_per_prompt.clone()
+                    ),
+                    "mae": step_baseline_evaluation.mae_per_prompt.clone(),
+                    "detected_mean": (
+                        step_baseline_evaluation.detected_mean_per_prompt.clone()
+                    ),
+                }
+                self.fixed_eval_baseline.update(
+                    self._fixed_step_eval_with_deltas(
+                        step_baseline_evaluation
+                    )
+                )
+            else:
+                step_baseline_evaluation = FixedStepEvalResult(
+                    metrics=dict(self.fixed_eval_baseline),
+                    total_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt["total"]
+                    ),
+                    retrieval_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt["retrieval"]
+                    ),
+                    m2m_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt["m2m"]
+                    ),
+                    step_reward_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt["step_reward"]
+                    ),
+                    exact_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt[
+                            "exact_fraction"
+                        ]
+                    ),
+                    within_one_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt[
+                            "within_one_fraction"
+                        ]
+                    ),
+                    mae_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt["mae"]
+                    ),
+                    detected_mean_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt[
+                            "detected_mean"
+                        ]
+                    ),
+                )
         initialized_best = self.best_balanced_score is None
+        initialized_step_best = bool(
+            getattr(self, "fixed_step_eval_pool", None) is not None
+            and getattr(self, "best_step_reward_delta", None) is None
+        )
         baseline_epoch = self.start_epoch - 1
         if self.best_balanced_score is None:
             self.best_balanced_score = 0.0
@@ -2162,6 +3200,9 @@ class DDPOTrainer:
             self.best_retrieval_epoch = baseline_epoch
             self.best_m2m_delta = 0.0
             self.best_m2m_epoch = baseline_epoch
+        if initialized_step_best:
+            self.best_step_reward_delta = 0.0
+            self.best_step_epoch = baseline_epoch
         if initialized_best:
             for name in (
                 "best_balanced.pt",
@@ -2169,11 +3210,18 @@ class DDPOTrainer:
                 "best_m2m.pt",
             ):
                 self._save_named_snapshot(name, baseline_epoch)
+        if initialized_step_best:
+            self._save_named_snapshot("best_step.pt", baseline_epoch)
+        baseline_metrics = self._fixed_eval_with_deltas(baseline_evaluation)
+        if step_baseline_evaluation is not None:
+            baseline_metrics.update(
+                self._fixed_step_eval_with_deltas(step_baseline_evaluation)
+            )
         record: dict[str, Any] = {
             "event": "baseline",
             "epoch": self.start_epoch - 1,
             "global_step": self.global_step,
-            **self._fixed_eval_with_deltas(baseline_evaluation),
+            **baseline_metrics,
         }
         self._append_fixed_eval(record)
         self._append_fixed_eval_per_prompt(
@@ -2181,12 +3229,33 @@ class DDPOTrainer:
             epoch=self.start_epoch - 1,
             evaluation=baseline_evaluation,
         )
+        if step_baseline_evaluation is not None:
+            self._append_fixed_step_eval_per_prompt(
+                event="baseline",
+                epoch=self.start_epoch - 1,
+                evaluation=step_baseline_evaluation,
+            )
         LOGGER.info("fixed evaluation baseline: %s", json.dumps(record, sort_keys=True))
         return record
 
     def _run_fixed_eval(self, epoch: int) -> dict[str, Any]:
         evaluation = self.evaluate_fixed_pool()
         metrics = self._fixed_eval_with_deltas(evaluation)
+        step_evaluation: FixedStepEvalResult | None = None
+        is_best_step = False
+        if getattr(self, "fixed_step_eval_pool", None) is not None:
+            step_evaluation = self.evaluate_fixed_step_pool()
+            metrics.update(self._fixed_step_eval_with_deltas(step_evaluation))
+            is_best_step = bool(
+                self.best_step_reward_delta is None
+                or metrics["eval_step_reward_delta"]
+                > self.best_step_reward_delta
+            )
+            if is_best_step:
+                self.best_step_reward_delta = metrics[
+                    "eval_step_reward_delta"
+                ]
+                self.best_step_epoch = epoch
         retrieval_tolerance = -(
             self.config.checkpoint_feasible_se_multiplier
             * metrics["eval_reward_retrieval_delta_bootstrap_se"]
@@ -2256,6 +3325,7 @@ class DDPOTrainer:
                 "eval_is_best_balanced": float(is_best_balanced),
                 "eval_is_best_retrieval": float(is_best_retrieval),
                 "eval_is_best_m2m": float(is_best_m2m),
+                "eval_is_best_step": float(is_best_step),
                 "eval_best_balanced_score": self.best_balanced_score,
                 "eval_best_balanced_epoch": float(
                     self.best_balanced_epoch
@@ -2266,6 +3336,14 @@ class DDPOTrainer:
                 ),
                 "eval_best_m2m_delta": self.best_m2m_delta,
                 "eval_best_m2m_epoch": float(self.best_m2m_epoch),
+                "eval_best_step_delta": float(
+                    getattr(self, "best_step_reward_delta", None) or 0.0
+                ),
+                "eval_best_step_epoch": float(
+                    getattr(self, "best_step_epoch", None)
+                    if getattr(self, "best_step_epoch", None) is not None
+                    else -1
+                ),
                 "eval_evals_without_improvement": float(
                     self.evals_without_improvement
                 ),
@@ -2284,6 +3362,12 @@ class DDPOTrainer:
             epoch=epoch,
             evaluation=evaluation,
         )
+        if step_evaluation is not None:
+            self._append_fixed_step_eval_per_prompt(
+                event="evaluation",
+                epoch=epoch,
+                evaluation=step_evaluation,
+            )
         return metrics
 
     def _rng_state(self) -> dict[str, Any]:
@@ -2296,6 +3380,13 @@ class DDPOTrainer:
             state["cuda"] = torch.cuda.get_rng_state_all()
         if self.data_loader.generator is not None:
             state["data_loader"] = self.data_loader.generator.get_state()
+        if (
+            self.step_data_loader is not None
+            and self.step_data_loader.generator is not None
+        ):
+            state["step_data_loader"] = (
+                self.step_data_loader.generator.get_state()
+            )
         return state
 
     def _restore_rng_state(self, state: dict[str, Any]) -> None:
@@ -2317,6 +3408,14 @@ class DDPOTrainer:
             self.data_loader.generator.set_state(
                 state["data_loader"].cpu()
             )
+        if (
+            "step_data_loader" in state
+            and self.step_data_loader is not None
+            and self.step_data_loader.generator is not None
+        ):
+            self.step_data_loader.generator.set_state(
+                state["step_data_loader"].cpu()
+            )
 
     def _checkpoint_payload(self, epoch: int) -> dict[str, Any]:
         return {
@@ -2332,6 +3431,9 @@ class DDPOTrainer:
             "fixed_eval_baseline_per_prompt": (
                 self.fixed_eval_baseline_per_prompt
             ),
+            "fixed_step_eval_baseline_per_prompt": (
+                self.fixed_step_eval_baseline_per_prompt
+            ),
             "fixed_eval_pool_id": (
                 self.fixed_eval_pool.pool_id
                 if self.fixed_eval_pool is not None
@@ -2344,12 +3446,24 @@ class DDPOTrainer:
                 if self.reward_calibration is not None
                 else None
             ),
+            "step_reward_calibration_id": (
+                self.step_reward_calibration.calibration_id
+                if self.step_reward_calibration is not None
+                else None
+            ),
+            "fixed_step_eval_pool_id": (
+                self.fixed_step_eval_pool.pool_id
+                if self.fixed_step_eval_pool is not None
+                else None
+            ),
             "best_balanced_score": self.best_balanced_score,
             "best_balanced_epoch": self.best_balanced_epoch,
             "best_retrieval_delta": self.best_retrieval_delta,
             "best_retrieval_epoch": self.best_retrieval_epoch,
             "best_m2m_delta": self.best_m2m_delta,
             "best_m2m_epoch": self.best_m2m_epoch,
+            "best_step_reward_delta": self.best_step_reward_delta,
+            "best_step_epoch": self.best_step_epoch,
             "evals_without_improvement": self.evals_without_improvement,
         }
 
@@ -2358,6 +3472,7 @@ class DDPOTrainer:
             "best_balanced.pt",
             "best_retrieval.pt",
             "best_m2m.pt",
+            "best_step.pt",
             "latest.pt",
         }:
             raise ValueError(f"Unsupported named checkpoint: {name!r}.")
@@ -2384,6 +3499,7 @@ class DDPOTrainer:
                 "best_balanced.pt",
                 "best_retrieval.pt",
                 "best_m2m.pt",
+                "best_step.pt",
             }:
                 raise ValueError(f"Unsupported best checkpoint: {name!r}.")
             shutil.copy2(checkpoint_path, self.output_dir / name)
@@ -2417,6 +3533,23 @@ class DDPOTrainer:
             raise ValueError(
                 "Checkpoint reward calibration does not match the current "
                 "--reward-calibration-path."
+            )
+        checkpoint_step_calibration_id = checkpoint.get(
+            "step_reward_calibration_id"
+        )
+        current_step_calibration_id = (
+            self.step_reward_calibration.calibration_id
+            if self.step_reward_calibration is not None
+            else None
+        )
+        if (
+            checkpoint_step_calibration_id is not None
+            and checkpoint_step_calibration_id
+            != current_step_calibration_id
+        ):
+            raise ValueError(
+                "Checkpoint step reward calibration does not match the "
+                "current --step-reward-calibration-path."
             )
         load_trainable_state_dict(self.model, checkpoint["policy"])
         restored_optimizer = restore_optimizer_state(
@@ -2459,8 +3592,22 @@ class DDPOTrainer:
             if baseline_per_prompt is not None
             else None
         )
+        step_baseline_per_prompt = checkpoint.get(
+            "fixed_step_eval_baseline_per_prompt"
+        )
+        self.fixed_step_eval_baseline_per_prompt = (
+            {
+                name: values.detach().float().cpu()
+                for name, values in step_baseline_per_prompt.items()
+            }
+            if step_baseline_per_prompt is not None
+            else None
+        )
         self.checkpoint_fixed_eval_pool_id = checkpoint.get(
             "fixed_eval_pool_id"
+        )
+        self.checkpoint_fixed_step_eval_pool_id = checkpoint.get(
+            "fixed_step_eval_pool_id"
         )
         self.best_balanced_score = checkpoint.get("best_balanced_score")
         self.best_balanced_epoch = checkpoint.get("best_balanced_epoch")
@@ -2468,6 +3615,10 @@ class DDPOTrainer:
         self.best_retrieval_epoch = checkpoint.get("best_retrieval_epoch")
         self.best_m2m_delta = checkpoint.get("best_m2m_delta")
         self.best_m2m_epoch = checkpoint.get("best_m2m_epoch")
+        self.best_step_reward_delta = checkpoint.get(
+            "best_step_reward_delta"
+        )
+        self.best_step_epoch = checkpoint.get("best_step_epoch")
         if (
             "best_balanced_score" not in checkpoint
             and self.fixed_eval_baseline is not None
@@ -2526,6 +3677,7 @@ class DDPOTrainer:
                         ("eval_is_best_balanced", "best_balanced.pt"),
                         ("eval_is_best_retrieval", "best_retrieval.pt"),
                         ("eval_is_best_m2m", "best_m2m.pt"),
+                        ("eval_is_best_step", "best_step.pt"),
                     )
                     if bool(fixed_eval_metrics.get(metric_name, 0.0))
                 )

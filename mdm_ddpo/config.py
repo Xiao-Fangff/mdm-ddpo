@@ -10,6 +10,15 @@ DEFAULT_MDM_ROOT = "/home/zhiwei/projects/motion-diffusion-model"
 DEFAULT_MOTIONRFT_ROOT = "/home/zhiwei/projects/MotionRFT"
 DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_CACHE_DIR = str(DEFAULT_PROJECT_ROOT / ".cache" / "mdm")
+DEFAULT_STEP_DATA_ROOT = (
+    DEFAULT_MOTIONRFT_ROOT
+    + "/RFT_MLD/third_party/motion-rule-data/offline_reward_validation/"
+    "walk_step_five_manifests_0_6_random400"
+)
+DEFAULT_STEP_DATA_MANIFEST = DEFAULT_STEP_DATA_ROOT + "/sample_manifest.jsonl"
+DEFAULT_STEP_MOTION_ROOT = (
+    DEFAULT_MOTIONRFT_ROOT + "/RFT_MLD/third_party/motion-rule"
+)
 
 
 @dataclass
@@ -29,6 +38,10 @@ class TrainConfig:
     )
     reward_t5_path: str = DEFAULT_MOTIONRFT_ROOT + "/deps/sentence-t5-large"
     reward_calibration_path: str = ""
+    step_reward_calibration_path: str = ""
+    step_data_manifest: str = DEFAULT_STEP_DATA_MANIFEST
+    step_motion_root: str = DEFAULT_STEP_MOTION_ROOT
+    step_detector_root: str = DEFAULT_STEP_MOTION_ROOT
     output_dir: str = "outputs/mdm_ddpo"
     resume: str = ""
     reset_optimizer_on_resume: bool = False
@@ -39,6 +52,14 @@ class TrainConfig:
     data_cache_dir: str = DEFAULT_DATA_CACHE_DIR
     data_workers: int = 4
     pin_memory: bool = True
+    enable_step_reward: bool = False
+    step_data_ratio: float = 0.25
+    step_targets: str = "1,2,3,4,5,6"
+    step_split_seed: int = 20260600
+    step_prompt_seed: int = 20260612
+    step_eval_samples_per_target: int = 8
+    step_min_frames: int = 40
+    step_max_frames: int = 196
 
     seed: int = 42
     device: str = "cuda:0"
@@ -72,6 +93,7 @@ class TrainConfig:
     advantage_std_floor_quantile: str = "p25"
     advantage_retrieval_weight: float = 0.5
     advantage_m2m_weight: float = 0.5
+    advantage_step_weight: float = 0.25
     log_prob_audit_tolerance: float = 1.0e-4
     anchor_lambda: float = 0.0
     anchor_auto_grad_ratio: float = 0.0
@@ -86,6 +108,14 @@ class TrainConfig:
 
     retrieval_weight: float = 1.0
     m2m_weight: float = 1.0
+    step_reward_weight: float = 0.5
+    step_reward_mode: str = "exp"
+    step_reward_temperature: float = 1.0
+    step_reward_linear_tolerance: float = 3.0
+    step_detector_backend: str = "progressive"
+    step_detector_fps: int = 20
+    step_detector_lead_threshold: float = 0.138
+    step_detector_rgdno_threshold: float = 0.005
     reward_embedding_mode: str = "mean"
 
     fixed_eval_every: int = 5
@@ -94,6 +124,7 @@ class TrainConfig:
     fixed_eval_samples_per_prompt: int = 4
     fixed_eval_bootstrap_samples: int = 2000
     fixed_eval_pool_path: str = ""
+    fixed_step_eval_pool_path: str = ""
     early_stop_patience: int = 8
     early_stop_min_delta: float = 0.0
     early_stop_min_delta_mode: str = "auto"
@@ -217,14 +248,88 @@ class TrainConfig:
                 "--advantage-std-floor-quantile must be 'p25' or 'p50'."
             )
         if self.advantage_mode in {"group_shrink", "component_shrink"}:
-            if not self.reward_calibration_path:
+            if (
+                not self.reward_calibration_path
+                and not (
+                    self.enable_step_reward
+                    and self.advantage_mode == "group_shrink"
+                )
+            ):
                 raise ValueError(
                     f"--advantage-mode {self.advantage_mode} requires "
                     "--reward-calibration-path."
                 )
+        if self.enable_step_reward:
+            if not 0 < self.step_data_ratio < 1:
+                raise ValueError("--step-data-ratio must be in (0,1).")
+            if self.prompts_per_rollout_batch < 2:
+                raise ValueError(
+                    "Step mixing requires at least two prompts per rollout batch."
+                )
+            if self.step_prompts_per_rollout_batch <= 0:
+                raise ValueError(
+                    "--step-data-ratio is too small for the rollout prompt batch."
+                )
+            if self.humanml_prompts_per_rollout_batch <= 0:
+                raise ValueError(
+                    "Step mixing must retain at least one HumanML prompt per batch."
+                )
+            if self.advantage_mode == "group_shrink":
+                raise ValueError(
+                    "group_shrink total calibration is incompatible with an added "
+                    "step component; use component_shrink, group_centered, or "
+                    "group_whiten."
+                )
+            if (
+                self.advantage_mode == "component_shrink"
+                and self.advantage_step_weight > 0
+                and not self.step_reward_calibration_path
+            ):
+                raise ValueError(
+                    "Step component_shrink requires "
+                    "--step-reward-calibration-path."
+                )
+            try:
+                from .step_data import parse_step_targets
+
+                parse_step_targets(self.step_targets)
+            except ValueError as exc:
+                raise ValueError(f"Invalid --step-targets: {exc}") from exc
+            if self.step_eval_samples_per_target <= 0:
+                raise ValueError(
+                    "--step-eval-samples-per-target must be positive."
+                )
+            if self.step_min_frames <= 0 or self.step_max_frames < self.step_min_frames:
+                raise ValueError("Step motion frame limits are invalid.")
+            if self.step_detector_backend not in {"progressive", "rgdno"}:
+                raise ValueError(
+                    "--step-detector-backend must be progressive or rgdno."
+                )
+            if self.step_reward_mode not in {
+                "exp",
+                "linear",
+                "exact",
+                "negative_l1",
+            }:
+                raise ValueError(
+                    "--step-reward-mode must be exp, linear, exact, or negative_l1."
+                )
+            if self.step_detector_fps <= 0:
+                raise ValueError("--step-detector-fps must be positive.")
+            for name in (
+                "step_reward_temperature",
+                "step_reward_linear_tolerance",
+                "step_detector_lead_threshold",
+                "step_detector_rgdno_threshold",
+            ):
+                if getattr(self, name) <= 0:
+                    raise ValueError(f"--{name.replace('_', '-')} must be positive.")
+            if self.step_reward_weight < 0:
+                raise ValueError("--step-reward-weight cannot be negative.")
         if (
             self.advantage_retrieval_weight < 0
             or self.advantage_m2m_weight < 0
+            or self.advantage_step_weight < 0
             or (
                 self.advantage_retrieval_weight == 0
                 and self.advantage_m2m_weight == 0
@@ -274,6 +379,15 @@ class TrainConfig:
             "reward backbone": self.reward_backbone_path,
             "reward T5": self.reward_t5_path,
         }
+        if self.enable_step_reward:
+            required.update(
+                {
+                    "step data manifest": self.step_data_manifest,
+                    "step motion root": self.step_motion_root,
+                }
+            )
+            if self.step_detector_backend == "progressive":
+                required["step detector root"] = self.step_detector_root
         missing = [f"{label}: {path}" for label, path in required.items() if not Path(path).exists()]
         if (
             self.reward_calibration_path
@@ -282,6 +396,14 @@ class TrainConfig:
             missing.append(
                 "reward calibration: "
                 f"{Path(self.reward_calibration_path).expanduser()}"
+            )
+        if (
+            self.step_reward_calibration_path
+            and not Path(self.step_reward_calibration_path).expanduser().exists()
+        ):
+            missing.append(
+                "step reward calibration: "
+                f"{Path(self.step_reward_calibration_path).expanduser()}"
             )
         if missing:
             raise FileNotFoundError("Missing required paths:\n  " + "\n  ".join(missing))
@@ -292,6 +414,38 @@ class TrainConfig:
     @property
     def prompts_per_rollout_batch(self) -> int:
         return self.rollout_batch_size // self.samples_per_prompt
+
+    @property
+    def step_target_values(self) -> tuple[int, ...]:
+        from .step_data import parse_step_targets
+
+        return parse_step_targets(self.step_targets)
+
+    @property
+    def step_prompts_per_rollout_batch(self) -> int:
+        if not self.enable_step_reward:
+            return 0
+        count = int(self.prompts_per_rollout_batch * self.step_data_ratio + 0.5)
+        return min(self.prompts_per_rollout_batch - 1, max(1, count))
+
+    @property
+    def humanml_prompts_per_rollout_batch(self) -> int:
+        return self.prompts_per_rollout_batch - self.step_prompts_per_rollout_batch
+
+    def step_detector_config(self) -> dict[str, Any]:
+        return {
+            "backend": self.step_detector_backend,
+            "fps": int(self.step_detector_fps),
+            "lead_threshold": float(self.step_detector_lead_threshold),
+            "rgdno_threshold": float(self.step_detector_rgdno_threshold),
+        }
+
+    def step_reward_config(self) -> dict[str, Any]:
+        return {
+            "mode": self.step_reward_mode,
+            "temperature": float(self.step_reward_temperature),
+            "linear_tolerance": float(self.step_reward_linear_tolerance),
+        }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -330,6 +484,25 @@ def build_parser() -> argparse.ArgumentParser:
             "tools/calibrate_reward_stats.py."
         ),
     )
+    paths.add_argument(
+        "--step-reward-calibration-path",
+        default="",
+        help="Immutable hard-step reward calibration JSON.",
+    )
+    paths.add_argument(
+        "--step-data-manifest",
+        default=DEFAULT_STEP_DATA_MANIFEST,
+    )
+    paths.add_argument(
+        "--step-motion-root",
+        default=DEFAULT_STEP_MOTION_ROOT,
+        help="Root used to resolve relative features_263_path entries.",
+    )
+    paths.add_argument(
+        "--step-detector-root",
+        default=DEFAULT_STEP_MOTION_ROOT,
+        help="Motion-Rule-co root for the progressive hard detector.",
+    )
     paths.add_argument("--output-dir", default=TrainConfig.output_dir)
     paths.add_argument("--resume", default="", help="DDPO checkpoint to resume.")
     paths.add_argument(
@@ -366,6 +539,18 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    data.add_argument(
+        "--enable-step-reward",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    data.add_argument("--step-data-ratio", type=float, default=0.25)
+    data.add_argument("--step-targets", default="1,2,3,4,5,6")
+    data.add_argument("--step-split-seed", type=int, default=20260600)
+    data.add_argument("--step-prompt-seed", type=int, default=20260612)
+    data.add_argument("--step-eval-samples-per-target", type=int, default=8)
+    data.add_argument("--step-min-frames", type=int, default=40)
+    data.add_argument("--step-max-frames", type=int, default=196)
 
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument("--seed", type=int, default=42)
@@ -514,6 +699,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.5,
     )
+    train.add_argument(
+        "--advantage-step-weight",
+        type=float,
+        default=0.25,
+    )
 
     policy = parser.add_argument_group("policy parameters")
     policy.add_argument("--train-mode", choices=["lora", "full"], default="lora")
@@ -527,6 +717,34 @@ def build_parser() -> argparse.ArgumentParser:
     reward = parser.add_argument_group("reward")
     reward.add_argument("--retrieval-weight", type=float, default=1.0)
     reward.add_argument("--m2m-weight", type=float, default=1.0)
+    reward.add_argument("--step-reward-weight", type=float, default=0.5)
+    reward.add_argument(
+        "--step-reward-mode",
+        choices=["exp", "linear", "exact", "negative_l1"],
+        default="exp",
+    )
+    reward.add_argument("--step-reward-temperature", type=float, default=1.0)
+    reward.add_argument(
+        "--step-reward-linear-tolerance",
+        type=float,
+        default=3.0,
+    )
+    reward.add_argument(
+        "--step-detector-backend",
+        choices=["progressive", "rgdno"],
+        default="progressive",
+    )
+    reward.add_argument("--step-detector-fps", type=int, default=20)
+    reward.add_argument(
+        "--step-detector-lead-threshold",
+        type=float,
+        default=0.138,
+    )
+    reward.add_argument(
+        "--step-detector-rgdno-threshold",
+        type=float,
+        default=0.005,
+    )
     reward.add_argument(
         "--reward-embedding-mode",
         choices=["sample", "mean"],
@@ -572,6 +790,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Optional shared fixed_eval_pool.pt. It is created when missing "
             "and copied into every run directory."
         ),
+    )
+    reward.add_argument(
+        "--fixed-step-eval-pool-path",
+        default="",
+        help="Optional shared fixed_step_eval_pool.pt.",
     )
     reward.add_argument(
         "--early-stop-patience",
@@ -663,12 +886,14 @@ def parse_config(argv: list[str] | None = None) -> TrainConfig:
     if config.dry_run:
         config.epochs = 1
         config.sample_steps = 4
-        config.rollout_batch_size = 2
+        config.rollout_batch_size = 4 if config.enable_step_reward else 2
         config.rollout_batches_per_epoch = 1
-        config.train_batch_size = 2
+        config.train_batch_size = config.rollout_batch_size
         config.samples_per_prompt = 2
         config.fixed_eval_prompts = 1
         config.fixed_eval_samples_per_prompt = 2
+        if config.enable_step_reward:
+            config.step_eval_samples_per_target = 1
         config.inner_epochs = 1
         config.data_workers = 0
         config.save_every = 1
