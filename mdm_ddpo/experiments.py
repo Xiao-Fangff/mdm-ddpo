@@ -57,6 +57,19 @@ def summarize_run(run_dir: str | Path) -> dict[str, Any]:
         else None
     )
     final = evaluations[-1] if evaluations else None
+    step_updates = [
+        record
+        for record in evaluations
+        if float(record.get("eval_is_best_step", 0.0)) >= 0.5
+    ]
+    best_step = (
+        max(
+            step_updates,
+            key=lambda record: float(record["eval_step_reward_delta"]),
+        )
+        if step_updates
+        else None
+    )
     return {
         "run": run_path.name,
         "run_dir": str(run_path),
@@ -66,6 +79,9 @@ def summarize_run(run_dir: str | Path) -> dict[str, Any]:
         "learning_rate": config.get("learning_rate"),
         "clip_range": config.get("clip_range"),
         "anchor_grad_ratio_target": config.get("anchor_auto_grad_ratio", 0.0),
+        "step_reward_enabled": config.get("enable_step_reward", False),
+        "step_data_ratio": config.get("step_data_ratio", 0.0),
+        "step_advantage_weight": config.get("advantage_step_weight", 0.0),
         "epochs_completed": len(training),
         "global_step": training[-1].get("global_step") if training else None,
         "clip_fraction_mean": _mean(training, "clip_fraction"),
@@ -95,7 +111,26 @@ def summarize_run(run_dir: str | Path) -> dict[str, Any]:
         "final_m2m_delta": (
             final.get("eval_reward_m2m_delta") if final else None
         ),
+        "best_step_epoch": best_step.get("epoch") if best_step else -1,
+        "best_step_reward_delta": (
+            best_step.get("eval_step_reward_delta") if best_step else None
+        ),
+        "best_step_mae_delta": (
+            best_step.get("eval_step_mae_delta") if best_step else None
+        ),
+        "best_step_exact_delta": (
+            best_step.get("eval_step_exact_fraction_delta")
+            if best_step
+            else None
+        ),
+        "final_step_reward_delta": (
+            final.get("eval_step_reward_delta") if final else None
+        ),
+        "final_step_mae_delta": (
+            final.get("eval_step_mae_delta") if final else None
+        ),
         "best_balanced_checkpoint": str(run_path / "best_balanced.pt"),
+        "best_step_checkpoint": str(run_path / "best_step.pt"),
     }
 
 
@@ -119,6 +154,9 @@ def write_comparison_tables(
         "learning_rate",
         "clip_range",
         "anchor_grad_ratio_target",
+        "step_reward_enabled",
+        "step_data_ratio",
+        "step_advantage_weight",
         "epochs_completed",
         "best_epoch",
         "has_balanced_improvement",
@@ -126,6 +164,10 @@ def write_comparison_tables(
         "best_retrieval_delta",
         "best_m2m_delta",
         "best_balanced_se",
+        "best_step_epoch",
+        "best_step_reward_delta",
+        "best_step_mae_delta",
+        "best_step_exact_delta",
         "clip_fraction_mean",
         "ratio_std_mean",
         "log_ratio_abs_max",

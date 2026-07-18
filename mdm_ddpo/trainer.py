@@ -798,6 +798,9 @@ def compute_component_shrink_advantages(
                     "component_advantage_step_group_std_median": (
                         step_stats["reward_group_std_median"]
                     ),
+                    "component_advantage_step_zero_variance_prompt_fraction": (
+                        step_stats["zero_variance_prompt_fraction"]
+                    ),
                     "component_advantage_step_effective_scale_max": (
                         step_stats["effective_shrink_scale_max"]
                     ),

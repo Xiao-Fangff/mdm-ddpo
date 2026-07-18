@@ -69,6 +69,10 @@ class ExperimentUtilitiesTest(unittest.TestCase):
                         "eval_reward_retrieval_delta": 0.01,
                         "eval_reward_m2m_delta": 0.02,
                         "eval_balanced_score_bootstrap_se": 0.03,
+                        "eval_is_best_step": 1.0,
+                        "eval_step_reward_delta": 0.08,
+                        "eval_step_mae_delta": -0.3,
+                        "eval_step_exact_fraction_delta": 0.1,
                     },
                     {
                         "event": "evaluation",
@@ -91,6 +95,8 @@ class ExperimentUtilitiesTest(unittest.TestCase):
 
         self.assertEqual(summary["best_epoch"], 4)
         self.assertEqual(summary["best_balanced_score"], 0.2)
+        self.assertEqual(summary["best_step_reward_delta"], 0.08)
+        self.assertEqual(summary["best_step_mae_delta"], -0.3)
         self.assertAlmostEqual(summary["clip_fraction_mean"], 0.15)
         self.assertTrue(tables_exist)
 

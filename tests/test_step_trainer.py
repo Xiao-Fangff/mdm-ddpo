@@ -33,6 +33,10 @@ class StepTrainerTest(unittest.TestCase):
         self.assertLess(advantages[0].item(), 0.0)
         torch.testing.assert_close(advantages[2:], torch.zeros(2))
         self.assertEqual(stats["component_advantage_step_samples"], 2.0)
+        self.assertEqual(
+            stats["component_advantage_step_zero_variance_prompt_fraction"],
+            0.0,
+        )
         self.assertLessEqual(
             stats["component_advantage_step_effective_scale_max"],
             1.0,

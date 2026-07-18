@@ -111,6 +111,9 @@ TRAINING_METRIC_NAMES = {
     "component_advantage_step_group_std_median": (
         "advantage/step_group_std_median"
     ),
+    "component_advantage_step_zero_variance_prompt_fraction": (
+        "advantage/step_zero_variance_prompt_fraction"
+    ),
     "component_advantage_step_effective_scale_max": (
         "advantage/step_effective_scale_max"
     ),
