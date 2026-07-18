@@ -29,8 +29,6 @@ ROLLOUT_BATCHES_PER_EPOCH="${MDM_DDPO_ROLLOUT_BATCHES_PER_EPOCH:-4}"
 # arguments below, so do not leak the convenience aliases into the SDK import.
 unset USE_SWANLAB SWANLAB_PROJECT SWANLAB_RUN_NAME SWANLAB_WORKSPACE
 unset SWANLAB_MODE SWANLAB_LOG_DIR
-unset ENABLE_STEP_REWARD STEP_REWARD_CALIBRATION_PATH FIXED_STEP_EVAL_POOL_PATH
-unset STEP_DATA_MANIFEST STEP_MOTION_ROOT STEP_DETECTOR_ROOT
 
 SWANLAB_FLAG="--no-use-swanlab"
 case "${DDPO_USE_SWANLAB,,}" in
@@ -63,6 +61,12 @@ case "${DDPO_ENABLE_STEP_REWARD,,}" in
     )
   ;;
 esac
+
+# These convenience aliases may have been exported by the caller. Clear them
+# only after STEP_ARGS has captured their values, so `set -u` cannot invalidate
+# the local launch configuration above.
+unset ENABLE_STEP_REWARD STEP_REWARD_CALIBRATION_PATH FIXED_STEP_EVAL_POOL_PATH
+unset STEP_DATA_MANIFEST STEP_MOTION_ROOT STEP_DETECTOR_ROOT
 
 exec "${PYTHON}" "${PROJECT_ROOT}/train_ddpo.py" \
   --device "${DEVICE}" \
