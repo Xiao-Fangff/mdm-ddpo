@@ -58,6 +58,7 @@ TRAINING_METRIC_NAMES = {
     "step_detected_mean": "step/detected_mean",
     "step_target_mean": "step/target_mean",
     "step_rollout_samples": "step/rollout_samples",
+    "step_use_m2m_reward": "step/use_m2m_reward",
     "reward_within_prompt_std": "reward/within_prompt_std",
     "reward_between_prompt_std": "reward/between_prompt_std",
     "reward_centered_std": "reward/centered_std",
@@ -78,6 +79,12 @@ TRAINING_METRIC_NAMES = {
         "advantage/retrieval_weight"
     ),
     "component_advantage_m2m_weight": "advantage/m2m_weight",
+    "component_advantage_step_m2m_enabled": (
+        "advantage/step_m2m_enabled"
+    ),
+    "component_advantage_step_m2m_contribution_mean_abs": (
+        "advantage/step_m2m_contribution_mean_abs"
+    ),
     "component_advantage_retrieval_std_floor": (
         "advantage/retrieval_std_floor"
     ),
@@ -252,6 +259,7 @@ TRAINING_METRIC_NAMES = {
     "step_eval_samples": "step_eval/samples",
     "step_eval_prompts": "step_eval/prompts",
     "step_eval_samples_per_prompt": "step_eval/samples_per_prompt",
+    "step_eval_use_m2m_reward": "step_eval/use_m2m_reward",
     "step_eval_seed": "step_eval/seed",
     "eval_step_total": "step_eval/total",
     "eval_step_total_delta": "step_eval/total_delta",

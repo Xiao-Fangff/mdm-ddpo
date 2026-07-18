@@ -45,6 +45,7 @@ class TrainScriptTest(unittest.TestCase):
         self.assertIn("--fixed-step-eval-pool-path /tmp/step-pool.pt", result.stdout)
         self.assertIn("--step-data-manifest /tmp/manifest.jsonl", result.stdout)
         self.assertIn("--rollout-batch-size 64", result.stdout)
+        self.assertIn("--step-use-m2m-reward", result.stdout)
 
 
 if __name__ == "__main__":

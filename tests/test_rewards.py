@@ -5,6 +5,7 @@ from mdm_ddpo.rewards import (
     MotionReward,
     RewardOutput,
     add_step_reward,
+    apply_step_m2m_policy,
     combine_reward_components,
 )
 
@@ -51,6 +52,24 @@ class RewardCompositionTest(unittest.TestCase):
         torch.testing.assert_close(combined.total, torch.tensor([1.0, 2.5]))
         self.assertEqual(combined.step_mask.tolist(), [False, True])
         self.assertEqual(combined.detected_steps.tolist(), [-1, 3])
+
+    def test_step_m2m_can_be_removed_without_changing_humanml_reward(self):
+        base = RewardOutput(
+            total=torch.tensor([1.0, 2.0]),
+            retrieval=torch.tensor([0.4, 0.5]),
+            m2m=torch.tensor([0.6, 1.5]),
+        )
+
+        adjusted = apply_step_m2m_policy(
+            base,
+            step_mask=torch.tensor([False, True]),
+            m2m_weight=1.0,
+            enabled=False,
+        )
+
+        torch.testing.assert_close(adjusted.total, torch.tensor([1.0, 0.5]))
+        torch.testing.assert_close(adjusted.retrieval, base.retrieval)
+        torch.testing.assert_close(adjusted.m2m, base.m2m)
 
     def test_mean_embedding_scoring_preserves_rng_state(self):
         reward = MotionReward.__new__(MotionReward)

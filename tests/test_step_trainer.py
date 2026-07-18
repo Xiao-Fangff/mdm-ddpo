@@ -57,6 +57,31 @@ class StepTrainerTest(unittest.TestCase):
                 step_weight=0.25,
             )
 
+    def test_component_shrink_masks_m2m_only_for_step_groups(self):
+        advantages, stats = compute_component_shrink_advantages(
+            retrieval_rewards=torch.zeros(4),
+            m2m_rewards=torch.tensor([0.0, 2.0, 0.0, 2.0]),
+            prompt_ids=torch.tensor([0, 0, 1, 1]),
+            epsilon=1.0e-8,
+            retrieval_std_floor=1.0,
+            m2m_std_floor=1.0,
+            retrieval_weight=0.0,
+            m2m_weight=1.0,
+            step_rewards=torch.zeros(4),
+            step_mask=torch.tensor([True, True, False, False]),
+            step_weight=0.0,
+            step_use_m2m_reward=False,
+        )
+
+        torch.testing.assert_close(advantages[:2], torch.zeros(2))
+        self.assertGreater(advantages[3].item(), 0.0)
+        self.assertLess(advantages[2].item(), 0.0)
+        self.assertEqual(stats["component_advantage_step_m2m_enabled"], 0.0)
+        self.assertEqual(
+            stats["component_advantage_step_m2m_contribution_mean_abs"],
+            0.0,
+        )
+
     def test_next_batch_mixes_humanml_and_step_targets(self):
         trainer = DDPOTrainer.__new__(DDPOTrainer)
         trainer.config = TrainConfig(

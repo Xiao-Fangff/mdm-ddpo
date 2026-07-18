@@ -110,6 +110,7 @@ class TrainConfig:
 
     retrieval_weight: float = 1.0
     m2m_weight: float = 1.0
+    step_use_m2m_reward: bool = True
     step_reward_weight: float = 0.5
     step_reward_mode: str = "exp"
     step_reward_temperature: float = 1.0
@@ -809,6 +810,15 @@ def build_parser() -> argparse.ArgumentParser:
     reward = parser.add_argument_group("reward")
     reward.add_argument("--retrieval-weight", type=float, default=1.0)
     reward.add_argument("--m2m-weight", type=float, default=1.0)
+    reward.add_argument(
+        "--step-use-m2m-reward",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Include M2M in step-labelled prompt rewards. Disabling this "
+            "masks M2M only for step samples; HumanML M2M is unchanged."
+        ),
+    )
     reward.add_argument("--step-reward-weight", type=float, default=0.5)
     reward.add_argument(
         "--step-reward-mode",

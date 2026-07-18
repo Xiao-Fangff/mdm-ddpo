@@ -47,6 +47,36 @@ def combine_reward_components(
     return retrieval_weight * retrieval + m2m_weight * m2m
 
 
+def apply_step_m2m_policy(
+    reward: RewardOutput,
+    *,
+    step_mask: torch.Tensor,
+    m2m_weight: float,
+    enabled: bool,
+) -> RewardOutput:
+    """Optionally remove M2M only from step-labelled sample totals."""
+    if step_mask.shape != reward.total.shape:
+        raise ValueError("Step mask must match the base reward shape.")
+    mask = step_mask.to(device=reward.total.device, dtype=torch.bool)
+    total = reward.total
+    if not enabled:
+        total = total - (
+            mask.to(dtype=total.dtype)
+            * float(m2m_weight)
+            * reward.m2m.to(total)
+        )
+    return RewardOutput(
+        total=total,
+        retrieval=reward.retrieval,
+        m2m=reward.m2m,
+        step=reward.step,
+        step_mask=reward.step_mask,
+        detected_steps=reward.detected_steps,
+        target_steps=reward.target_steps,
+        step_absolute_error=reward.step_absolute_error,
+    )
+
+
 def add_step_reward(
     reward: RewardOutput,
     *,

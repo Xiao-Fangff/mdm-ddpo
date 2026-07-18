@@ -90,6 +90,10 @@ reward_step = exp(-error / temperature)
 `target_steps=-1` 和 `step_mask=false`，其 step reward 严格为 0；步数样本同时保留
 retrieval、M2M 和 step reward。
 
+`--no-step-use-m2m-reward` 可只移除 step-labelled samples 的 M2M raw reward 和
+component-shrink advantage 贡献；HumanML 的 M2M 权重与训练逻辑完全不变。关闭后
+仍计算并记录 step prompt 上的 M2M 指标，便于与启用 M2M 的实验做统计比较。
+
 默认 step 配置使用两套独立的 group size：HumanML 每条文本 `K_human=4`，step
 每条文本 `K_step=16`。`--step-data-ratio` 的语义是 **motion sample 占比**，不是
 prompt 占比；默认 0.25 时，一个完整 physical rollout batch 为 64 motions：
@@ -547,6 +551,7 @@ bash scripts/run_anchor_seed_sweep.sh outputs/followup_sweeps/BEST_RUN
 | `--step-detector-backend` | `progressive`（默认）或本地 `rgdno` |
 | `--step-reward-mode` | `exp`、`linear`、`exact` 或 `negative_l1` |
 | `--step-reward-weight` | step component 在 raw total reward 中的权重 |
+| `--step-use-m2m-reward` / `--no-step-use-m2m-reward` | 是否让 M2M 参与 step 样本更新；不影响 HumanML，默认启用 |
 | `--advantage-step-weight` | step component-shrink advantage 权重；默认 0.25 |
 | `--fixed-step-eval-pool-path` | 跨 run 共享的 held-out step fixed pool |
 | `--split` | rollout split；只能为 `train` |

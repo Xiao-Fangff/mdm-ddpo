@@ -57,6 +57,9 @@ MotionRFT 的 `StepCountNet`。
   step reward 严格为 0。
 - 默认 reward：`exp(-abs(detected-target)/temperature)`；另支持 linear/exact/
   negative_l1。
+- `--no-step-use-m2m-reward` 只屏蔽 step-labelled samples 的 M2M raw reward 与
+  component advantage；HumanML M2M 不变，step M2M 指标仍保留用于比较。默认
+  `--step-use-m2m-reward`。
 - mixed K 已解耦：HumanML `K=4`，step `K=16`。`step_data_ratio` 现在按 motion
   sample 计，而非 prompt 计；默认 physical batch 64 严格组装为 12 HumanML prompts
   × 4 = 48 与 1 step prompt × 16 = 16（仍为 3:1）。
@@ -75,7 +78,7 @@ MotionRFT 的 `StepCountNet`。
 
 ## Step reward 已完成验证
 
-- 单元测试总数已增加到 85，当前全部通过。
+- 单元测试总数已增加到 88，当前全部通过。
 - `compileall`、`bash -n scripts/*.sh`、`git diff --check` 通过。
 - 真实 RFT_MLD 263-D GT detector 对齐：3/3 exact。
 - 6 prompts × 2 motions × 4 diffusion steps 的 calibration GPU smoke 成功；输出

@@ -57,6 +57,7 @@ case "${DDPO_ENABLE_STEP_REWARD,,}" in
       --step-reward-mode exp
       --step-reward-temperature 1.0
       --step-reward-weight 0.5
+      --step-use-m2m-reward
       --advantage-step-weight 0.25
     )
   ;;

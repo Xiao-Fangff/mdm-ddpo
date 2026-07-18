@@ -27,7 +27,12 @@ from .lora import (
     parameter_counts,
     trainable_state_dict,
 )
-from .rewards import MotionReward, RewardOutput, add_step_reward
+from .rewards import (
+    MotionReward,
+    RewardOutput,
+    add_step_reward,
+    apply_step_m2m_policy,
+)
 from .runtime import (
     autocast_context,
     bootstrap_external_repositories,
@@ -679,6 +684,7 @@ def compute_component_shrink_advantages(
     step_mask: torch.Tensor | None = None,
     step_std_floor: float | None = None,
     step_weight: float = 0.0,
+    step_use_m2m_reward: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Shrink reward components independently before fixed-weight combining."""
     if retrieval_rewards.shape != m2m_rewards.shape:
@@ -693,12 +699,20 @@ def compute_component_shrink_advantages(
         raise ValueError("At least one component advantage weight must be non-zero.")
     if (step_rewards is None) != (step_mask is None):
         raise ValueError("Step rewards and step mask must be provided together.")
+    active_step_mask: torch.Tensor | None = None
     if step_rewards is not None:
         if step_rewards.shape != retrieval_rewards.shape:
             raise ValueError("Step rewards must match retrieval rewards.")
         assert step_mask is not None
         if step_mask.shape != retrieval_rewards.shape:
             raise ValueError("Step mask must match component rewards.")
+        active_step_mask = step_mask.bool()
+        for prompt_id in torch.unique(prompt_ids, sorted=True):
+            prompt_active = active_step_mask[prompt_ids == prompt_id]
+            if prompt_active.any() and not prompt_active.all():
+                raise ValueError(
+                    "Step reward mask must be constant within every prompt group."
+                )
         if step_weight > 0 and (step_std_floor is None or step_std_floor <= 0):
             raise ValueError(
                 "A positive step component weight requires a fixed std floor."
@@ -720,6 +734,8 @@ def compute_component_shrink_advantages(
     )
     retrieval_contribution = retrieval_weight * retrieval_advantages
     m2m_contribution = m2m_weight * m2m_advantages
+    if active_step_mask is not None and not step_use_m2m_reward:
+        m2m_contribution = m2m_contribution.masked_fill(active_step_mask, 0.0)
     combined = retrieval_contribution + m2m_contribution
     comparable = (
         retrieval_advantages.abs() > epsilon
@@ -737,6 +753,7 @@ def compute_component_shrink_advantages(
         ),
         "component_advantage_retrieval_weight": float(retrieval_weight),
         "component_advantage_m2m_weight": float(m2m_weight),
+        "component_advantage_step_m2m_enabled": float(step_use_m2m_reward),
         "component_advantage_retrieval_std_floor": float(
             retrieval_std_floor
         ),
@@ -752,6 +769,11 @@ def compute_component_shrink_advantages(
         ),
         "component_advantage_m2m_contribution_mean_abs": (
             m2m_contribution.abs().mean().item()
+        ),
+        "component_advantage_step_m2m_contribution_mean_abs": (
+            m2m_contribution[active_step_mask].abs().mean().item()
+            if active_step_mask is not None and active_step_mask.any()
+            else 0.0
         ),
         "component_advantage_retrieval_group_std_median": (
             retrieval_stats["reward_group_std_median"]
@@ -770,12 +792,6 @@ def compute_component_shrink_advantages(
         assert step_mask is not None
         assert step_std_floor is not None
         active = step_mask.bool()
-        for prompt_id in torch.unique(prompt_ids, sorted=True):
-            prompt_active = active[prompt_ids == prompt_id]
-            if prompt_active.any() and not prompt_active.all():
-                raise ValueError(
-                    "Step reward mask must be constant within every prompt group."
-                )
         if active.any():
             active_advantages, step_stats = compute_grouped_advantages(
                 step_rewards[active],
@@ -1269,6 +1285,7 @@ class DDPOTrainer:
             "step_detector": self.config.step_detector_config(),
             "step_reward": self.config.step_reward_config(),
             "step_reward_weight": self.config.step_reward_weight,
+            "step_use_m2m_reward": self.config.step_use_m2m_reward,
             "step_reward_calibration_id": (
                 self.step_reward_calibration.calibration_id
                 if self.step_reward_calibration is not None
@@ -1597,6 +1614,9 @@ class DDPOTrainer:
                         self.config.step_reward_weight
                     ),
                     "step_eval_reward_mode": self.config.step_reward_mode,
+                    "step_eval_use_m2m_reward": float(
+                        self.config.step_use_m2m_reward
+                    ),
                 }
             )
         return signature
@@ -1876,6 +1896,12 @@ class DDPOTrainer:
                 )
             finally:
                 self.reward_model.embedding_mode = previous_mode
+            base_reward = apply_step_m2m_policy(
+                base_reward,
+                step_mask=torch.ones_like(target_steps, dtype=torch.bool),
+                m2m_weight=self.config.m2m_weight,
+                enabled=self.config.step_use_m2m_reward,
+            )
             detected = self.step_detector.count_normalized(
                 generated_motion,
                 lengths,
@@ -1940,6 +1966,9 @@ class DDPOTrainer:
                     self.config.step_reward_weight
                 ),
                 "step_eval_reward_mode": self.config.step_reward_mode,
+                "step_eval_use_m2m_reward": float(
+                    self.config.step_use_m2m_reward
+                ),
             },
             total_per_prompt=total_by_prompt.mean(dim=1),
             retrieval_per_prompt=retrieval_by_prompt.mean(dim=1),
@@ -2135,6 +2164,12 @@ class DDPOTrainer:
             lengths=lengths,
             gt_motion=gt_motion,
         )
+        reward_output = apply_step_m2m_policy(
+            reward_output,
+            step_mask=step_mask.to(self.device),
+            m2m_weight=self.config.m2m_weight,
+            enabled=self.config.step_use_m2m_reward,
+        )
         step_reward = torch.zeros(batch_size, device=self.device)
         detected_steps = torch.full(
             (batch_size,),
@@ -2236,6 +2271,11 @@ class DDPOTrainer:
                         self.config.advantage_step_weight
                         if self.config.enable_step_reward
                         else 0.0
+                    ),
+                    step_use_m2m_reward=(
+                        self.config.step_use_m2m_reward
+                        if self.config.enable_step_reward
+                        else True
                     ),
                 )
             )
@@ -2827,6 +2867,9 @@ class DDPOTrainer:
             "step_motion_ratio": (
                 self.config.step_rollout_samples
                 / self.config.rollout_batch_size
+            ),
+            "step_use_m2m_reward": float(
+                self.config.step_use_m2m_reward
             ),
             **group_stats,
         }
