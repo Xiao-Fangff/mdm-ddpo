@@ -13,8 +13,10 @@ from mdm_ddpo.trainer import (
     Trajectory,
     apply_optimizer_hyperparameters,
     compute_grouped_advantages,
+    log_prob_consistency_metrics,
     repeat_prompt_batch,
     restore_optimizer_state,
+    shuffled_sample_minibatches,
 )
 
 
@@ -128,6 +130,52 @@ class GroupedRolloutTest(unittest.TestCase):
         config = TrainConfig(rollout_batch_size=10, samples_per_prompt=4)
         with self.assertRaisesRegex(ValueError, "divisible"):
             config.validate()
+
+    def test_config_requires_equal_sized_ppo_minibatches(self):
+        config = TrainConfig(
+            rollout_batch_size=8,
+            rollout_batches_per_epoch=3,
+            train_batch_size=10,
+            samples_per_prompt=4,
+        )
+        with self.assertRaisesRegex(ValueError, "rollout_batch_size.*divisible"):
+            config.validate()
+
+    def test_ppo_minibatches_shuffle_individual_samples(self):
+        generator = torch.Generator().manual_seed(7)
+
+        batches = shuffled_sample_minibatches(
+            12,
+            4,
+            generator=generator,
+        )
+
+        flattened = torch.cat(batches)
+        self.assertEqual(sorted(flattened.tolist()), list(range(12)))
+        self.assertTrue(all(len(batch) == 4 for batch in batches))
+        contiguous_blocks = {
+            tuple(range(start, start + 4)) for start in range(0, 12, 4)
+        }
+        self.assertTrue(
+            any(tuple(batch.tolist()) not in contiguous_blocks for batch in batches)
+        )
+
+    def test_log_prob_consistency_audit_accepts_matching_policy(self):
+        old = torch.tensor([0.1, -0.2, 0.3])
+        new = old + torch.tensor([1.0e-6, -2.0e-6, 0.0])
+
+        metrics = log_prob_consistency_metrics(old, new, tolerance=1.0e-5)
+
+        self.assertLess(metrics["initial_log_prob_abs_diff_max"], 1.0e-5)
+        self.assertAlmostEqual(metrics["initial_ratio_mean"], 1.0, places=5)
+
+    def test_log_prob_consistency_audit_rejects_policy_mismatch(self):
+        with self.assertRaisesRegex(RuntimeError, "consistency audit failed"):
+            log_prob_consistency_metrics(
+                torch.zeros(2),
+                torch.tensor([0.0, 0.01]),
+                tolerance=1.0e-4,
+            )
 
     def test_default_training_settings_use_grouped_low_variance_rewards(self):
         config = TrainConfig()

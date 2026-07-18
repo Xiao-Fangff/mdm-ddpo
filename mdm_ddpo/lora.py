@@ -145,6 +145,17 @@ def load_trainable_state_dict(
     unexpected = sorted(set(state_dict) - known)
     if unexpected:
         raise KeyError(f"Checkpoint has unknown policy tensors: {unexpected[:8]}")
+    required = {
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    missing = sorted(required - set(state_dict))
+    if missing:
+        raise KeyError(
+            "Checkpoint is missing trainable policy tensors: "
+            f"{missing[:8]}"
+        )
     model.load_state_dict(state_dict, strict=False)
 
 

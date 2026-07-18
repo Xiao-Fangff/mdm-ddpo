@@ -67,6 +67,7 @@ class TrainConfig:
     adv_clip_max: float = 5.0
     advantage_epsilon: float = 1.0e-8
     advantage_mode: str = "group_whiten"
+    log_prob_audit_tolerance: float = 1.0e-4
 
     train_mode: str = "lora"
     lora_rank: int = 8
@@ -132,6 +133,15 @@ class TrainConfig:
                 "--rollout-batch-size must be divisible by "
                 "--samples-per-prompt."
             )
+        rollout_samples = (
+            self.rollout_batch_size * self.rollout_batches_per_epoch
+        )
+        if rollout_samples % self.train_batch_size != 0:
+            raise ValueError(
+                "rollout_batch_size * rollout_batches_per_epoch must be "
+                "divisible by --train-batch-size so every PPO minibatch has "
+                "the same number of samples."
+            )
         if self.fixed_eval_every < 0:
             raise ValueError("--fixed-eval-every cannot be negative.")
         if self.early_stop_patience < 0:
@@ -169,6 +179,7 @@ class TrainConfig:
             "max_grad_norm",
             "clip_range",
             "advantage_epsilon",
+            "log_prob_audit_tolerance",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"--{name.replace('_', '-')} must be positive.")
@@ -330,6 +341,15 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--clip-range", type=float, default=1.0e-4)
     train.add_argument("--adv-clip-max", type=float, default=5.0)
     train.add_argument("--advantage-epsilon", type=float, default=1.0e-8)
+    train.add_argument(
+        "--log-prob-audit-tolerance",
+        type=float,
+        default=1.0e-4,
+        help=(
+            "Maximum allowed absolute old/new log-probability difference "
+            "before the first optimizer update for each rollout."
+        ),
+    )
     train.add_argument(
         "--advantage-mode",
         choices=["group_centered", "group_whiten"],

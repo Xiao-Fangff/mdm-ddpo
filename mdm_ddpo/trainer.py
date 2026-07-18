@@ -79,6 +79,73 @@ def restore_optimizer_state(
     return True
 
 
+def shuffled_sample_minibatches(
+    num_samples: int,
+    batch_size: int,
+    *,
+    generator: torch.Generator | None = None,
+) -> list[torch.Tensor]:
+    """Shuffle individual rollout samples before forming equal PPO batches."""
+    if num_samples <= 0 or batch_size <= 0:
+        raise ValueError("Sample count and PPO batch size must be positive.")
+    if num_samples % batch_size != 0:
+        raise ValueError(
+            "The PPO sample count must be divisible by the train batch size."
+        )
+    permutation = torch.randperm(num_samples, generator=generator)
+    return list(permutation.split(batch_size))
+
+
+def log_prob_consistency_metrics(
+    old_log_probs: torch.Tensor,
+    new_log_probs: torch.Tensor,
+    tolerance: float,
+) -> dict[str, float]:
+    """Audit rollout/recomputed log probabilities before policy mutation."""
+    if old_log_probs.shape != new_log_probs.shape:
+        raise ValueError("Old and new log-probability tensors must match.")
+    if old_log_probs.numel() == 0:
+        raise ValueError("Cannot audit empty log-probability tensors.")
+    if tolerance <= 0:
+        raise ValueError("Log-probability audit tolerance must be positive.")
+
+    log_ratio = new_log_probs.detach().float() - old_log_probs.detach().float()
+    if not torch.isfinite(log_ratio).all():
+        raise FloatingPointError(
+            "Non-finite old/new log-probability difference before optimization."
+        )
+    absolute = log_ratio.abs()
+    ratio = log_ratio.exp()
+    maximum = absolute.max().item()
+    metrics = {
+        "initial_log_prob_abs_diff_mean": absolute.mean().item(),
+        "initial_log_prob_abs_diff_max": maximum,
+        "initial_log_ratio_mean": log_ratio.mean().item(),
+        "initial_log_ratio_std": log_ratio.std(unbiased=False).item(),
+        "initial_log_ratio_max": maximum,
+        "initial_ratio_mean": ratio.mean().item(),
+        "initial_ratio_std": ratio.std(unbiased=False).item(),
+        "initial_ratio_abs_deviation_max": (ratio - 1.0).abs().max().item(),
+    }
+    if maximum > tolerance:
+        raise RuntimeError(
+            "Old/new log-probability consistency audit failed before the "
+            f"first optimizer update: max_abs_diff={maximum:.6g} exceeds "
+            f"tolerance={tolerance:.6g}."
+        )
+    return metrics
+
+
+def _tensor_collection_l2_norm(tensors: list[torch.Tensor]) -> float:
+    if not tensors:
+        return 0.0
+    squared_norm = sum(
+        tensor.detach().float().square().sum()
+        for tensor in tensors
+    )
+    return squared_norm.sqrt().item()
+
+
 @dataclass(frozen=True)
 class PromptBatch:
     motion: torch.Tensor
@@ -363,6 +430,9 @@ class DDPOTrainer:
             "fixed_eval_enabled": self.fixed_eval_batch is not None,
             "fixed_eval_prompts": self.config.fixed_eval_prompts,
             "early_stop_patience": self.config.early_stop_patience,
+            "log_prob_audit_tolerance": (
+                self.config.log_prob_audit_tolerance
+            ),
         }
 
     def _build_fixed_eval_batch(self) -> PromptBatch:
@@ -692,6 +762,53 @@ class DDPOTrainer:
         )
         return selected, per_sample
 
+    @torch.no_grad()
+    def _audit_first_update_log_probs(
+        self,
+        trajectory: Trajectory,
+        sample_indices: torch.Tensor,
+        selected_timesteps: torch.Tensor,
+        model_kwargs: dict[str, Any],
+    ) -> dict[str, float]:
+        old_parts: list[torch.Tensor] = []
+        new_parts: list[torch.Tensor] = []
+        for timestep_position in range(selected_timesteps.shape[1]):
+            time_indices = selected_timesteps[:, timestep_position]
+            current = trajectory.latents[sample_indices, time_indices].to(
+                self.device,
+                non_blocking=self.config.pin_memory,
+            )
+            previous = trajectory.next_latents[sample_indices, time_indices].to(
+                self.device,
+                non_blocking=self.config.pin_memory,
+            )
+            timesteps = trajectory.timesteps[sample_indices, time_indices].to(
+                self.device,
+                non_blocking=self.config.pin_memory,
+            )
+            old_log_probs = trajectory.old_log_probs[
+                sample_indices, time_indices
+            ].to(self.device, non_blocking=self.config.pin_memory)
+            with autocast_context(self.device, self.config.precision):
+                _, new_log_probs, _ = ddim_step_with_logprob(
+                    self.diffusion,
+                    self.policy_model,
+                    current,
+                    timesteps,
+                    model_kwargs=model_kwargs,
+                    eta=self.config.ddim_eta,
+                    prev_sample=previous,
+                    mask=model_kwargs["y"]["mask"],
+                    clip_denoised=self.config.clip_denoised,
+                )
+            old_parts.append(old_log_probs.detach().float().cpu())
+            new_parts.append(new_log_probs.detach().float().cpu())
+        return log_prob_consistency_metrics(
+            torch.cat(old_parts),
+            torch.cat(new_parts),
+            self.config.log_prob_audit_tolerance,
+        )
+
     def optimize(self, trajectory: Trajectory) -> dict[str, float]:
         if trajectory.advantages is None:
             raise ValueError("Advantages must be computed before optimization.")
@@ -699,39 +816,47 @@ class DDPOTrainer:
         num_samples, num_timesteps = trajectory.timesteps.shape
         metric_values: dict[str, list[float]] = {
             "loss": [],
-            "approx_kl": [],
-            "clip_fraction": [],
-            "ratio": [],
             "grad_norm": [],
+            "update_norm": [],
             "skipped_updates": [],
         }
+        log_ratio_parts: list[torch.Tensor] = []
+        ratio_parts: list[torch.Tensor] = []
+        audit_metrics: dict[str, float] | None = None
 
         self.optimizer.zero_grad(set_to_none=True)
-        trainable_parameters = [
-            parameter
-            for parameter in self.model.parameters()
+        named_trainable_parameters = [
+            (name, parameter)
+            for name, parameter in self.model.named_parameters()
             if parameter.requires_grad
+        ]
+        trainable_parameters = [
+            parameter for _, parameter in named_trainable_parameters
+        ]
+        lora_parameters = [
+            parameter
+            for name, parameter in named_trainable_parameters
+            if "lora_a" in name or "lora_b" in name
         ]
         for inner_epoch in range(self.config.inner_epochs):
             selected_timesteps, timesteps_per_sample = self._selected_timesteps(
                 num_samples,
                 num_timesteps,
             )
-            num_sample_minibatches = math.ceil(
-                num_samples / self.config.train_batch_size
+            sample_minibatches = shuffled_sample_minibatches(
+                num_samples,
+                self.config.train_batch_size,
             )
-            minibatch_order = torch.randperm(num_sample_minibatches)
+            num_sample_minibatches = len(sample_minibatches)
             progress = tqdm(
                 total=num_sample_minibatches * timesteps_per_sample,
                 desc=f"DDPO inner epoch {inner_epoch}",
                 leave=False,
                 dynamic_ncols=True,
             )
-            for minibatch_position, minibatch_tensor in enumerate(minibatch_order):
-                sample_minibatch_index = int(minibatch_tensor.item())
-                start = sample_minibatch_index * self.config.train_batch_size
-                end = min(start + self.config.train_batch_size, num_samples)
-                sample_indices = torch.arange(start, end)
+            for minibatch_position, sample_indices in enumerate(
+                sample_minibatches
+            ):
                 advantages = trajectory.advantages[sample_indices].to(
                     self.device,
                     non_blocking=self.config.pin_memory,
@@ -755,6 +880,19 @@ class DDPOTrainer:
                     cached_text_embeddings=cached_text_embeddings,
                 )
 
+                minibatch_timesteps = selected_timesteps[sample_indices]
+                if audit_metrics is None:
+                    audit_metrics = self._audit_first_update_log_probs(
+                        trajectory,
+                        sample_indices,
+                        minibatch_timesteps,
+                        model_kwargs,
+                    )
+                    LOGGER.info(
+                        "Initial old/new log-probability audit: %s",
+                        json.dumps(audit_metrics, sort_keys=True),
+                    )
+
                 group_start = (
                     minibatch_position
                     // self.config.gradient_accumulation_steps
@@ -767,7 +905,6 @@ class DDPOTrainer:
                     group_end - group_start
                 ) * timesteps_per_sample
 
-                minibatch_timesteps = selected_timesteps[sample_indices]
                 for timestep_position in range(timesteps_per_sample):
                     time_indices = minibatch_timesteps[:, timestep_position]
                     current = trajectory.latents[
@@ -799,9 +936,12 @@ class DDPOTrainer:
                             -self.config.adv_clip_max,
                             self.config.adv_clip_max,
                         )
-                        log_ratio = (
-                            new_log_probs - old_log_probs
-                        ).clamp(-20.0, 20.0)
+                        raw_log_ratio = new_log_probs - old_log_probs
+                        if not torch.isfinite(raw_log_ratio).all():
+                            raise FloatingPointError(
+                                "Non-finite PPO log ratio encountered."
+                            )
+                        log_ratio = raw_log_ratio.clamp(-20.0, 20.0)
                         ratio = log_ratio.exp()
                         unclipped_loss = -clipped_advantages * ratio
                         clipped_loss = -clipped_advantages * ratio.clamp(
@@ -817,24 +957,14 @@ class DDPOTrainer:
                         loss / accumulation_divisor
                     ).backward()
 
-                    approx_kl = (
-                        0.5
-                        * (new_log_probs - old_log_probs).square().mean()
-                    )
-                    clip_fraction = (
-                        (ratio - 1.0).abs() > self.config.clip_range
-                    ).float().mean()
                     metric_values["loss"].append(
                         loss.detach().float().item()
                     )
-                    metric_values["approx_kl"].append(
-                        approx_kl.detach().float().item()
+                    log_ratio_parts.append(
+                        raw_log_ratio.detach().float().cpu().reshape(-1)
                     )
-                    metric_values["clip_fraction"].append(
-                        clip_fraction.detach().float().item()
-                    )
-                    metric_values["ratio"].append(
-                        ratio.detach().float().mean().item()
+                    ratio_parts.append(
+                        ratio.detach().float().cpu().reshape(-1)
                     )
                     progress.update(1)
 
@@ -852,11 +982,26 @@ class DDPOTrainer:
                             torch.isfinite(grad_norm).item()
                         )
                         if finite_gradients:
+                            lora_before_update = [
+                                parameter.detach().clone()
+                                for parameter in lora_parameters
+                            ]
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
                             self.global_step += 1
                             metric_values["grad_norm"].append(
                                 float(grad_norm)
+                            )
+                            metric_values["update_norm"].append(
+                                _tensor_collection_l2_norm(
+                                    [
+                                        parameter.detach() - before
+                                        for parameter, before in zip(
+                                            lora_parameters,
+                                            lora_before_update,
+                                        )
+                                    ]
+                                )
                             )
                             metric_values["skipped_updates"].append(0.0)
                         else:
@@ -872,10 +1017,32 @@ class DDPOTrainer:
                         self.optimizer.zero_grad(set_to_none=True)
             progress.close()
 
-        return {
+        if audit_metrics is None or not log_ratio_parts:
+            raise RuntimeError("PPO optimization produced no policy transitions.")
+        all_log_ratios = torch.cat(log_ratio_parts)
+        all_ratios = torch.cat(ratio_parts)
+        result = {
             name: float(np.mean(values)) if values else 0.0
             for name, values in metric_values.items()
         }
+        result.update(
+            {
+                "approx_kl": (
+                    0.5 * all_log_ratios.square().mean()
+                ).item(),
+                "log_ratio_mean": all_log_ratios.mean().item(),
+                "log_ratio_std": all_log_ratios.std(unbiased=False).item(),
+                "log_ratio_max": all_log_ratios.abs().max().item(),
+                "ratio": all_ratios.mean().item(),
+                "ratio_std": all_ratios.std(unbiased=False).item(),
+                "clip_fraction": (
+                    (all_ratios - 1.0).abs() > self.config.clip_range
+                ).float().mean().item(),
+                "lora_norm": _tensor_collection_l2_norm(lora_parameters),
+                **audit_metrics,
+            }
+        )
+        return result
 
     def _rollout_metrics(self, trajectory: Trajectory) -> dict[str, float]:
         advantages = trajectory.advantages

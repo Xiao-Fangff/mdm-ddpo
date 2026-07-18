@@ -7,6 +7,7 @@ import unittest
 from mdm_ddpo.lora import (
     LoRAWeight,
     inject_lora,
+    load_trainable_state_dict,
     merge_lora,
     trainable_state_dict,
 )
@@ -67,6 +68,38 @@ class LoRATest(unittest.TestCase):
         self.assertFalse(
             any("parametrizations" in name for name in model.state_dict())
         )
+
+    def test_loading_requires_every_trainable_lora_tensor(self):
+        model = ToyNetwork()
+        inject_lora(
+            model,
+            rank=2,
+            alpha=2,
+            target_regex=r"(block|attn)",
+        )
+        state = trainable_state_dict(model)
+        missing_name = next(iter(state))
+        state.pop(missing_name)
+
+        with self.assertRaisesRegex(KeyError, "missing trainable policy"):
+            load_trainable_state_dict(model, state)
+
+    def test_loading_accepts_complete_trainable_lora_state(self):
+        source = ToyNetwork()
+        target = ToyNetwork()
+        for model in (source, target):
+            inject_lora(
+                model,
+                rank=2,
+                alpha=2,
+                target_regex=r"(block|attn)",
+            )
+        source_state = trainable_state_dict(source)
+
+        load_trainable_state_dict(target, source_state)
+
+        for name, tensor in source_state.items():
+            torch.testing.assert_close(target.state_dict()[name], tensor)
 
 
 if __name__ == "__main__":
