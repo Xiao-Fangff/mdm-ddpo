@@ -50,7 +50,8 @@ exec "${PYTHON}" "${PROJECT_ROOT}/train_ddpo.py" \
   --m2m-weight 1.0 \
   --reward-embedding-mode mean \
   --fixed-eval-every 5 \
-  --fixed-eval-prompts 32 \
+  --fixed-eval-prompts 128 \
+  --fixed-eval-samples-per-prompt 4 \
   --early-stop-patience 8 \
   "${SWANLAB_FLAG}" \
   --swanlab-project "${DDPO_SWANLAB_PROJECT}" \

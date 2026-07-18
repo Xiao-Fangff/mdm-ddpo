@@ -34,6 +34,7 @@ class TrainConfig:
 
     dataset: str = "humanml"
     split: str = "train"
+    eval_split: str = "val"
     data_cache_dir: str = DEFAULT_DATA_CACHE_DIR
     data_workers: int = 4
     pin_memory: bool = True
@@ -82,7 +83,10 @@ class TrainConfig:
 
     fixed_eval_every: int = 5
     fixed_eval_seed: int = 20260717
-    fixed_eval_prompts: int = 32
+    fixed_eval_prompts: int = 128
+    fixed_eval_samples_per_prompt: int = 4
+    fixed_eval_bootstrap_samples: int = 2000
+    fixed_eval_pool_path: str = ""
     early_stop_patience: int = 8
     early_stop_min_delta: float = 0.0
 
@@ -101,6 +105,18 @@ class TrainConfig:
         if self.dataset != "humanml":
             raise ValueError(
                 "The MotionReward 263-D adapter currently supports dataset='humanml' only."
+            )
+        if self.split != "train":
+            raise ValueError(
+                "DDPO rollouts must use the HumanML3D train split; "
+                "set --split train."
+            )
+        if self.eval_split not in {"val", "test"}:
+            raise ValueError("--eval-split must be 'val' or 'test'.")
+        if self.fixed_eval_every > 0 and self.eval_split == "test":
+            raise ValueError(
+                "The HumanML3D test split cannot be used for checkpoint "
+                "selection; use --eval-split val."
             )
         if not 0 < self.ddim_eta <= 1:
             raise ValueError(
@@ -121,6 +137,8 @@ class TrainConfig:
             "log_every",
             "samples_per_prompt",
             "fixed_eval_prompts",
+            "fixed_eval_samples_per_prompt",
+            "fixed_eval_bootstrap_samples",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"--{name.replace('_', '-')} must be positive.")
@@ -248,6 +266,15 @@ def build_parser() -> argparse.ArgumentParser:
     data = parser.add_argument_group("data")
     data.add_argument("--dataset", default="humanml", choices=["humanml"])
     data.add_argument("--split", default="train")
+    data.add_argument(
+        "--eval-split",
+        default="val",
+        choices=["val", "test"],
+        help=(
+            "Held-out split used by fixed validation. The test split is "
+            "forbidden while fixed validation selects checkpoints."
+        ),
+    )
     data.add_argument(
         "--data-cache-dir",
         default=DEFAULT_DATA_CACHE_DIR,
@@ -396,8 +423,28 @@ def build_parser() -> argparse.ArgumentParser:
     reward.add_argument(
         "--fixed-eval-prompts",
         type=int,
-        default=32,
+        default=128,
         help="Number of deterministic prompts in the fixed evaluation pool.",
+    )
+    reward.add_argument(
+        "--fixed-eval-samples-per-prompt",
+        type=int,
+        default=4,
+        help="Generated motions evaluated for every held-out prompt.",
+    )
+    reward.add_argument(
+        "--fixed-eval-bootstrap-samples",
+        type=int,
+        default=2000,
+        help="Bootstrap replicates used for fixed-validation standard errors.",
+    )
+    reward.add_argument(
+        "--fixed-eval-pool-path",
+        default="",
+        help=(
+            "Optional shared fixed_eval_pool.pt. It is created when missing "
+            "and copied into every run directory."
+        ),
     )
     reward.add_argument(
         "--early-stop-patience",
@@ -471,6 +518,7 @@ def parse_config(argv: list[str] | None = None) -> TrainConfig:
         config.train_batch_size = 2
         config.samples_per_prompt = 2
         config.fixed_eval_prompts = 1
+        config.fixed_eval_samples_per_prompt = 2
         config.inner_epochs = 1
         config.data_workers = 0
         config.save_every = 1

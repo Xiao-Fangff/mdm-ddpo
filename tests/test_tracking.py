@@ -145,7 +145,11 @@ class SwanLabTrackerTest(unittest.TestCase):
                 "potential_group_whiten_scale_max": 100.0,
                 "eval_reward": 1.6,
                 "eval_reward_delta": 0.03,
+                "eval_reward_retrieval_delta_median": 0.01,
+                "eval_reward_retrieval_improvement_fraction": 0.625,
+                "eval_reward_retrieval_delta_bootstrap_se": 0.004,
                 "eval_batch_size": 32,
+                "eval_samples_per_prompt": 4,
                 "eval_diffusion_steps": 50,
                 "eval_best_reward": 1.62,
                 "eval_best_epoch": 2,
@@ -175,7 +179,17 @@ class SwanLabTrackerTest(unittest.TestCase):
         )
         self.assertEqual(metrics["eval/reward_total"], 1.6)
         self.assertEqual(metrics["eval/reward_total_delta"], 0.03)
+        self.assertEqual(metrics["eval/reward_retrieval_delta_median"], 0.01)
+        self.assertEqual(
+            metrics["eval/reward_retrieval_improvement_fraction"],
+            0.625,
+        )
+        self.assertEqual(
+            metrics["eval/reward_retrieval_delta_bootstrap_se"],
+            0.004,
+        )
         self.assertEqual(metrics["eval/batch_size"], 32)
+        self.assertEqual(metrics["eval/samples_per_prompt"], 4)
         self.assertEqual(metrics["eval/diffusion_steps"], 50)
         self.assertEqual(metrics["eval/best_reward_total"], 1.62)
         self.assertEqual(metrics["eval/best_epoch"], 2)

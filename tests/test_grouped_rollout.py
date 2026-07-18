@@ -10,6 +10,8 @@ import torch
 from mdm_ddpo.config import TrainConfig
 from mdm_ddpo.trainer import (
     DDPOTrainer,
+    FixedEvalPool,
+    FixedEvalResult,
     Trajectory,
     apply_optimizer_hyperparameters,
     compute_grouped_advantages,
@@ -17,10 +19,25 @@ from mdm_ddpo.trainer import (
     repeat_prompt_batch,
     restore_optimizer_state,
     shuffled_sample_minibatches,
+    validate_fixed_eval_pool,
 )
 
 
 class GroupedRolloutTest(unittest.TestCase):
+    @staticmethod
+    def _fixed_pool(prompt_count: int, *, split: str = "val") -> FixedEvalPool:
+        return validate_fixed_eval_pool(
+            FixedEvalPool(
+                dataset_indices=torch.arange(prompt_count),
+                motion=torch.zeros(prompt_count, 2, 1, 4),
+                lengths=torch.full((prompt_count,), 4),
+                texts=[f"eval-{index}" for index in range(prompt_count)],
+                split=split,
+                noise_seed=123,
+                prompt_noise_seeds=torch.arange(prompt_count) + 123,
+            )
+        )
+
     @staticmethod
     def _trajectory(prompt_ids: list[int]) -> Trajectory:
         sample_count = len(prompt_ids)
@@ -186,6 +203,20 @@ class GroupedRolloutTest(unittest.TestCase):
         self.assertAlmostEqual(config.timestep_fraction, 0.5)
         self.assertAlmostEqual(config.learning_rate, 3.0e-4)
         self.assertEqual(config.early_stop_patience, 8)
+        self.assertEqual(config.split, "train")
+        self.assertEqual(config.eval_split, "val")
+        self.assertEqual(config.fixed_eval_prompts, 128)
+        self.assertEqual(config.fixed_eval_samples_per_prompt, 4)
+
+    def test_checkpoint_selection_rejects_test_split(self):
+        config = TrainConfig(eval_split="test", fixed_eval_every=1)
+        with self.assertRaisesRegex(ValueError, "test split"):
+            config.validate()
+
+    def test_rollouts_reject_non_train_split(self):
+        config = TrainConfig(split="val")
+        with self.assertRaisesRegex(ValueError, "rollouts must use"):
+            config.validate()
 
     def test_resume_uses_current_optimizer_hyperparameters(self):
         parameter = torch.nn.Parameter(torch.tensor(1.0))
@@ -238,11 +269,22 @@ class GroupedRolloutTest(unittest.TestCase):
 
     def test_fixed_eval_tracks_best_reward_and_plateau_count(self):
         trainer = DDPOTrainer.__new__(DDPOTrainer)
-        trainer.config = TrainConfig(early_stop_min_delta=0.0)
+        trainer.config = TrainConfig(
+            early_stop_min_delta=0.0,
+            fixed_eval_prompts=2,
+            fixed_eval_bootstrap_samples=100,
+            fixed_eval_seed=123,
+        )
+        trainer.fixed_eval_pool = self._fixed_pool(2)
         trainer.fixed_eval_baseline = {
             "eval_reward": 1.0,
             "eval_reward_retrieval": 0.4,
             "eval_reward_m2m": 0.6,
+        }
+        trainer.fixed_eval_baseline_per_prompt = {
+            "total": torch.tensor([0.9, 1.1]),
+            "retrieval": torch.tensor([0.3, 0.5]),
+            "m2m": torch.tensor([0.6, 0.6]),
         }
         trainer.best_eval_reward = 1.0
         trainer.best_eval_epoch = -1
@@ -250,16 +292,18 @@ class GroupedRolloutTest(unittest.TestCase):
         trainer.global_step = 0
         evaluations = iter(
             [
-                {
-                    "eval_reward": 1.1,
-                    "eval_reward_retrieval": 0.45,
-                    "eval_reward_m2m": 0.65,
-                },
-                {
-                    "eval_reward": 1.05,
-                    "eval_reward_retrieval": 0.43,
-                    "eval_reward_m2m": 0.62,
-                },
+                FixedEvalResult(
+                    metrics={},
+                    total_per_prompt=torch.tensor([1.0, 1.2]),
+                    retrieval_per_prompt=torch.tensor([0.35, 0.55]),
+                    m2m_per_prompt=torch.tensor([0.65, 0.65]),
+                ),
+                FixedEvalResult(
+                    metrics={},
+                    total_per_prompt=torch.tensor([0.95, 1.15]),
+                    retrieval_per_prompt=torch.tensor([0.33, 0.53]),
+                    m2m_per_prompt=torch.tensor([0.62, 0.62]),
+                ),
             ]
         )
         trainer.evaluate_fixed_pool = lambda: next(evaluations)
@@ -271,6 +315,10 @@ class GroupedRolloutTest(unittest.TestCase):
 
         self.assertEqual(improved["eval_is_best"], 1.0)
         self.assertAlmostEqual(improved["eval_best_reward_delta"], 0.1)
+        self.assertAlmostEqual(
+            improved["eval_reward_retrieval_improvement_fraction"],
+            1.0,
+        )
         self.assertEqual(plateau["eval_is_best"], 0.0)
         self.assertEqual(plateau["eval_evals_without_improvement"], 1.0)
         self.assertEqual(trainer.best_eval_epoch, 4)
@@ -285,11 +333,15 @@ class GroupedRolloutTest(unittest.TestCase):
             timestep_fraction=0.5,
         )
         trainer.diffusion = SimpleNamespace(num_timesteps=50)
+        trainer.fixed_eval_pool = self._fixed_pool(32)
 
         signature = trainer._fixed_eval_signature()
 
         self.assertEqual(signature["eval_prompts"], 32.0)
         self.assertEqual(signature["eval_samples"], 128.0)
+        self.assertEqual(signature["eval_samples_per_prompt"], 4.0)
+        self.assertEqual(signature["eval_split"], "val")
+        self.assertEqual(signature["eval_pool_id"], trainer.fixed_eval_pool.pool_id)
         self.assertEqual(signature["eval_prompt_batch_size"], 8.0)
         self.assertEqual(signature["eval_batch_size"], 32.0)
         self.assertEqual(signature["eval_diffusion_steps"], 50.0)
@@ -305,7 +357,7 @@ class GroupedRolloutTest(unittest.TestCase):
             samples_per_prompt=2,
         )
         trainer.diffusion = SimpleNamespace(num_timesteps=4)
-        trainer.fixed_eval_batch = object()
+        trainer.fixed_eval_pool = self._fixed_pool(1)
         trainer.fixed_eval_baseline = {
             "eval_reward": 1.0,
             "eval_reward_retrieval": 0.4,
@@ -314,19 +366,26 @@ class GroupedRolloutTest(unittest.TestCase):
             "eval_prompts": 1.0,
             "eval_seed": float(trainer.config.fixed_eval_seed),
         }
+        trainer.fixed_eval_baseline_per_prompt = {
+            "total": torch.tensor([1.0]),
+            "retrieval": torch.tensor([0.4]),
+            "m2m": torch.tensor([0.6]),
+        }
         trainer.best_eval_reward = 1.1
         trainer.best_eval_epoch = 0
         trainer.evals_without_improvement = 5
         trainer.start_epoch = 1
         trainer.global_step = 2
-        current_metrics = {
-            "eval_reward": 1.05,
-            "eval_reward_retrieval": 0.43,
-            "eval_reward_m2m": 0.62,
-            "eval_reward_std": 0.2,
-            **trainer._fixed_eval_signature(),
-        }
-        trainer.evaluate_fixed_pool = lambda: dict(current_metrics)
+        current_evaluation = FixedEvalResult(
+            metrics={
+                "eval_reward_std": 0.2,
+                **trainer._fixed_eval_signature(),
+            },
+            total_per_prompt=torch.tensor([1.05]),
+            retrieval_per_prompt=torch.tensor([0.43]),
+            m2m_per_prompt=torch.tensor([0.62]),
+        )
+        trainer.evaluate_fixed_pool = lambda: current_evaluation
         saved_best_epochs = []
         trainer._save_best_snapshot = saved_best_epochs.append
 
@@ -335,8 +394,12 @@ class GroupedRolloutTest(unittest.TestCase):
             with self.assertLogs("mdm_ddpo.trainer", level="WARNING"):
                 trainer._initialize_fixed_eval()
 
-        self.assertEqual(trainer.fixed_eval_baseline, current_metrics)
-        self.assertEqual(trainer.best_eval_reward, 1.05)
+        self.assertAlmostEqual(trainer.fixed_eval_baseline["eval_reward"], 1.05)
+        torch.testing.assert_close(
+            trainer.fixed_eval_baseline_per_prompt["retrieval"],
+            torch.tensor([0.43]),
+        )
+        self.assertAlmostEqual(trainer.best_eval_reward, 1.05)
         self.assertEqual(trainer.best_eval_epoch, 0)
         self.assertEqual(trainer.evals_without_improvement, 0)
         self.assertEqual(saved_best_epochs, [0])

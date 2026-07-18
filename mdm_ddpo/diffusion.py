@@ -41,6 +41,7 @@ def ddim_step_with_logprob(
     mask: torch.Tensor | None = None,
     clip_denoised: bool = False,
     generator: torch.Generator | None = None,
+    noise: torch.Tensor | None = None,
     min_std: float = 1.0e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Take one stochastic DDIM step and evaluate its transition log-probability.
@@ -89,12 +90,17 @@ def ddim_step_with_logprob(
     std = sigma.to(sample.dtype) * active
 
     if prev_sample is None:
-        noise = torch.randn(
-            sample.shape,
-            device=sample.device,
-            dtype=sample.dtype,
-            generator=generator,
-        )
+        if noise is None:
+            noise = torch.randn(
+                sample.shape,
+                device=sample.device,
+                dtype=sample.dtype,
+                generator=generator,
+            )
+        elif noise.shape != sample.shape:
+            raise ValueError("noise must have the same shape as sample.")
+        else:
+            noise = noise.to(device=sample.device, dtype=sample.dtype)
         prev_sample = (mean + std * noise).contiguous()
     elif prev_sample.shape != sample.shape:
         raise ValueError("prev_sample must have the same shape as sample.")

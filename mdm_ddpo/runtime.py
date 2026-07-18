@@ -97,9 +97,7 @@ def _seed_worker(worker_id: int) -> None:
     random.seed(worker_seed)
 
 
-def build_data_loader(config: TrainConfig) -> DataLoader:
-    from data_loaders.get_data import get_collate_fn, get_dataset_class
-
+def _prepare_data_cache(config: TrainConfig) -> Path:
     cache_root = (
         Path(config.data_cache_dir).expanduser().resolve()
         if config.data_cache_dir
@@ -115,11 +113,18 @@ def build_data_loader(config: TrainConfig) -> DataLoader:
         )
     if not glove_link.exists():
         glove_link.symlink_to(glove_source, target_is_directory=True)
+    return cache_root
 
+
+def build_dataset(config: TrainConfig, *, split: str) -> Any:
+    """Build a HumanML dataset for an explicit split using local cache only."""
+    from data_loaders.get_data import get_dataset_class
+
+    cache_root = _prepare_data_cache(config)
     dataset_class = get_dataset_class(config.dataset)
     # Explicit absolute roots avoid relying on the launch directory.
-    dataset = dataset_class(
-        split=config.split,
+    return dataset_class(
+        split=split,
         num_frames=None,
         mode="train",
         abs_path=str(Path(config.mdm_root).resolve()),
@@ -127,6 +132,12 @@ def build_data_loader(config: TrainConfig) -> DataLoader:
         device=None,
         autoregressive=False,
     )
+
+
+def build_data_loader(config: TrainConfig) -> DataLoader:
+    from data_loaders.get_data import get_collate_fn
+
+    dataset = build_dataset(config, split=config.split)
     prompt_batch_size = config.prompts_per_rollout_batch
     if len(dataset) < prompt_batch_size:
         raise ValueError(

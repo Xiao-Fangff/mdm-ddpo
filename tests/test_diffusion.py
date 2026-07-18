@@ -136,6 +136,36 @@ class DiffusionLogProbTest(unittest.TestCase):
         torch.testing.assert_close(first, pred_xstart)
         torch.testing.assert_close(log_prob, torch.zeros_like(log_prob))
 
+    def test_explicit_noise_makes_stochastic_transition_reproducible(self):
+        diffusion = ToyDiffusion()
+        policy = ToyPolicy()
+        sample = torch.randn(2, 2, 1, 3)
+        timestep = torch.full((2,), 2, dtype=torch.long)
+        noise = torch.randn_like(sample)
+
+        first, first_log_prob, _ = ddim_step_with_logprob(
+            diffusion,
+            policy,
+            sample,
+            timestep,
+            model_kwargs={},
+            eta=1.0,
+            noise=noise,
+        )
+        torch.manual_seed(999)
+        second, second_log_prob, _ = ddim_step_with_logprob(
+            diffusion,
+            policy,
+            sample,
+            timestep,
+            model_kwargs={},
+            eta=1.0,
+            noise=noise,
+        )
+
+        torch.testing.assert_close(first, second)
+        torch.testing.assert_close(first_log_prob, second_log_prob)
+
 
 if __name__ == "__main__":
     unittest.main()

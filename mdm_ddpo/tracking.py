@@ -91,16 +91,46 @@ TRAINING_METRIC_NAMES = {
     "elapsed_seconds": "time/epoch_seconds",
     "eval_reward": "eval/reward_total",
     "eval_reward_std": "eval/reward_std",
+    "eval_reward_median": "eval/reward_total_median",
+    "eval_reward_bootstrap_se": "eval/reward_total_bootstrap_se",
     "eval_reward_retrieval": "eval/reward_retrieval",
+    "eval_reward_retrieval_median": "eval/reward_retrieval_median",
+    "eval_reward_retrieval_bootstrap_se": (
+        "eval/reward_retrieval_bootstrap_se"
+    ),
     "eval_reward_m2m": "eval/reward_m2m",
+    "eval_reward_m2m_median": "eval/reward_m2m_median",
+    "eval_reward_m2m_bootstrap_se": "eval/reward_m2m_bootstrap_se",
     "eval_reward_delta": "eval/reward_total_delta",
+    "eval_reward_delta_median": "eval/reward_total_delta_median",
+    "eval_reward_improvement_fraction": (
+        "eval/reward_total_improvement_fraction"
+    ),
+    "eval_reward_delta_bootstrap_se": "eval/reward_total_delta_bootstrap_se",
     "eval_reward_retrieval_delta": "eval/reward_retrieval_delta",
+    "eval_reward_retrieval_delta_median": (
+        "eval/reward_retrieval_delta_median"
+    ),
+    "eval_reward_retrieval_improvement_fraction": (
+        "eval/reward_retrieval_improvement_fraction"
+    ),
+    "eval_reward_retrieval_delta_bootstrap_se": (
+        "eval/reward_retrieval_delta_bootstrap_se"
+    ),
     "eval_reward_m2m_delta": "eval/reward_m2m_delta",
+    "eval_reward_m2m_delta_median": "eval/reward_m2m_delta_median",
+    "eval_reward_m2m_improvement_fraction": (
+        "eval/reward_m2m_improvement_fraction"
+    ),
+    "eval_reward_m2m_delta_bootstrap_se": (
+        "eval/reward_m2m_delta_bootstrap_se"
+    ),
     "eval_reward_baseline": "eval/reward_total_baseline",
     "eval_reward_retrieval_baseline": "eval/reward_retrieval_baseline",
     "eval_reward_m2m_baseline": "eval/reward_m2m_baseline",
     "eval_samples": "eval/samples",
     "eval_prompts": "eval/prompts",
+    "eval_samples_per_prompt": "eval/samples_per_prompt",
     "eval_seed": "eval/seed",
     "eval_batch_size": "eval/batch_size",
     "eval_diffusion_steps": "eval/diffusion_steps",

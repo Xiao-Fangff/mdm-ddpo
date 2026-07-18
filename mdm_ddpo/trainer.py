@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -14,7 +15,6 @@ from typing import Any
 import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from .config import TrainConfig
@@ -31,6 +31,7 @@ from .runtime import (
     autocast_context,
     bootstrap_external_repositories,
     build_data_loader,
+    build_dataset,
     build_mdm,
     build_model_kwargs,
     build_policy_model,
@@ -146,11 +147,203 @@ def _tensor_collection_l2_norm(tensors: list[torch.Tensor]) -> float:
     return squared_norm.sqrt().item()
 
 
+FIXED_EVAL_POOL_VERSION = 1
+
+
 @dataclass(frozen=True)
-class PromptBatch:
+class FixedEvalPool:
+    dataset_indices: torch.Tensor
     motion: torch.Tensor
     lengths: torch.Tensor
     texts: list[str]
+    split: str
+    noise_seed: int
+    prompt_noise_seeds: torch.Tensor
+    pool_id: str = ""
+
+    @property
+    def prompt_count(self) -> int:
+        return len(self.texts)
+
+
+@dataclass(frozen=True)
+class FixedEvalResult:
+    metrics: dict[str, Any]
+    total_per_prompt: torch.Tensor
+    retrieval_per_prompt: torch.Tensor
+    m2m_per_prompt: torch.Tensor
+
+
+def _update_hash_with_tensor(
+    digest: Any,
+    tensor: torch.Tensor,
+) -> None:
+    value = tensor.detach().cpu().contiguous()
+    digest.update(str(value.dtype).encode("utf-8"))
+    digest.update(str(tuple(value.shape)).encode("utf-8"))
+    digest.update(value.numpy().tobytes())
+
+
+def fixed_eval_pool_id(pool: FixedEvalPool) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(FIXED_EVAL_POOL_VERSION).encode("utf-8"))
+    digest.update(pool.split.encode("utf-8"))
+    digest.update(str(pool.noise_seed).encode("utf-8"))
+    _update_hash_with_tensor(digest, pool.dataset_indices)
+    _update_hash_with_tensor(digest, pool.motion)
+    _update_hash_with_tensor(digest, pool.lengths)
+    _update_hash_with_tensor(digest, pool.prompt_noise_seeds)
+    for value in pool.texts:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def validate_fixed_eval_pool(pool: FixedEvalPool) -> FixedEvalPool:
+    prompt_count = pool.prompt_count
+    if prompt_count <= 0:
+        raise ValueError("Fixed-eval pool cannot be empty.")
+    if pool.dataset_indices.shape != (prompt_count,):
+        raise ValueError("Fixed-eval dataset indices have an invalid shape.")
+    if pool.lengths.shape != (prompt_count,):
+        raise ValueError("Fixed-eval lengths have an invalid shape.")
+    if pool.motion.ndim != 4 or pool.motion.shape[0] != prompt_count:
+        raise ValueError("Fixed-eval GT motion has an invalid shape.")
+    if pool.prompt_noise_seeds.shape != (prompt_count,):
+        raise ValueError("Fixed-eval prompt noise seeds have an invalid shape.")
+    normalized = FixedEvalPool(
+        dataset_indices=pool.dataset_indices.detach().cpu().long(),
+        motion=pool.motion.detach().cpu().float(),
+        lengths=pool.lengths.detach().cpu().long(),
+        texts=list(pool.texts),
+        split=pool.split,
+        noise_seed=int(pool.noise_seed),
+        prompt_noise_seeds=pool.prompt_noise_seeds.detach().cpu().long(),
+    )
+    calculated_id = fixed_eval_pool_id(normalized)
+    if pool.pool_id and pool.pool_id != calculated_id:
+        raise ValueError(
+            "Fixed-eval pool checksum mismatch; the persisted pool is corrupt."
+        )
+    return FixedEvalPool(
+        dataset_indices=normalized.dataset_indices,
+        motion=normalized.motion,
+        lengths=normalized.lengths,
+        texts=normalized.texts,
+        split=normalized.split,
+        noise_seed=normalized.noise_seed,
+        prompt_noise_seeds=normalized.prompt_noise_seeds,
+        pool_id=calculated_id,
+    )
+
+
+def save_fixed_eval_pool(pool: FixedEvalPool, path: Path) -> Path:
+    pool = validate_fixed_eval_pool(pool)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": FIXED_EVAL_POOL_VERSION,
+        "pool_id": pool.pool_id,
+        "split": pool.split,
+        "dataset_indices": pool.dataset_indices,
+        "texts": pool.texts,
+        "lengths": pool.lengths,
+        "gt_motion": pool.motion,
+        "noise_seed": pool.noise_seed,
+        "prompt_noise_seeds": pool.prompt_noise_seeds,
+    }
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary_path)
+    os.replace(temporary_path, path)
+    return path
+
+
+def load_fixed_eval_pool(path: Path) -> FixedEvalPool:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if int(payload.get("version", -1)) != FIXED_EVAL_POOL_VERSION:
+        raise ValueError(
+            f"Unsupported fixed-eval pool version in {path}: "
+            f"{payload.get('version')!r}."
+        )
+    required = {
+        "pool_id",
+        "split",
+        "dataset_indices",
+        "texts",
+        "lengths",
+        "gt_motion",
+        "noise_seed",
+        "prompt_noise_seeds",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise KeyError(f"Fixed-eval pool is missing fields: {missing}")
+    return validate_fixed_eval_pool(
+        FixedEvalPool(
+            dataset_indices=payload["dataset_indices"],
+            motion=payload["gt_motion"],
+            lengths=payload["lengths"],
+            texts=list(payload["texts"]),
+            split=str(payload["split"]),
+            noise_seed=int(payload["noise_seed"]),
+            prompt_noise_seeds=payload["prompt_noise_seeds"],
+            pool_id=str(payload["pool_id"]),
+        )
+    )
+
+
+def bootstrap_standard_error(
+    values: torch.Tensor,
+    *,
+    samples: int,
+    seed: int,
+) -> float:
+    values = values.detach().float().cpu().reshape(-1)
+    if values.numel() < 2:
+        return 0.0
+    if samples <= 0:
+        raise ValueError("Bootstrap sample count must be positive.")
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randint(
+        values.numel(),
+        (samples, values.numel()),
+        generator=generator,
+    )
+    bootstrap_means = values[indices].mean(dim=1)
+    return bootstrap_means.std(unbiased=True).item()
+
+
+def summarize_fixed_eval_component(
+    name: str,
+    current: torch.Tensor,
+    baseline: torch.Tensor,
+    *,
+    bootstrap_samples: int,
+    seed: int,
+) -> dict[str, float]:
+    current = current.detach().float().cpu().reshape(-1)
+    baseline = baseline.detach().float().cpu().reshape(-1)
+    if current.shape != baseline.shape or current.numel() == 0:
+        raise ValueError("Fixed-eval current and baseline values must match.")
+    delta = current - baseline
+    return {
+        name: current.mean().item(),
+        f"{name}_median": torch.quantile(current, 0.5).item(),
+        f"{name}_bootstrap_se": bootstrap_standard_error(
+            current,
+            samples=bootstrap_samples,
+            seed=seed,
+        ),
+        f"{name}_baseline": baseline.mean().item(),
+        f"{name}_delta": delta.mean().item(),
+        f"{name}_delta_median": torch.quantile(delta, 0.5).item(),
+        f"{name}_improvement_fraction": (delta > 0).float().mean().item(),
+        f"{name}_delta_bootstrap_se": bootstrap_standard_error(
+            delta,
+            samples=bootstrap_samples,
+            seed=seed + 1,
+        ),
+    }
 
 
 def repeat_prompt_batch(
@@ -356,17 +549,29 @@ class DDPOTrainer:
         self.reward_model = MotionReward(config, self.reward_device)
         self.start_epoch = 0
         self.global_step = 0
-        self.fixed_eval_baseline: dict[str, float] | None = None
+        self.fixed_eval_baseline: dict[str, Any] | None = None
+        self.fixed_eval_baseline_per_prompt: dict[str, torch.Tensor] | None = None
+        self.checkpoint_fixed_eval_pool_id: str | None = None
         self.best_eval_reward: float | None = None
         self.best_eval_epoch: int | None = None
         self.evals_without_improvement = 0
         if config.resume:
             self._load_checkpoint(config.resume)
-        self.fixed_eval_batch = (
-            self._build_fixed_eval_batch()
+        self.fixed_eval_pool = (
+            self._load_or_create_fixed_eval_pool()
             if config.fixed_eval_every > 0
             else None
         )
+        if (
+            self.fixed_eval_pool is not None
+            and self.checkpoint_fixed_eval_pool_id is not None
+            and self.fixed_eval_pool.pool_id
+            != self.checkpoint_fixed_eval_pool_id
+        ):
+            raise ValueError(
+                "Resume checkpoint fixed-eval pool does not match "
+                "fixed_eval_pool.pt."
+            )
 
         total, trainable = parameter_counts(self.model)
         LOGGER.info(
@@ -427,42 +632,57 @@ class DDPOTrainer:
             "samples_per_prompt": self.config.samples_per_prompt,
             "advantage_mode": self.config.advantage_mode,
             "timestep_fraction": self.config.timestep_fraction,
-            "fixed_eval_enabled": self.fixed_eval_batch is not None,
+            "fixed_eval_enabled": self.fixed_eval_pool is not None,
             "fixed_eval_prompts": self.config.fixed_eval_prompts,
+            "fixed_eval_samples_per_prompt": (
+                self.config.fixed_eval_samples_per_prompt
+            ),
+            "fixed_eval_split": self.config.eval_split,
+            "fixed_eval_pool_id": (
+                self.fixed_eval_pool.pool_id
+                if self.fixed_eval_pool is not None
+                else ""
+            ),
             "early_stop_patience": self.config.early_stop_patience,
             "log_prob_audit_tolerance": (
                 self.config.log_prob_audit_tolerance
             ),
         }
 
-    def _build_fixed_eval_batch(self) -> PromptBatch:
-        """Select a deterministic prompt pool without advancing training RNG."""
+    def _create_fixed_eval_pool(self) -> FixedEvalPool:
+        """Materialize exact held-out samples without advancing training RNG."""
         from data_loaders.get_data import get_collate_fn
 
-        if len(self.data_loader.dataset) < self.config.fixed_eval_prompts:
-            raise ValueError(
-                "Dataset has fewer samples than --fixed-eval-prompts: "
-                f"{len(self.data_loader.dataset)} < "
-                f"{self.config.fixed_eval_prompts}."
-            )
         rng_state = self._rng_state()
         try:
             seed_everything(self.config.fixed_eval_seed)
-            loader = DataLoader(
-                self.data_loader.dataset,
-                batch_size=self.config.fixed_eval_prompts,
-                shuffle=False,
-                num_workers=0,
-                drop_last=True,
-                collate_fn=get_collate_fn(
-                    self.config.dataset,
-                    hml_mode="train",
-                    batch_size=self.config.fixed_eval_prompts,
-                ),
+            dataset = build_dataset(
+                self.config,
+                split=self.config.eval_split,
             )
-            motion, condition = next(iter(loader))
+            if len(dataset) < self.config.fixed_eval_prompts:
+                raise ValueError(
+                    "Held-out dataset has fewer samples than "
+                    "--fixed-eval-prompts: "
+                    f"{len(dataset)} < {self.config.fixed_eval_prompts}."
+                )
+            generator = torch.Generator().manual_seed(
+                self.config.fixed_eval_seed
+            )
+            dataset_indices = torch.randperm(
+                len(dataset),
+                generator=generator,
+            )[: self.config.fixed_eval_prompts]
+            items = [dataset[int(index)] for index in dataset_indices]
+            collate_fn = get_collate_fn(
+                self.config.dataset,
+                hml_mode="train",
+                batch_size=self.config.fixed_eval_prompts,
+            )
+            motion, condition = collate_fn(items)
         finally:
             self._restore_rng_state(rng_state)
+
         prompt_count = motion.shape[0]
         if (
             prompt_count != self.config.fixed_eval_prompts
@@ -476,29 +696,115 @@ class DDPOTrainer:
                 f"text={len(condition['y']['text'])}, "
                 f"lengths={len(condition['y']['lengths'])}."
             )
-        return PromptBatch(
-            motion=motion.detach().cpu(),
-            lengths=condition["y"]["lengths"].detach().cpu().long(),
-            texts=list(condition["y"]["text"]),
+        prompt_noise_seeds = (
+            torch.arange(prompt_count, dtype=torch.long) * 1_000_003
+            + self.config.fixed_eval_seed
+        )
+        return validate_fixed_eval_pool(
+            FixedEvalPool(
+                dataset_indices=dataset_indices,
+                motion=motion,
+                lengths=condition["y"]["lengths"],
+                texts=list(condition["y"]["text"]),
+                split=self.config.eval_split,
+                noise_seed=self.config.fixed_eval_seed,
+                prompt_noise_seeds=prompt_noise_seeds,
+            )
         )
 
-    def _fixed_eval_signature(self) -> dict[str, float]:
+    def _validate_fixed_eval_pool_config(
+        self,
+        pool: FixedEvalPool,
+    ) -> None:
+        expected = {
+            "split": self.config.eval_split,
+            "prompt_count": self.config.fixed_eval_prompts,
+            "noise_seed": self.config.fixed_eval_seed,
+        }
+        actual = {
+            "split": pool.split,
+            "prompt_count": pool.prompt_count,
+            "noise_seed": pool.noise_seed,
+        }
+        if actual != expected:
+            raise ValueError(
+                "Fixed-eval pool does not match current configuration: "
+                f"expected={expected}, actual={actual}. Use a fresh output "
+                "directory or the matching fixed-eval settings."
+            )
+
+    def _load_or_create_fixed_eval_pool(self) -> FixedEvalPool:
+        output_path = self.output_dir / "fixed_eval_pool.pt"
+        configured_path = (
+            Path(self.config.fixed_eval_pool_path).expanduser().resolve()
+            if self.config.fixed_eval_pool_path
+            else None
+        )
+        source_path: Path | None = None
+        if configured_path is not None and configured_path.exists():
+            source_path = configured_path
+        elif output_path.exists():
+            source_path = output_path
+        elif self.config.resume:
+            resume_pool_path = (
+                Path(self.config.resume).expanduser().resolve().parent
+                / "fixed_eval_pool.pt"
+            )
+            if resume_pool_path.exists():
+                source_path = resume_pool_path
+            else:
+                raise FileNotFoundError(
+                    "Cannot resume fixed validation because the original "
+                    f"fixed_eval_pool.pt is missing next to {self.config.resume}."
+                )
+
+        if source_path is None:
+            pool = self._create_fixed_eval_pool()
+            if configured_path is not None:
+                save_fixed_eval_pool(pool, configured_path)
+                LOGGER.info("Created shared fixed-eval pool: %s", configured_path)
+        else:
+            pool = load_fixed_eval_pool(source_path)
+            LOGGER.info("Loaded fixed-eval pool: %s", source_path)
+
+        self._validate_fixed_eval_pool_config(pool)
+        if configured_path is not None and not configured_path.exists():
+            save_fixed_eval_pool(pool, configured_path)
+        if output_path != source_path:
+            save_fixed_eval_pool(pool, output_path)
+        LOGGER.info(
+            "Fixed validation pool: split=%s, prompts=%d, pool_id=%s",
+            pool.split,
+            pool.prompt_count,
+            pool.pool_id,
+        )
+        return pool
+
+    def _fixed_eval_signature(self) -> dict[str, Any]:
         """Describe every setting that changes the deterministic eval pool."""
+        if self.fixed_eval_pool is None:
+            raise RuntimeError("Fixed evaluation is disabled.")
         prompt_batch_size = min(
-            self.config.fixed_eval_prompts,
+            self.fixed_eval_pool.prompt_count,
             self.config.prompts_per_rollout_batch,
         )
         precision_code = {"no": 0.0, "fp16": 1.0, "bf16": 2.0}
         return {
             "eval_samples": float(
-                self.config.fixed_eval_prompts
-                * self.config.samples_per_prompt
+                self.fixed_eval_pool.prompt_count
+                * self.config.fixed_eval_samples_per_prompt
             ),
-            "eval_prompts": float(self.config.fixed_eval_prompts),
-            "eval_seed": float(self.config.fixed_eval_seed),
+            "eval_prompts": float(self.fixed_eval_pool.prompt_count),
+            "eval_samples_per_prompt": float(
+                self.config.fixed_eval_samples_per_prompt
+            ),
+            "eval_seed": float(self.fixed_eval_pool.noise_seed),
+            "eval_split": self.fixed_eval_pool.split,
+            "eval_pool_id": self.fixed_eval_pool.pool_id,
             "eval_prompt_batch_size": float(prompt_batch_size),
             "eval_batch_size": float(
-                prompt_batch_size * self.config.samples_per_prompt
+                prompt_batch_size
+                * self.config.fixed_eval_samples_per_prompt
             ),
             "eval_diffusion_steps": float(self.diffusion.num_timesteps),
             "eval_guidance_scale": float(self.config.guidance_scale),
@@ -508,18 +814,16 @@ class DDPOTrainer:
             "eval_allow_tf32": float(self.config.allow_tf32),
             "eval_retrieval_weight": float(self.config.retrieval_weight),
             "eval_m2m_weight": float(self.config.m2m_weight),
-        }
+    }
 
     @torch.no_grad()
-    def evaluate_fixed_pool(self) -> dict[str, float]:
+    def evaluate_fixed_pool(self) -> FixedEvalResult:
         """Evaluate identical prompts and diffusion noise with mean embeddings."""
-        if self.fixed_eval_batch is None:
+        if self.fixed_eval_pool is None:
             raise RuntimeError("Fixed evaluation is disabled.")
 
-        generator = torch.Generator(device=self.device)
-        generator.manual_seed(self.config.fixed_eval_seed)
         prompt_batch_size = self.config.prompts_per_rollout_batch
-        total_prompt_count = len(self.fixed_eval_batch.texts)
+        total_prompt_count = self.fixed_eval_pool.prompt_count
         chunk_count = math.ceil(total_prompt_count / prompt_batch_size)
         progress = tqdm(
             total=chunk_count * self.diffusion.num_timesteps,
@@ -537,10 +841,10 @@ class DDPOTrainer:
                 total_prompt_count,
             )
             motion, lengths, texts, _ = repeat_prompt_batch(
-                self.fixed_eval_batch.motion[prompt_start:prompt_end],
-                self.fixed_eval_batch.lengths[prompt_start:prompt_end],
-                self.fixed_eval_batch.texts[prompt_start:prompt_end],
-                self.config.samples_per_prompt,
+                self.fixed_eval_pool.motion[prompt_start:prompt_end],
+                self.fixed_eval_pool.lengths[prompt_start:prompt_end],
+                self.fixed_eval_pool.texts[prompt_start:prompt_end],
+                self.config.fixed_eval_samples_per_prompt,
             )
             motion = motion.to(self.device, dtype=torch.float32)
             batch_size, _, _, num_frames = motion.shape
@@ -552,18 +856,50 @@ class DDPOTrainer:
                 device=self.device,
                 guidance_scale=self.config.guidance_scale,
             )
-            current = torch.randn(
-                motion.shape,
-                device=self.device,
-                dtype=motion.dtype,
-                generator=generator,
+            noise_parts: list[torch.Tensor] = []
+            prompt_generators: list[torch.Generator] = []
+            prompt_shape = tuple(
+                self.fixed_eval_pool.motion.shape[1:]
             )
+            for prompt_index in range(prompt_start, prompt_end):
+                generator = torch.Generator(device=self.device)
+                generator.manual_seed(
+                    int(self.fixed_eval_pool.prompt_noise_seeds[prompt_index])
+                )
+                prompt_generators.append(generator)
+                noise_parts.append(
+                    torch.randn(
+                        (
+                            self.config.fixed_eval_samples_per_prompt,
+                            *prompt_shape,
+                        ),
+                        device=self.device,
+                        dtype=motion.dtype,
+                        generator=generator,
+                    )
+                )
+            current = torch.cat(noise_parts, dim=0)
             for step in range(self.diffusion.num_timesteps - 1, -1, -1):
                 timestep = torch.full(
                     (batch_size,),
                     step,
                     device=self.device,
                     dtype=torch.long,
+                )
+                transition_noise = torch.cat(
+                    [
+                        torch.randn(
+                            (
+                                self.config.fixed_eval_samples_per_prompt,
+                                *prompt_shape,
+                            ),
+                            device=self.device,
+                            dtype=motion.dtype,
+                            generator=generator,
+                        )
+                        for generator in prompt_generators
+                    ],
+                    dim=0,
                 )
                 with autocast_context(self.device, self.config.precision):
                     current, _, _ = ddim_step_with_logprob(
@@ -575,7 +911,7 @@ class DDPOTrainer:
                         eta=self.config.ddim_eta,
                         mask=model_kwargs["y"]["mask"],
                         clip_denoised=self.config.clip_denoised,
-                        generator=generator,
+                        noise=transition_noise,
                     )
                 progress.update(1)
 
@@ -603,8 +939,8 @@ class DDPOTrainer:
         retrieval_rewards = torch.cat(retrieval_totals)
         m2m_rewards = torch.cat(m2m_totals)
         expected_samples = (
-            self.config.fixed_eval_prompts
-            * self.config.samples_per_prompt
+            self.fixed_eval_pool.prompt_count
+            * self.config.fixed_eval_samples_per_prompt
         )
         if len(rewards) != expected_samples:
             raise RuntimeError(
@@ -612,13 +948,21 @@ class DDPOTrainer:
                 f"expected={expected_samples}, actual={len(rewards)}."
             )
 
-        return {
-            "eval_reward": rewards.mean().item(),
-            "eval_reward_std": rewards.std(unbiased=False).item(),
-            "eval_reward_retrieval": retrieval_rewards.mean().item(),
-            "eval_reward_m2m": m2m_rewards.mean().item(),
-            **self._fixed_eval_signature(),
-        }
+        group_shape = (
+            self.fixed_eval_pool.prompt_count,
+            self.config.fixed_eval_samples_per_prompt,
+        )
+        return FixedEvalResult(
+            metrics={
+                "eval_reward_std": rewards.std(unbiased=False).item(),
+                **self._fixed_eval_signature(),
+            },
+            total_per_prompt=rewards.reshape(group_shape).mean(dim=1),
+            retrieval_per_prompt=(
+                retrieval_rewards.reshape(group_shape).mean(dim=1)
+            ),
+            m2m_per_prompt=m2m_rewards.reshape(group_shape).mean(dim=1),
+        )
 
     def _next_batch(self) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.data_iterator is None:
@@ -1072,27 +1416,108 @@ class DDPOTrainer:
         ) as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
+    def _append_fixed_eval_per_prompt(
+        self,
+        *,
+        event: str,
+        epoch: int,
+        evaluation: FixedEvalResult,
+    ) -> None:
+        if self.fixed_eval_pool is None:
+            raise RuntimeError("Fixed evaluation is disabled.")
+        if self.fixed_eval_baseline_per_prompt is None:
+            raise RuntimeError("Fixed evaluation baseline is missing.")
+        entries = []
+        for index in range(self.fixed_eval_pool.prompt_count):
+            retrieval = evaluation.retrieval_per_prompt[index].item()
+            m2m = evaluation.m2m_per_prompt[index].item()
+            retrieval_baseline = self.fixed_eval_baseline_per_prompt[
+                "retrieval"
+            ][index].item()
+            m2m_baseline = self.fixed_eval_baseline_per_prompt["m2m"][
+                index
+            ].item()
+            entries.append(
+                {
+                    "pool_position": index,
+                    "dataset_index": int(
+                        self.fixed_eval_pool.dataset_indices[index]
+                    ),
+                    "text": self.fixed_eval_pool.texts[index],
+                    "length": int(self.fixed_eval_pool.lengths[index]),
+                    "retrieval_baseline": retrieval_baseline,
+                    "retrieval_current": retrieval,
+                    "retrieval_delta": retrieval - retrieval_baseline,
+                    "m2m_baseline": m2m_baseline,
+                    "m2m_current": m2m,
+                    "m2m_delta": m2m - m2m_baseline,
+                }
+            )
+        record = {
+            "event": event,
+            "epoch": epoch,
+            "global_step": self.global_step,
+            "eval_split": self.fixed_eval_pool.split,
+            "eval_pool_id": self.fixed_eval_pool.pool_id,
+            "prompts": entries,
+        }
+        with open(
+            self.output_dir / "fixed_eval_per_prompt.jsonl",
+            "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
     def _fixed_eval_with_deltas(
         self,
-        metrics: dict[str, float],
-    ) -> dict[str, float]:
-        if self.fixed_eval_baseline is None:
+        evaluation: FixedEvalResult,
+    ) -> dict[str, Any]:
+        if self.fixed_eval_baseline_per_prompt is None:
             raise RuntimeError("Fixed evaluation baseline has not been initialized.")
-        result = dict(metrics)
-        for name in ("eval_reward", "eval_reward_retrieval", "eval_reward_m2m"):
-            result[f"{name}_baseline"] = self.fixed_eval_baseline[name]
-            result[f"{name}_delta"] = metrics[name] - self.fixed_eval_baseline[name]
+        result = dict(evaluation.metrics)
+        components = (
+            (
+                "eval_reward",
+                evaluation.total_per_prompt,
+                self.fixed_eval_baseline_per_prompt["total"],
+            ),
+            (
+                "eval_reward_retrieval",
+                evaluation.retrieval_per_prompt,
+                self.fixed_eval_baseline_per_prompt["retrieval"],
+            ),
+            (
+                "eval_reward_m2m",
+                evaluation.m2m_per_prompt,
+                self.fixed_eval_baseline_per_prompt["m2m"],
+            ),
+        )
+        for offset, (name, current, baseline) in enumerate(components):
+            result.update(
+                summarize_fixed_eval_component(
+                    name,
+                    current,
+                    baseline,
+                    bootstrap_samples=(
+                        self.config.fixed_eval_bootstrap_samples
+                    ),
+                    seed=self.config.fixed_eval_seed + 100 * offset,
+                )
+            )
         return result
 
     def _initialize_fixed_eval(self) -> dict[str, Any] | None:
-        if self.fixed_eval_batch is None:
+        if self.fixed_eval_pool is None:
             return None
         expected_signature = self._fixed_eval_signature()
         if (
             self.fixed_eval_baseline is not None
-            and any(
-                self.fixed_eval_baseline.get(name) != value
-                for name, value in expected_signature.items()
+            and (
+                self.fixed_eval_baseline_per_prompt is None
+                or any(
+                    self.fixed_eval_baseline.get(name) != value
+                    for name, value in expected_signature.items()
+                )
             )
         ):
             LOGGER.warning(
@@ -1105,6 +1530,7 @@ class DDPOTrainer:
                 expected_signature,
             )
             self.fixed_eval_baseline = None
+            self.fixed_eval_baseline_per_prompt = None
             self.best_eval_reward = None
             self.best_eval_epoch = None
             self.evals_without_improvement = 0
@@ -1113,7 +1539,29 @@ class DDPOTrainer:
                 LOGGER.warning(
                     "Using the resumed policy as the new fixed-eval baseline."
                 )
-            self.fixed_eval_baseline = self.evaluate_fixed_pool()
+            baseline_evaluation = self.evaluate_fixed_pool()
+            self.fixed_eval_baseline_per_prompt = {
+                "total": baseline_evaluation.total_per_prompt.clone(),
+                "retrieval": (
+                    baseline_evaluation.retrieval_per_prompt.clone()
+                ),
+                "m2m": baseline_evaluation.m2m_per_prompt.clone(),
+            }
+            self.fixed_eval_baseline = self._fixed_eval_with_deltas(
+                baseline_evaluation
+            )
+        else:
+            assert self.fixed_eval_baseline_per_prompt is not None
+            baseline_evaluation = FixedEvalResult(
+                metrics=dict(self.fixed_eval_baseline),
+                total_per_prompt=(
+                    self.fixed_eval_baseline_per_prompt["total"]
+                ),
+                retrieval_per_prompt=(
+                    self.fixed_eval_baseline_per_prompt["retrieval"]
+                ),
+                m2m_per_prompt=self.fixed_eval_baseline_per_prompt["m2m"],
+            )
         initialized_best = self.best_eval_reward is None
         if self.best_eval_reward is None:
             self.best_eval_reward = self.fixed_eval_baseline["eval_reward"]
@@ -1124,14 +1572,20 @@ class DDPOTrainer:
             "event": "baseline",
             "epoch": self.start_epoch - 1,
             "global_step": self.global_step,
-            **self._fixed_eval_with_deltas(self.fixed_eval_baseline),
+            **self._fixed_eval_with_deltas(baseline_evaluation),
         }
         self._append_fixed_eval(record)
+        self._append_fixed_eval_per_prompt(
+            event="baseline",
+            epoch=self.start_epoch - 1,
+            evaluation=baseline_evaluation,
+        )
         LOGGER.info("fixed evaluation baseline: %s", json.dumps(record, sort_keys=True))
         return record
 
-    def _run_fixed_eval(self, epoch: int) -> dict[str, float]:
-        metrics = self._fixed_eval_with_deltas(self.evaluate_fixed_pool())
+    def _run_fixed_eval(self, epoch: int) -> dict[str, Any]:
+        evaluation = self.evaluate_fixed_pool()
+        metrics = self._fixed_eval_with_deltas(evaluation)
         is_best = (
             self.best_eval_reward is None
             or metrics["eval_reward"]
@@ -1166,6 +1620,11 @@ class DDPOTrainer:
                 "global_step": self.global_step,
                 **metrics,
             }
+        )
+        self._append_fixed_eval_per_prompt(
+            event="evaluation",
+            epoch=epoch,
+            evaluation=evaluation,
         )
         return metrics
 
@@ -1212,6 +1671,14 @@ class DDPOTrainer:
             "scaler": self.scaler.state_dict(),
             "rng": self._rng_state(),
             "fixed_eval_baseline": self.fixed_eval_baseline,
+            "fixed_eval_baseline_per_prompt": (
+                self.fixed_eval_baseline_per_prompt
+            ),
+            "fixed_eval_pool_id": (
+                self.fixed_eval_pool.pool_id
+                if self.fixed_eval_pool is not None
+                else None
+            ),
             "best_eval_reward": self.best_eval_reward,
             "best_eval_epoch": self.best_eval_epoch,
             "evals_without_improvement": self.evals_without_improvement,
@@ -1269,6 +1736,18 @@ class DDPOTrainer:
         self.start_epoch = int(checkpoint["epoch"]) + 1
         self.global_step = int(checkpoint.get("global_step", 0))
         self.fixed_eval_baseline = checkpoint.get("fixed_eval_baseline")
+        baseline_per_prompt = checkpoint.get("fixed_eval_baseline_per_prompt")
+        self.fixed_eval_baseline_per_prompt = (
+            {
+                name: values.detach().float().cpu()
+                for name, values in baseline_per_prompt.items()
+            }
+            if baseline_per_prompt is not None
+            else None
+        )
+        self.checkpoint_fixed_eval_pool_id = checkpoint.get(
+            "fixed_eval_pool_id"
+        )
         self.best_eval_reward = checkpoint.get("best_eval_reward")
         self.best_eval_epoch = checkpoint.get("best_eval_epoch")
         self.evals_without_improvement = int(
@@ -1307,9 +1786,9 @@ class DDPOTrainer:
                 trajectory = self.collect_rollouts(epoch)
                 rollout_metrics = self._rollout_metrics(trajectory)
                 optimization_metrics = self.optimize(trajectory)
-                fixed_eval_metrics: dict[str, float] = {}
+                fixed_eval_metrics: dict[str, Any] = {}
                 if (
-                    self.fixed_eval_batch is not None
+                    self.fixed_eval_pool is not None
                     and (epoch + 1) % self.config.fixed_eval_every == 0
                 ):
                     fixed_eval_metrics = self._run_fixed_eval(epoch)
