@@ -153,6 +153,12 @@ class SwanLabTrackerTest(unittest.TestCase):
                 "eval_reward_retrieval_delta_median": 0.01,
                 "eval_reward_retrieval_improvement_fraction": 0.625,
                 "eval_reward_retrieval_delta_bootstrap_se": 0.004,
+                "eval_normalized_retrieval_delta": 0.2,
+                "eval_normalized_m2m_delta": 0.1,
+                "eval_balanced_score": 0.15,
+                "eval_balanced_score_bootstrap_se": 0.02,
+                "eval_feasible": 1.0,
+                "eval_is_best_balanced": 1.0,
                 "eval_batch_size": 32,
                 "eval_samples_per_prompt": 4,
                 "eval_diffusion_steps": 50,
@@ -204,6 +210,12 @@ class SwanLabTrackerTest(unittest.TestCase):
             metrics["eval/reward_retrieval_delta_bootstrap_se"],
             0.004,
         )
+        self.assertEqual(metrics["eval/normalized_retrieval_delta"], 0.2)
+        self.assertEqual(metrics["eval/normalized_m2m_delta"], 0.1)
+        self.assertEqual(metrics["eval/balanced_score"], 0.15)
+        self.assertEqual(metrics["eval/balanced_score_bootstrap_se"], 0.02)
+        self.assertEqual(metrics["eval/feasible"], 1.0)
+        self.assertEqual(metrics["eval/is_best_balanced"], 1.0)
         self.assertEqual(metrics["eval/batch_size"], 32)
         self.assertEqual(metrics["eval/samples_per_prompt"], 4)
         self.assertEqual(metrics["eval/diffusion_steps"], 50)

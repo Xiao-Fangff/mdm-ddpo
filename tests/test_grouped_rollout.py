@@ -15,6 +15,7 @@ from mdm_ddpo.trainer import (
     Trajectory,
     apply_optimizer_hyperparameters,
     compute_component_shrink_advantages,
+    compute_balanced_validation_metrics,
     compute_grouped_advantages,
     log_prob_consistency_metrics,
     repeat_prompt_batch,
@@ -282,6 +283,11 @@ class GroupedRolloutTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "test split"):
             config.validate()
 
+    def test_fixed_checkpoint_selection_requires_calibration(self):
+        config = TrainConfig(fixed_eval_every=1)
+        with self.assertRaisesRegex(ValueError, "checkpoint selection requires"):
+            config.validate()
+
     def test_rollouts_reject_non_train_split(self):
         config = TrainConfig(split="val")
         with self.assertRaisesRegex(ValueError, "rollouts must use"):
@@ -345,6 +351,12 @@ class GroupedRolloutTest(unittest.TestCase):
             fixed_eval_seed=123,
         )
         trainer.fixed_eval_pool = self._fixed_pool(2)
+        trainer.reward_calibration = SimpleNamespace(
+            global_scale=lambda component: {
+                "retrieval": 1.0,
+                "m2m": 1.0,
+            }[component]
+        )
         trainer.fixed_eval_baseline = {
             "eval_reward": 1.0,
             "eval_reward_retrieval": 0.4,
@@ -355,8 +367,12 @@ class GroupedRolloutTest(unittest.TestCase):
             "retrieval": torch.tensor([0.3, 0.5]),
             "m2m": torch.tensor([0.6, 0.6]),
         }
-        trainer.best_eval_reward = 1.0
-        trainer.best_eval_epoch = -1
+        trainer.best_balanced_score = 0.0
+        trainer.best_balanced_epoch = -1
+        trainer.best_retrieval_delta = 0.0
+        trainer.best_retrieval_epoch = -1
+        trainer.best_m2m_delta = 0.0
+        trainer.best_m2m_epoch = -1
         trainer.evals_without_improvement = 0
         trainer.global_step = 0
         evaluations = iter(
@@ -383,14 +399,83 @@ class GroupedRolloutTest(unittest.TestCase):
             plateau = trainer._run_fixed_eval(epoch=9)
 
         self.assertEqual(improved["eval_is_best"], 1.0)
-        self.assertAlmostEqual(improved["eval_best_reward_delta"], 0.1)
+        self.assertEqual(improved["eval_feasible"], 1.0)
+        self.assertAlmostEqual(improved["eval_balanced_score"], 0.05)
         self.assertAlmostEqual(
             improved["eval_reward_retrieval_improvement_fraction"],
             1.0,
         )
         self.assertEqual(plateau["eval_is_best"], 0.0)
         self.assertEqual(plateau["eval_evals_without_improvement"], 1.0)
-        self.assertEqual(trainer.best_eval_epoch, 4)
+        self.assertEqual(trainer.best_balanced_epoch, 4)
+
+    def test_balanced_score_uses_fixed_calibration_scales(self):
+        metrics = compute_balanced_validation_metrics(
+            torch.tensor([0.3, 0.5]),
+            torch.tensor([0.1, 0.3]),
+            torch.tensor([0.4, 0.6]),
+            torch.tensor([0.3, 0.5]),
+            retrieval_scale=0.1,
+            m2m_scale=0.2,
+            bootstrap_samples=100,
+            seed=9,
+        )
+
+        self.assertAlmostEqual(
+            metrics["eval_normalized_retrieval_delta"],
+            2.0,
+        )
+        self.assertAlmostEqual(
+            metrics["eval_normalized_m2m_delta"],
+            0.5,
+            places=6,
+        )
+        self.assertAlmostEqual(metrics["eval_balanced_score"], 1.25, places=6)
+
+    def test_balanced_checkpoint_rejects_component_regression(self):
+        trainer = DDPOTrainer.__new__(DDPOTrainer)
+        trainer.config = TrainConfig(
+            fixed_eval_prompts=2,
+            fixed_eval_bootstrap_samples=100,
+            fixed_eval_seed=123,
+        )
+        trainer.fixed_eval_pool = self._fixed_pool(2)
+        trainer.reward_calibration = SimpleNamespace(
+            global_scale=lambda component: 1.0
+        )
+        trainer.fixed_eval_baseline = {
+            "eval_reward": 0.0,
+            "eval_reward_retrieval": 0.0,
+            "eval_reward_m2m": 0.0,
+        }
+        trainer.fixed_eval_baseline_per_prompt = {
+            "total": torch.zeros(2),
+            "retrieval": torch.zeros(2),
+            "m2m": torch.zeros(2),
+        }
+        trainer.best_balanced_score = 0.0
+        trainer.best_balanced_epoch = -1
+        trainer.best_retrieval_delta = 0.0
+        trainer.best_retrieval_epoch = -1
+        trainer.best_m2m_delta = 0.0
+        trainer.best_m2m_epoch = -1
+        trainer.evals_without_improvement = 0
+        trainer.global_step = 0
+        trainer.evaluate_fixed_pool = lambda: FixedEvalResult(
+            metrics={},
+            total_per_prompt=torch.ones(2),
+            retrieval_per_prompt=-torch.ones(2),
+            m2m_per_prompt=2 * torch.ones(2),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            trainer.output_dir = Path(directory)
+            metrics = trainer._run_fixed_eval(epoch=0)
+
+        self.assertGreater(metrics["eval_balanced_score"], 0.0)
+        self.assertEqual(metrics["eval_feasible"], 0.0)
+        self.assertEqual(metrics["eval_is_best_balanced"], 0.0)
+        self.assertEqual(metrics["eval_is_best_m2m"], 1.0)
 
     def test_fixed_eval_signature_captures_chunking_and_sampler_settings(self):
         trainer = DDPOTrainer.__new__(DDPOTrainer)
@@ -427,6 +512,9 @@ class GroupedRolloutTest(unittest.TestCase):
         )
         trainer.diffusion = SimpleNamespace(num_timesteps=4)
         trainer.fixed_eval_pool = self._fixed_pool(1)
+        trainer.reward_calibration = SimpleNamespace(
+            global_scale=lambda component: 1.0
+        )
         trainer.fixed_eval_baseline = {
             "eval_reward": 1.0,
             "eval_reward_retrieval": 0.4,
@@ -440,8 +528,12 @@ class GroupedRolloutTest(unittest.TestCase):
             "retrieval": torch.tensor([0.4]),
             "m2m": torch.tensor([0.6]),
         }
-        trainer.best_eval_reward = 1.1
-        trainer.best_eval_epoch = 0
+        trainer.best_balanced_score = 0.1
+        trainer.best_balanced_epoch = 0
+        trainer.best_retrieval_delta = 0.1
+        trainer.best_retrieval_epoch = 0
+        trainer.best_m2m_delta = 0.1
+        trainer.best_m2m_epoch = 0
         trainer.evals_without_improvement = 5
         trainer.start_epoch = 1
         trainer.global_step = 2
@@ -456,7 +548,9 @@ class GroupedRolloutTest(unittest.TestCase):
         )
         trainer.evaluate_fixed_pool = lambda: current_evaluation
         saved_best_epochs = []
-        trainer._save_best_snapshot = saved_best_epochs.append
+        trainer._save_named_snapshot = (
+            lambda name, epoch: saved_best_epochs.append((name, epoch))
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             trainer.output_dir = Path(directory)
@@ -468,10 +562,17 @@ class GroupedRolloutTest(unittest.TestCase):
             trainer.fixed_eval_baseline_per_prompt["retrieval"],
             torch.tensor([0.43]),
         )
-        self.assertAlmostEqual(trainer.best_eval_reward, 1.05)
-        self.assertEqual(trainer.best_eval_epoch, 0)
+        self.assertAlmostEqual(trainer.best_balanced_score, 0.0)
+        self.assertEqual(trainer.best_balanced_epoch, 0)
         self.assertEqual(trainer.evals_without_improvement, 0)
-        self.assertEqual(saved_best_epochs, [0])
+        self.assertEqual(
+            saved_best_epochs,
+            [
+                ("best_balanced.pt", 0),
+                ("best_retrieval.pt", 0),
+                ("best_m2m.pt", 0),
+            ],
+        )
 
 
 if __name__ == "__main__":

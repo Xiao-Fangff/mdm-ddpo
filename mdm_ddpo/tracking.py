@@ -159,6 +159,19 @@ TRAINING_METRIC_NAMES = {
     "eval_reward_m2m_delta_bootstrap_se": (
         "eval/reward_m2m_delta_bootstrap_se"
     ),
+    "eval_normalized_retrieval_delta": (
+        "eval/normalized_retrieval_delta"
+    ),
+    "eval_normalized_m2m_delta": "eval/normalized_m2m_delta",
+    "eval_balanced_score": "eval/balanced_score",
+    "eval_balanced_score_median": "eval/balanced_score_median",
+    "eval_balanced_score_bootstrap_se": (
+        "eval/balanced_score_bootstrap_se"
+    ),
+    "eval_feasible": "eval/feasible",
+    "eval_retrieval_tolerance": "eval/retrieval_tolerance",
+    "eval_m2m_tolerance": "eval/m2m_tolerance",
+    "eval_effective_min_delta": "eval/effective_min_delta",
     "eval_reward_baseline": "eval/reward_total_baseline",
     "eval_reward_retrieval_baseline": "eval/reward_retrieval_baseline",
     "eval_reward_m2m_baseline": "eval/reward_m2m_baseline",
@@ -169,6 +182,15 @@ TRAINING_METRIC_NAMES = {
     "eval_batch_size": "eval/batch_size",
     "eval_diffusion_steps": "eval/diffusion_steps",
     "eval_is_best": "eval/is_best",
+    "eval_is_best_balanced": "eval/is_best_balanced",
+    "eval_is_best_retrieval": "eval/is_best_retrieval",
+    "eval_is_best_m2m": "eval/is_best_m2m",
+    "eval_best_balanced_score": "eval/best_balanced_score",
+    "eval_best_balanced_epoch": "eval/best_balanced_epoch",
+    "eval_best_retrieval_delta": "eval/best_retrieval_delta",
+    "eval_best_retrieval_epoch": "eval/best_retrieval_epoch",
+    "eval_best_m2m_delta": "eval/best_m2m_delta",
+    "eval_best_m2m_epoch": "eval/best_m2m_epoch",
     "eval_best_reward": "eval/best_reward_total",
     "eval_best_reward_delta": "eval/best_reward_total_delta",
     "eval_best_epoch": "eval/best_epoch",

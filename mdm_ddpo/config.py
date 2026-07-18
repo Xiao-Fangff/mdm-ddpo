@@ -93,6 +93,9 @@ class TrainConfig:
     fixed_eval_pool_path: str = ""
     early_stop_patience: int = 8
     early_stop_min_delta: float = 0.0
+    early_stop_min_delta_mode: str = "auto"
+    early_stop_se_multiplier: float = 1.0
+    checkpoint_feasible_se_multiplier: float = 1.0
 
     save_every: int = 1
     log_every: int = 1
@@ -170,6 +173,21 @@ class TrainConfig:
             raise ValueError("--early-stop-patience cannot be negative.")
         if self.early_stop_min_delta < 0:
             raise ValueError("--early-stop-min-delta cannot be negative.")
+        if self.early_stop_min_delta_mode not in {"fixed", "auto"}:
+            raise ValueError(
+                "--early-stop-min-delta-mode must be 'fixed' or 'auto'."
+            )
+        if self.early_stop_se_multiplier < 0:
+            raise ValueError("--early-stop-se-multiplier cannot be negative.")
+        if self.checkpoint_feasible_se_multiplier < 0:
+            raise ValueError(
+                "--checkpoint-feasible-se-multiplier cannot be negative."
+            )
+        if self.fixed_eval_every > 0 and not self.reward_calibration_path:
+            raise ValueError(
+                "Fixed validation checkpoint selection requires "
+                "--reward-calibration-path."
+            )
         if self.advantage_mode not in {
             "group_centered",
             "group_whiten",
@@ -531,6 +549,29 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Minimum fixed-eval reward increase required to reset patience.",
+    )
+    reward.add_argument(
+        "--early-stop-min-delta-mode",
+        choices=["fixed", "auto"],
+        default="auto",
+        help=(
+            "In auto mode, the effective minimum is at least the balanced "
+            "validation bootstrap standard error."
+        ),
+    )
+    reward.add_argument(
+        "--early-stop-se-multiplier",
+        type=float,
+        default=1.0,
+    )
+    reward.add_argument(
+        "--checkpoint-feasible-se-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "Allow each component delta down to minus this many paired "
+            "bootstrap standard errors when checking balanced feasibility."
+        ),
     )
 
     output = parser.add_argument_group("output")

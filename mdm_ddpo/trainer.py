@@ -350,6 +350,51 @@ def summarize_fixed_eval_component(
     }
 
 
+def compute_balanced_validation_metrics(
+    retrieval_current: torch.Tensor,
+    retrieval_baseline: torch.Tensor,
+    m2m_current: torch.Tensor,
+    m2m_baseline: torch.Tensor,
+    *,
+    retrieval_scale: float,
+    m2m_scale: float,
+    bootstrap_samples: int,
+    seed: int,
+) -> dict[str, float]:
+    """Compute paired, calibration-normalized balanced validation deltas."""
+    tensors = [
+        value.detach().float().cpu().reshape(-1)
+        for value in (
+            retrieval_current,
+            retrieval_baseline,
+            m2m_current,
+            m2m_baseline,
+        )
+    ]
+    if any(value.shape != tensors[0].shape for value in tensors[1:]):
+        raise ValueError("Balanced validation component tensors must match.")
+    if tensors[0].numel() == 0:
+        raise ValueError("Balanced validation cannot use empty tensors.")
+    if retrieval_scale <= 0 or m2m_scale <= 0:
+        raise ValueError("Balanced validation scales must be positive.")
+    retrieval_delta = tensors[0] - tensors[1]
+    m2m_delta = tensors[2] - tensors[3]
+    normalized_retrieval = retrieval_delta / retrieval_scale
+    normalized_m2m = m2m_delta / m2m_scale
+    balanced = 0.5 * normalized_retrieval + 0.5 * normalized_m2m
+    return {
+        "eval_normalized_retrieval_delta": normalized_retrieval.mean().item(),
+        "eval_normalized_m2m_delta": normalized_m2m.mean().item(),
+        "eval_balanced_score": balanced.mean().item(),
+        "eval_balanced_score_median": torch.quantile(balanced, 0.5).item(),
+        "eval_balanced_score_bootstrap_se": bootstrap_standard_error(
+            balanced,
+            samples=bootstrap_samples,
+            seed=seed,
+        ),
+    }
+
+
 def repeat_prompt_batch(
     motion: torch.Tensor,
     lengths: torch.Tensor,
@@ -698,8 +743,12 @@ class DDPOTrainer:
         self.fixed_eval_baseline: dict[str, Any] | None = None
         self.fixed_eval_baseline_per_prompt: dict[str, torch.Tensor] | None = None
         self.checkpoint_fixed_eval_pool_id: str | None = None
-        self.best_eval_reward: float | None = None
-        self.best_eval_epoch: int | None = None
+        self.best_balanced_score: float | None = None
+        self.best_balanced_epoch: int | None = None
+        self.best_retrieval_delta: float | None = None
+        self.best_retrieval_epoch: int | None = None
+        self.best_m2m_delta: float | None = None
+        self.best_m2m_epoch: int | None = None
         self.evals_without_improvement = 0
         if config.resume:
             self._load_checkpoint(config.resume)
@@ -718,6 +767,18 @@ class DDPOTrainer:
                 "Resume checkpoint fixed-eval pool does not match "
                 "fixed_eval_pool.pt."
             )
+        if config.resume:
+            resume_dir = Path(config.resume).expanduser().resolve().parent
+            for name in (
+                "best_balanced.pt",
+                "best_retrieval.pt",
+                "best_m2m.pt",
+            ):
+                source = resume_dir / name
+                target = self.output_dir / name
+                if source.exists() and source != target and not target.exists():
+                    shutil.copy2(source, target)
+                    LOGGER.info("Copied resumed best checkpoint: %s", target)
 
         total, trainable = parameter_counts(self.model)
         LOGGER.info(
@@ -1719,6 +1780,24 @@ class DDPOTrainer:
                     seed=self.config.fixed_eval_seed + 100 * offset,
                 )
             )
+        if self.reward_calibration is None:
+            raise RuntimeError(
+                "Balanced fixed validation requires reward calibration."
+            )
+        result.update(
+            compute_balanced_validation_metrics(
+                evaluation.retrieval_per_prompt,
+                self.fixed_eval_baseline_per_prompt["retrieval"],
+                evaluation.m2m_per_prompt,
+                self.fixed_eval_baseline_per_prompt["m2m"],
+                retrieval_scale=self.reward_calibration.global_scale(
+                    "retrieval"
+                ),
+                m2m_scale=self.reward_calibration.global_scale("m2m"),
+                bootstrap_samples=self.config.fixed_eval_bootstrap_samples,
+                seed=self.config.fixed_eval_seed + 10_000,
+            )
+        )
         return result
 
     def _initialize_fixed_eval(self) -> dict[str, Any] | None:
@@ -1746,8 +1825,12 @@ class DDPOTrainer:
             )
             self.fixed_eval_baseline = None
             self.fixed_eval_baseline_per_prompt = None
-            self.best_eval_reward = None
-            self.best_eval_epoch = None
+            self.best_balanced_score = None
+            self.best_balanced_epoch = None
+            self.best_retrieval_delta = None
+            self.best_retrieval_epoch = None
+            self.best_m2m_delta = None
+            self.best_m2m_epoch = None
             self.evals_without_improvement = 0
         if self.fixed_eval_baseline is None:
             if self.config.resume:
@@ -1777,12 +1860,22 @@ class DDPOTrainer:
                 ),
                 m2m_per_prompt=self.fixed_eval_baseline_per_prompt["m2m"],
             )
-        initialized_best = self.best_eval_reward is None
-        if self.best_eval_reward is None:
-            self.best_eval_reward = self.fixed_eval_baseline["eval_reward"]
-            self.best_eval_epoch = self.start_epoch - 1
+        initialized_best = self.best_balanced_score is None
+        baseline_epoch = self.start_epoch - 1
+        if self.best_balanced_score is None:
+            self.best_balanced_score = 0.0
+            self.best_balanced_epoch = baseline_epoch
+            self.best_retrieval_delta = 0.0
+            self.best_retrieval_epoch = baseline_epoch
+            self.best_m2m_delta = 0.0
+            self.best_m2m_epoch = baseline_epoch
         if initialized_best:
-            self._save_best_snapshot(self.start_epoch - 1)
+            for name in (
+                "best_balanced.pt",
+                "best_retrieval.pt",
+                "best_m2m.pt",
+            ):
+                self._save_named_snapshot(name, baseline_epoch)
         record: dict[str, Any] = {
             "event": "baseline",
             "epoch": self.start_epoch - 1,
@@ -1801,28 +1894,85 @@ class DDPOTrainer:
     def _run_fixed_eval(self, epoch: int) -> dict[str, Any]:
         evaluation = self.evaluate_fixed_pool()
         metrics = self._fixed_eval_with_deltas(evaluation)
-        is_best = (
-            self.best_eval_reward is None
-            or metrics["eval_reward"]
-            > self.best_eval_reward + self.config.early_stop_min_delta
+        retrieval_tolerance = -(
+            self.config.checkpoint_feasible_se_multiplier
+            * metrics["eval_reward_retrieval_delta_bootstrap_se"]
         )
-        if is_best:
-            self.best_eval_reward = metrics["eval_reward"]
-            self.best_eval_epoch = epoch
+        m2m_tolerance = -(
+            self.config.checkpoint_feasible_se_multiplier
+            * metrics["eval_reward_m2m_delta_bootstrap_se"]
+        )
+        feasible = bool(
+            metrics["eval_reward_retrieval_delta"] >= retrieval_tolerance
+            and metrics["eval_reward_m2m_delta"] >= m2m_tolerance
+        )
+        automatic_min_delta = (
+            self.config.early_stop_se_multiplier
+            * metrics["eval_balanced_score_bootstrap_se"]
+            if self.config.early_stop_min_delta_mode == "auto"
+            else 0.0
+        )
+        effective_min_delta = max(
+            self.config.early_stop_min_delta,
+            automatic_min_delta,
+        )
+        is_best_balanced = bool(
+            feasible
+            and (
+                self.best_balanced_score is None
+                or metrics["eval_balanced_score"]
+                > self.best_balanced_score + effective_min_delta
+            )
+        )
+        is_best_retrieval = bool(
+            self.best_retrieval_delta is None
+            or metrics["eval_reward_retrieval_delta"]
+            > self.best_retrieval_delta
+        )
+        is_best_m2m = bool(
+            self.best_m2m_delta is None
+            or metrics["eval_reward_m2m_delta"] > self.best_m2m_delta
+        )
+        if is_best_balanced:
+            self.best_balanced_score = metrics["eval_balanced_score"]
+            self.best_balanced_epoch = epoch
             self.evals_without_improvement = 0
         else:
             self.evals_without_improvement += 1
-        assert self.best_eval_reward is not None
-        assert self.best_eval_epoch is not None
+        if is_best_retrieval:
+            self.best_retrieval_delta = metrics[
+                "eval_reward_retrieval_delta"
+            ]
+            self.best_retrieval_epoch = epoch
+        if is_best_m2m:
+            self.best_m2m_delta = metrics["eval_reward_m2m_delta"]
+            self.best_m2m_epoch = epoch
+        assert self.best_balanced_score is not None
+        assert self.best_balanced_epoch is not None
+        assert self.best_retrieval_delta is not None
+        assert self.best_retrieval_epoch is not None
+        assert self.best_m2m_delta is not None
+        assert self.best_m2m_epoch is not None
         metrics.update(
             {
-                "eval_is_best": float(is_best),
-                "eval_best_reward": self.best_eval_reward,
-                "eval_best_reward_delta": (
-                    self.best_eval_reward
-                    - self.fixed_eval_baseline["eval_reward"]
+                "eval_feasible": float(feasible),
+                "eval_retrieval_tolerance": retrieval_tolerance,
+                "eval_m2m_tolerance": m2m_tolerance,
+                "eval_effective_min_delta": effective_min_delta,
+                "eval_is_best": float(is_best_balanced),
+                "eval_is_best_balanced": float(is_best_balanced),
+                "eval_is_best_retrieval": float(is_best_retrieval),
+                "eval_is_best_m2m": float(is_best_m2m),
+                "eval_best_balanced_score": self.best_balanced_score,
+                "eval_best_balanced_epoch": float(
+                    self.best_balanced_epoch
                 ),
-                "eval_best_epoch": float(self.best_eval_epoch),
+                "eval_best_retrieval_delta": self.best_retrieval_delta,
+                "eval_best_retrieval_epoch": float(
+                    self.best_retrieval_epoch
+                ),
+                "eval_best_m2m_delta": self.best_m2m_delta,
+                "eval_best_m2m_epoch": float(self.best_m2m_epoch),
                 "eval_evals_without_improvement": float(
                     self.evals_without_improvement
                 ),
@@ -1899,31 +2049,50 @@ class DDPOTrainer:
                 if self.reward_calibration is not None
                 else None
             ),
-            "best_eval_reward": self.best_eval_reward,
-            "best_eval_epoch": self.best_eval_epoch,
+            "best_balanced_score": self.best_balanced_score,
+            "best_balanced_epoch": self.best_balanced_epoch,
+            "best_retrieval_delta": self.best_retrieval_delta,
+            "best_retrieval_epoch": self.best_retrieval_epoch,
+            "best_m2m_delta": self.best_m2m_delta,
+            "best_m2m_epoch": self.best_m2m_epoch,
             "evals_without_improvement": self.evals_without_improvement,
         }
 
-    def _save_best_snapshot(self, epoch: int) -> Path:
-        best_path = self.output_dir / "best.pt"
-        temporary_path = self.output_dir / "best.tmp"
+    def _save_named_snapshot(self, name: str, epoch: int) -> Path:
+        if name not in {
+            "best_balanced.pt",
+            "best_retrieval.pt",
+            "best_m2m.pt",
+            "latest.pt",
+        }:
+            raise ValueError(f"Unsupported named checkpoint: {name!r}.")
+        path = self.output_dir / name
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
         torch.save(self._checkpoint_payload(epoch), temporary_path)
-        os.replace(temporary_path, best_path)
-        LOGGER.info("Saved best fixed-eval checkpoint: %s", best_path)
-        return best_path
+        os.replace(temporary_path, path)
+        LOGGER.info("Saved named checkpoint: %s", path)
+        return path
 
-    def _save_checkpoint(self, epoch: int, *, mark_best: bool = False) -> Path:
+    def _save_checkpoint(
+        self,
+        epoch: int,
+        *,
+        best_names: tuple[str, ...] = (),
+    ) -> Path:
         checkpoint_path = self.output_dir / f"checkpoint_{epoch:06d}.pt"
         temporary_path = checkpoint_path.with_suffix(".tmp")
         torch.save(self._checkpoint_payload(epoch), temporary_path)
         os.replace(temporary_path, checkpoint_path)
         shutil.copy2(checkpoint_path, self.output_dir / "latest.pt")
-        if mark_best:
-            shutil.copy2(checkpoint_path, self.output_dir / "best.pt")
-            LOGGER.info(
-                "Saved best fixed-eval checkpoint: %s",
-                self.output_dir / "best.pt",
-            )
+        for name in best_names:
+            if name not in {
+                "best_balanced.pt",
+                "best_retrieval.pt",
+                "best_m2m.pt",
+            }:
+                raise ValueError(f"Unsupported best checkpoint: {name!r}.")
+            shutil.copy2(checkpoint_path, self.output_dir / name)
+            LOGGER.info("Saved best checkpoint: %s", self.output_dir / name)
         LOGGER.info("Saved checkpoint: %s", checkpoint_path)
         return checkpoint_path
 
@@ -1982,8 +2151,22 @@ class DDPOTrainer:
         self.checkpoint_fixed_eval_pool_id = checkpoint.get(
             "fixed_eval_pool_id"
         )
-        self.best_eval_reward = checkpoint.get("best_eval_reward")
-        self.best_eval_epoch = checkpoint.get("best_eval_epoch")
+        self.best_balanced_score = checkpoint.get("best_balanced_score")
+        self.best_balanced_epoch = checkpoint.get("best_balanced_epoch")
+        self.best_retrieval_delta = checkpoint.get("best_retrieval_delta")
+        self.best_retrieval_epoch = checkpoint.get("best_retrieval_epoch")
+        self.best_m2m_delta = checkpoint.get("best_m2m_delta")
+        self.best_m2m_epoch = checkpoint.get("best_m2m_epoch")
+        if (
+            "best_balanced_score" not in checkpoint
+            and self.fixed_eval_baseline is not None
+        ):
+            LOGGER.warning(
+                "Legacy checkpoint has no balanced-selection state; using "
+                "the resumed policy as a new fixed-validation baseline."
+            )
+            self.fixed_eval_baseline = None
+            self.fixed_eval_baseline_per_prompt = None
         self.evals_without_improvement = int(
             checkpoint.get("evals_without_improvement", 0)
         )
@@ -2026,7 +2209,15 @@ class DDPOTrainer:
                     and (epoch + 1) % self.config.fixed_eval_every == 0
                 ):
                     fixed_eval_metrics = self._run_fixed_eval(epoch)
-                is_best_eval = bool(fixed_eval_metrics.get("eval_is_best", 0.0))
+                best_names = tuple(
+                    name
+                    for metric_name, name in (
+                        ("eval_is_best_balanced", "best_balanced.pt"),
+                        ("eval_is_best_retrieval", "best_retrieval.pt"),
+                        ("eval_is_best_m2m", "best_m2m.pt"),
+                    )
+                    if bool(fixed_eval_metrics.get(metric_name, 0.0))
+                )
                 should_early_stop = bool(
                     fixed_eval_metrics
                     and self.config.early_stop_patience > 0
@@ -2056,21 +2247,23 @@ class DDPOTrainer:
                     )
                 if (
                     (epoch + 1) % self.config.save_every == 0
-                    or is_best_eval
+                    or best_names
                     or should_early_stop
                 ):
-                    self._save_checkpoint(epoch, mark_best=is_best_eval)
+                    self._save_checkpoint(epoch, best_names=best_names)
                     last_saved_epoch = epoch
+                else:
+                    self._save_named_snapshot("latest.pt", epoch)
                 completed_epoch = epoch
                 if should_early_stop:
                     LOGGER.info(
                         "Early stopping at epoch=%d after %d fixed "
-                        "evaluations without improvement; best epoch=%d, "
-                        "best reward=%.6f.",
+                        "evaluations without balanced improvement; best "
+                        "epoch=%d, best balanced score=%.6f.",
                         epoch,
                         self.evals_without_improvement,
-                        self.best_eval_epoch,
-                        self.best_eval_reward,
+                        self.best_balanced_epoch,
+                        self.best_balanced_score,
                     )
                     break
 
