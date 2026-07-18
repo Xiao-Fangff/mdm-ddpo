@@ -60,6 +60,11 @@ MotionRFT 的 `StepCountNet`。
 - `--no-step-use-m2m-reward` 只屏蔽 step-labelled samples 的 M2M raw reward 与
   component advantage；HumanML M2M 不变，step M2M 指标仍保留用于比较。默认
   `--step-use-m2m-reward`。
+- 支持按数据类型设置 component advantage：全局 retrieval/M2M 权重用于 HumanML，
+  `step_advantage_retrieval/m2m/step_weight` 只覆盖 step groups；K8 count 隔离实验
+  使用 HumanML `0.5/0.5` 与 step `0.2/0.0/0.8`。
+- step sampler 默认按 target 轮转均衡；K8、50% step、4 rollouts/epoch 时，每个
+  rollout 有 4 个 step groups，每 epoch 16 个，target 1–6 各 2–3 groups。
 - mixed K 已解耦：HumanML `K=4`，step `K=16`。`step_data_ratio` 现在按 motion
   sample 计，而非 prompt 计；默认 physical batch 64 严格组装为 12 HumanML prompts
   × 4 = 48 与 1 step prompt × 16 = 16（仍为 3:1）。
@@ -78,9 +83,13 @@ MotionRFT 的 `StepCountNet`。
 
 ## Step reward 已完成验证
 
-- 单元测试总数已增加到 88，当前全部通过。
+- 95 个单元测试全部通过。
+- GT/reference audit（1,842 motions）显示：manifest pseudo label 可 100% 复现，
+  但相对原 caption 请求步数 exact 仅 14.0%、MAE 2.61，且没有原始 target-1
+  caption。step 结果必须视为 detector pseudo-count，而非已验证的真实数字控制。
 - `compileall`、`bash -n scripts/*.sh`、`git diff --check` 通过。
-- 真实 RFT_MLD 263-D GT detector 对齐：3/3 exact。
+- 早期 3-sample 检查仅证明 263-D 恢复路径能复现 manifest pseudo label；不能作为
+  原 caption 请求步数的准确性证据。
 - 6 prompts × 2 motions × 4 diffusion steps 的 calibration GPU smoke 成功；输出
   `full_calibration=false`，仅验证流程。
 - 1 HumanML prompt + 1 step prompt、每 prompt 2 motions、4 diffusion steps 的
@@ -158,7 +167,8 @@ A0–A4、follow-up 和 anchor × seed 实验。
 - 最佳配置的 anchor ratio `{0,0.1,0.2}` × seed `{42,43,44}`。
 - 三 seed 平均 retrieval、M2M、balanced score 验收。
 - 标准 HumanML baseline/candidate replication 对比。
-- 正式 384×4 step reward calibration（50 diffusion steps）。
+- K8 negative-L1 step calibration（384 prompts × 8，50 diffusion steps）。
+- K8/50% step/分类型 `0.5,0.5` vs `0.2,0,0.8` 的 30-epoch count 隔离实验。
 - step advantage weight 最小消融 S0/S1/S2 与三个 seed 复现。
 - step exact/MAE 改善后的可视化人工审计和按 target/length 分层统计。
 

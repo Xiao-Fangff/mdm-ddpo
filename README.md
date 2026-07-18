@@ -143,6 +143,12 @@ A_step = centered_step / sqrt(group_std_step^2 + floor_step^2)
 A      = w_ret*A_ret + w_m2m*A_m2m + step_mask*w_step*A_step
 ```
 
+Mixed training can override these weights only for step-labelled groups. For
+example, HumanML `0.5/0.5` and step `0.2/0.0/0.8` are expressed with
+`--step-advantage-retrieval-weight`, `--step-advantage-m2m-weight`, and
+`--step-advantage-step-weight`. Unspecified step-specific weights inherit the
+global HumanML values for backward compatibility.
+
 floor 只能来自固定 `reward_calibration.json` 的 p25 或 p50，不会在 minibatch
 中动态估计。训练日志包含两个 component advantage 的 correlation、sign conflict
 fraction、各自 mean-absolute contribution 和 effective maximum scale。
@@ -360,8 +366,8 @@ bash scripts/train_humanml.sh \
   --rollout-batch-size 32 \
   --rollout-batches-per-epoch 4 \
   --samples-per-prompt 4 \
-  --train-batch-size 32 \
-  --gradient-accumulation-steps 2 \
+  --train-batch-size 64 \
+  --gradient-accumulation-steps 1 \
   --inner-epochs 1 \
   --timestep-fraction 0.5 \
   --learning-rate 1e-4 \
@@ -446,6 +452,55 @@ bash scripts/run_step_reward_ablations.sh
 
 输出 `step_ablation_comparison.csv/.md`，同时包含 balanced retrieval/M2M 与
 best-step reward/MAE/exact delta，避免只看 detector reward 而忽略原任务退化。
+
+### 3c. K8 count-learnability diagnostic
+
+先生成与训练 K 和 reward mode 严格匹配的 calibration：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 \
+python tools/calibrate_step_reward_stats.py \
+  --output step_reward_k8_negative_l1_calibration.json \
+  --pool-path artifacts/step_reward_k8_negative_l1_calibration_pool.pt \
+  --samples-output artifacts/step_reward_k8_negative_l1_calibration_samples.pt \
+  --prompts 384 \
+  --samples-per-prompt 8 \
+  --batch-size 64 \
+  --sample-steps 50 \
+  --step-reward-mode negative_l1 \
+  --device cuda:0 \
+  --precision bf16
+```
+
+然后运行固定 30 epochs 的隔离诊断：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 \
+DEVICE=cuda:0 \
+REWARD_DEVICE=same \
+OUTPUT_DIR=$PWD/outputs/step_k8_negative_l1_diagnostic \
+MDM_DDPO_REWARD_CALIBRATION_PATH=$PWD/reward_calibration.json \
+MDM_DDPO_STEP_REWARD_CALIBRATION_PATH=$PWD/step_reward_k8_negative_l1_calibration.json \
+MDM_DDPO_FIXED_EVAL_POOL_PATH=$PWD/artifacts/humanml_val_fixed_eval_pool.pt \
+MDM_DDPO_FIXED_STEP_EVAL_POOL_PATH=$PWD/artifacts/step_val_fixed_eval_pool_k8.pt \
+MDM_DDPO_USE_SWANLAB=1 \
+MDM_DDPO_SWANLAB_PROJECT=mdm-ddpo-step \
+bash scripts/train_step_k8_diagnostic.sh
+```
+
+该脚本使用 50% step motions、K8、每 epoch 16 个均衡 pseudo-target prompt groups、
+HumanML `0.5 retrieval + 0.5 M2M` 与 step
+`0.2 retrieval + 0.0 M2M + 0.8 negative-L1 step`。优先检查 `best_step.pt`，并要求
+MAE/exact/within-one 三项改善持续多个 fixed validation points。
+
+训练前可运行原始 caption target 与 detector 的 reference-motion confusion：
+
+```bash
+python tools/validate_step_detector_gt.py \
+  --output artifacts/step_gt_detector_validation.json \
+  --step-targets 1,2,3,4,5,6 \
+  --step-detector-backend progressive
+```
 
 ## 4. 固定消融 A0–A4
 
@@ -546,6 +601,7 @@ bash scripts/run_anchor_seed_sweep.sh outputs/followup_sweeps/BEST_RUN
 | `--step-data-ratio` | 每个 rollout 中 step **motion sample** 的比例；默认 0.25 |
 | `--samples-per-prompt` | HumanML 每条文本的 rollout K；默认 4 |
 | `--step-samples-per-prompt` | step 每条文本的 rollout K；默认 16 |
+| `--step-balanced-sampling` | 在短 rollout 窗口内轮转并均衡 target 类别；默认启用 |
 | `--step-targets` | hard label 类别，默认 `1,2,3,4,5,6` |
 | `--step-data-manifest` | RFT_MLD/Motion-Rule step pseudo-label manifest |
 | `--step-detector-backend` | `progressive`（默认）或本地 `rgdno` |
@@ -553,6 +609,9 @@ bash scripts/run_anchor_seed_sweep.sh outputs/followup_sweeps/BEST_RUN
 | `--step-reward-weight` | step component 在 raw total reward 中的权重 |
 | `--step-use-m2m-reward` / `--no-step-use-m2m-reward` | 是否让 M2M 参与 step 样本更新；不影响 HumanML，默认启用 |
 | `--advantage-step-weight` | step component-shrink advantage 权重；默认 0.25 |
+| `--step-advantage-retrieval-weight` | step groups 专用 retrieval advantage 权重；默认继承全局值 |
+| `--step-advantage-m2m-weight` | step groups 专用 M2M advantage 权重；默认继承全局值 |
+| `--step-advantage-step-weight` | step groups 专用 hard-step advantage 权重；默认继承 `--advantage-step-weight` |
 | `--fixed-step-eval-pool-path` | 跨 run 共享的 held-out step fixed pool |
 | `--split` | rollout split；只能为 `train` |
 | `--eval-split` | fixed validation split；checkpoint selection 只能使用 `val` |

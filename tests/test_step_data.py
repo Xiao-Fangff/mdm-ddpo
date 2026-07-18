@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from mdm_ddpo.step_data import (
+    BalancedStepTargetSampler,
     StepMotionDataset,
     create_fixed_step_eval_pool,
     load_fixed_step_eval_pool,
@@ -55,6 +56,30 @@ class StepDataTest(unittest.TestCase):
             render_step_prompt(3, 7, 42),
         )
         self.assertIn("step", render_step_prompt(1, 0, 42))
+
+    def test_balanced_sampler_covers_targets_uniformly_in_short_windows(self):
+        targets = [target for target in range(1, 7) for _ in range(10)]
+        sampler_a = BalancedStepTargetSampler(
+            targets,
+            generator=torch.Generator().manual_seed(17),
+        )
+        sampler_b = BalancedStepTargetSampler(
+            targets,
+            generator=torch.Generator().manual_seed(17),
+        )
+
+        indices_a = list(sampler_a)
+        indices_b = list(sampler_b)
+        first_window_counts = {
+            target: sum(targets[index] == target for index in indices_a[:16])
+            for target in range(1, 7)
+        }
+
+        self.assertEqual(indices_a, indices_b)
+        self.assertLessEqual(
+            max(first_window_counts.values()) - min(first_window_counts.values()),
+            1,
+        )
 
     def test_manifest_split_is_stratified_disjoint_and_reproducible(self):
         with tempfile.TemporaryDirectory() as directory:

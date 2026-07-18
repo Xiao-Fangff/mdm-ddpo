@@ -82,6 +82,33 @@ class StepTrainerTest(unittest.TestCase):
             0.0,
         )
 
+    def test_component_shrink_supports_data_type_specific_weights(self):
+        advantages, stats = compute_component_shrink_advantages(
+            retrieval_rewards=torch.tensor([0.0, 2.0, 0.0, 2.0]),
+            m2m_rewards=torch.tensor([2.0, 0.0, 0.0, 2.0]),
+            prompt_ids=torch.tensor([0, 0, 1, 1]),
+            epsilon=1.0e-8,
+            retrieval_std_floor=1.0,
+            m2m_std_floor=1.0,
+            retrieval_weight=0.5,
+            m2m_weight=0.5,
+            step_retrieval_weight=0.2,
+            step_m2m_weight=0.0,
+            step_rewards=torch.tensor([0.0, 2.0, 0.0, 0.0]),
+            step_mask=torch.tensor([True, True, False, False]),
+            step_std_floor=1.0,
+            step_weight=0.8,
+        )
+
+        self.assertLess(advantages[0].item(), 0.0)
+        self.assertGreater(advantages[1].item(), 0.0)
+        self.assertEqual(stats["component_advantage_step_retrieval_weight"], 0.2)
+        self.assertEqual(stats["component_advantage_step_m2m_weight"], 0.0)
+        self.assertEqual(
+            stats["component_advantage_step_m2m_contribution_mean_abs"],
+            0.0,
+        )
+
     def test_next_batch_mixes_humanml_and_step_targets(self):
         trainer = DDPOTrainer.__new__(DDPOTrainer)
         trainer.config = TrainConfig(
@@ -202,6 +229,30 @@ class StepTrainerTest(unittest.TestCase):
         self.assertEqual(config.step_rollout_samples, 16)
         self.assertEqual(config.humanml_rollout_samples, 48)
         self.assertEqual(config.step_fixed_eval_prompts_per_batch, 4)
+
+    def test_k8_half_step_mix_has_four_step_prompts_per_rollout(self):
+        config = TrainConfig(
+            enable_step_reward=True,
+            rollout_batch_size=64,
+            samples_per_prompt=4,
+            step_samples_per_prompt=8,
+            step_data_ratio=0.5,
+        )
+
+        self.assertEqual(config.humanml_prompts_per_rollout_batch, 8)
+        self.assertEqual(config.step_prompts_per_rollout_batch, 4)
+        self.assertEqual(config.humanml_rollout_samples, 32)
+        self.assertEqual(config.step_rollout_samples, 32)
+
+    def test_step_specific_advantage_weights_default_to_global_values(self):
+        config = TrainConfig(
+            advantage_retrieval_weight=0.5,
+            advantage_m2m_weight=0.5,
+            advantage_step_weight=0.25,
+        )
+        self.assertEqual(config.effective_step_advantage_retrieval_weight, 0.5)
+        self.assertEqual(config.effective_step_advantage_m2m_weight, 0.5)
+        self.assertEqual(config.effective_step_advantage_step_weight, 0.25)
 
     def test_step_reward_rejects_total_group_shrink_calibration(self):
         config = TrainConfig(

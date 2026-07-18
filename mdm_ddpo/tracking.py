@@ -59,6 +59,18 @@ TRAINING_METRIC_NAMES = {
     "step_target_mean": "step/target_mean",
     "step_rollout_samples": "step/rollout_samples",
     "step_use_m2m_reward": "step/use_m2m_reward",
+    "step_target_1_samples": "step/target_1_samples",
+    "step_target_2_samples": "step/target_2_samples",
+    "step_target_3_samples": "step/target_3_samples",
+    "step_target_4_samples": "step/target_4_samples",
+    "step_target_5_samples": "step/target_5_samples",
+    "step_target_6_samples": "step/target_6_samples",
+    "step_target_1_prompt_groups": "step/target_1_prompt_groups",
+    "step_target_2_prompt_groups": "step/target_2_prompt_groups",
+    "step_target_3_prompt_groups": "step/target_3_prompt_groups",
+    "step_target_4_prompt_groups": "step/target_4_prompt_groups",
+    "step_target_5_prompt_groups": "step/target_5_prompt_groups",
+    "step_target_6_prompt_groups": "step/target_6_prompt_groups",
     "reward_within_prompt_std": "reward/within_prompt_std",
     "reward_between_prompt_std": "reward/between_prompt_std",
     "reward_centered_std": "reward/centered_std",
@@ -81,6 +93,15 @@ TRAINING_METRIC_NAMES = {
     "component_advantage_m2m_weight": "advantage/m2m_weight",
     "component_advantage_step_m2m_enabled": (
         "advantage/step_m2m_enabled"
+    ),
+    "component_advantage_step_retrieval_weight": (
+        "advantage/step_retrieval_weight"
+    ),
+    "component_advantage_step_m2m_weight": (
+        "advantage/step_m2m_weight"
+    ),
+    "component_advantage_step_retrieval_contribution_mean_abs": (
+        "advantage/step_retrieval_contribution_mean_abs"
     ),
     "component_advantage_step_m2m_contribution_mean_abs": (
         "advantage/step_m2m_contribution_mean_abs"

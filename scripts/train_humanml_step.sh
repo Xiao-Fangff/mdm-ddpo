@@ -26,7 +26,7 @@ exec bash "${PROJECT_ROOT}/scripts/train_humanml.sh" \
   --fixed-step-eval-samples-per-prompt 16 \
   --rollout-batch-size 64 \
   --rollout-batches-per-epoch 2 \
-  --train-batch-size 32 \
-  --gradient-accumulation-steps 2 \
+  --train-batch-size 64 \
+  --gradient-accumulation-steps 1 \
   --step-reward-weight 0.5 \
   "$@"

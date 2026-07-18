@@ -680,6 +680,8 @@ def compute_component_shrink_advantages(
     m2m_std_floor: float,
     retrieval_weight: float = 0.5,
     m2m_weight: float = 0.5,
+    step_retrieval_weight: float | None = None,
+    step_m2m_weight: float | None = None,
     step_rewards: torch.Tensor | None = None,
     step_mask: torch.Tensor | None = None,
     step_std_floor: float | None = None,
@@ -693,7 +695,23 @@ def compute_component_shrink_advantages(
         raise ValueError("Component rewards and prompt ids must be matching 1-D tensors.")
     if retrieval_std_floor <= 0 or m2m_std_floor <= 0:
         raise ValueError("Component shrinkage floors must be positive.")
-    if retrieval_weight < 0 or m2m_weight < 0 or step_weight < 0:
+    resolved_step_retrieval_weight = (
+        retrieval_weight
+        if step_retrieval_weight is None
+        else float(step_retrieval_weight)
+    )
+    resolved_step_m2m_weight = (
+        m2m_weight
+        if step_m2m_weight is None
+        else float(step_m2m_weight)
+    )
+    if (
+        retrieval_weight < 0
+        or m2m_weight < 0
+        or resolved_step_retrieval_weight < 0
+        or resolved_step_m2m_weight < 0
+        or step_weight < 0
+    ):
         raise ValueError("Component advantage weights must be non-negative.")
     if retrieval_weight == 0 and m2m_weight == 0 and step_weight == 0:
         raise ValueError("At least one component advantage weight must be non-zero.")
@@ -734,8 +752,20 @@ def compute_component_shrink_advantages(
     )
     retrieval_contribution = retrieval_weight * retrieval_advantages
     m2m_contribution = m2m_weight * m2m_advantages
-    if active_step_mask is not None and not step_use_m2m_reward:
-        m2m_contribution = m2m_contribution.masked_fill(active_step_mask, 0.0)
+    if active_step_mask is not None:
+        retrieval_contribution[active_step_mask] = (
+            resolved_step_retrieval_weight
+            * retrieval_advantages[active_step_mask]
+        )
+        m2m_contribution[active_step_mask] = (
+            resolved_step_m2m_weight
+            * m2m_advantages[active_step_mask]
+        )
+        if not step_use_m2m_reward:
+            m2m_contribution = m2m_contribution.masked_fill(
+                active_step_mask,
+                0.0,
+            )
     combined = retrieval_contribution + m2m_contribution
     comparable = (
         retrieval_advantages.abs() > epsilon
@@ -753,6 +783,12 @@ def compute_component_shrink_advantages(
         ),
         "component_advantage_retrieval_weight": float(retrieval_weight),
         "component_advantage_m2m_weight": float(m2m_weight),
+        "component_advantage_step_retrieval_weight": float(
+            resolved_step_retrieval_weight
+        ),
+        "component_advantage_step_m2m_weight": float(
+            resolved_step_m2m_weight
+        ),
         "component_advantage_step_m2m_enabled": float(step_use_m2m_reward),
         "component_advantage_retrieval_std_floor": float(
             retrieval_std_floor
@@ -772,6 +808,11 @@ def compute_component_shrink_advantages(
         ),
         "component_advantage_step_m2m_contribution_mean_abs": (
             m2m_contribution[active_step_mask].abs().mean().item()
+            if active_step_mask is not None and active_step_mask.any()
+            else 0.0
+        ),
+        "component_advantage_step_retrieval_contribution_mean_abs": (
+            retrieval_contribution[active_step_mask].abs().mean().item()
             if active_step_mask is not None and active_step_mask.any()
             else 0.0
         ),
@@ -1239,7 +1280,7 @@ class DDPOTrainer:
                 self._advantage_std_floor("step")
                 if self.config.enable_step_reward
                 and self.config.advantage_mode == "component_shrink"
-                and self.config.advantage_step_weight > 0
+                and self.config.effective_step_advantage_step_weight > 0
                 else 0.0
             ),
             "timestep_fraction": self.config.timestep_fraction,
@@ -1286,6 +1327,16 @@ class DDPOTrainer:
             "step_reward": self.config.step_reward_config(),
             "step_reward_weight": self.config.step_reward_weight,
             "step_use_m2m_reward": self.config.step_use_m2m_reward,
+            "step_balanced_sampling": self.config.step_balanced_sampling,
+            "step_advantage_retrieval_weight": (
+                self.config.effective_step_advantage_retrieval_weight
+            ),
+            "step_advantage_m2m_weight": (
+                self.config.effective_step_advantage_m2m_weight
+            ),
+            "step_advantage_step_weight": (
+                self.config.effective_step_advantage_step_weight
+            ),
             "step_reward_calibration_id": (
                 self.step_reward_calibration.calibration_id
                 if self.step_reward_calibration is not None
@@ -1325,6 +1376,7 @@ class DDPOTrainer:
             seed=self.config.seed + 7919,
             workers=self.config.data_workers,
             pin_memory=self.config.pin_memory,
+            balanced_targets=self.config.step_balanced_sampling,
         )
         self.step_eval_records = list(evaluation)
         self.step_mdm_mean = torch.as_tensor(
@@ -1340,7 +1392,7 @@ class DDPOTrainer:
         LOGGER.info(
             "Step mixed data: train=%d, held_out_val=%d, targets=%s, "
             "target_histogram=%s, prompts_per_batch=humanml:%d step:%d, "
-            "motions_per_batch=humanml:%d step:%d.",
+            "motions_per_batch=humanml:%d step:%d, balanced_sampling=%s.",
             len(training),
             len(evaluation),
             self.config.step_target_values,
@@ -1349,6 +1401,7 @@ class DDPOTrainer:
             self.config.step_prompts_per_rollout_batch,
             self.config.humanml_rollout_samples,
             self.config.step_rollout_samples,
+            self.config.step_balanced_sampling,
         )
 
     def _load_or_create_fixed_step_eval_pool(self) -> FixedStepEvalPool:
@@ -2239,6 +2292,8 @@ class DDPOTrainer:
         # A fresh randomized subset per DDPO epoch also makes epoch-boundary
         # resume reproducible from the DataLoader generator state.
         self.data_iterator = iter(self.data_loader)
+        if self.step_data_loader is not None:
+            self.step_data_iterator = iter(self.step_data_loader)
         batches = [
             self._rollout_batch(epoch, batch_index)
             for batch_index in range(self.config.rollout_batches_per_epoch)
@@ -2259,16 +2314,22 @@ class DDPOTrainer:
                         self.config.advantage_retrieval_weight
                     ),
                     m2m_weight=self.config.advantage_m2m_weight,
+                    step_retrieval_weight=(
+                        self.config.effective_step_advantage_retrieval_weight
+                    ),
+                    step_m2m_weight=(
+                        self.config.effective_step_advantage_m2m_weight
+                    ),
                     step_rewards=trajectory.step_rewards,
                     step_mask=trajectory.step_mask,
                     step_std_floor=(
                         self._advantage_std_floor("step")
                         if self.config.enable_step_reward
-                        and self.config.advantage_step_weight > 0
+                        and self.config.effective_step_advantage_step_weight > 0
                         else None
                     ),
                     step_weight=(
-                        self.config.advantage_step_weight
+                        self.config.effective_step_advantage_step_weight
                         if self.config.enable_step_reward
                         else 0.0
                     ),
@@ -2897,6 +2958,14 @@ class DDPOTrainer:
                     "step_rollout_samples": float(active.sum()),
                 }
             )
+            for target in self.config.step_target_values:
+                target_samples = float(
+                    (trajectory.target_steps[active] == target).sum()
+                )
+                result[f"step_target_{target}_samples"] = target_samples
+                result[f"step_target_{target}_prompt_groups"] = (
+                    target_samples / self.config.step_samples_per_prompt
+                )
         else:
             result["step_rollout_samples"] = 0.0
         return result

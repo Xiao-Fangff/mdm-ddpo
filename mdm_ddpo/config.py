@@ -59,6 +59,7 @@ class TrainConfig:
     step_split_seed: int = 20260600
     step_prompt_seed: int = 20260612
     step_eval_samples_per_target: int = 8
+    step_balanced_sampling: bool = True
     step_min_frames: int = 40
     step_max_frames: int = 196
 
@@ -96,6 +97,9 @@ class TrainConfig:
     advantage_retrieval_weight: float = 0.5
     advantage_m2m_weight: float = 0.5
     advantage_step_weight: float = 0.25
+    step_advantage_retrieval_weight: float | None = None
+    step_advantage_m2m_weight: float | None = None
+    step_advantage_step_weight: float | None = None
     log_prob_audit_tolerance: float = 1.0e-4
     anchor_lambda: float = 0.0
     anchor_auto_grad_ratio: float = 0.0
@@ -330,7 +334,7 @@ class TrainConfig:
                 )
             if (
                 self.advantage_mode == "component_shrink"
-                and self.advantage_step_weight > 0
+                and self.effective_step_advantage_step_weight > 0
                 and not self.step_reward_calibration_path
             ):
                 raise ValueError(
@@ -386,6 +390,28 @@ class TrainConfig:
             raise ValueError(
                 "Component advantage weights must be non-negative and not "
                 "both zero."
+            )
+        for name in (
+            "step_advantage_retrieval_weight",
+            "step_advantage_m2m_weight",
+            "step_advantage_step_weight",
+        ):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(
+                    f"--{name.replace('_', '-')} cannot be negative."
+                )
+        if self.enable_step_reward and all(
+            weight == 0
+            for weight in (
+                self.effective_step_advantage_retrieval_weight,
+                self.effective_step_advantage_m2m_weight,
+                self.effective_step_advantage_step_weight,
+            )
+        ):
+            raise ValueError(
+                "At least one step-labelled component advantage weight must "
+                "be non-zero."
             )
         if not 0 < self.timestep_fraction <= 1:
             raise ValueError("--timestep-fraction must be in (0, 1].")
@@ -516,6 +542,30 @@ class TrainConfig:
             self.rollout_batch_size // self.fixed_step_eval_samples_per_prompt,
         )
 
+    @property
+    def effective_step_advantage_retrieval_weight(self) -> float:
+        return float(
+            self.advantage_retrieval_weight
+            if self.step_advantage_retrieval_weight is None
+            else self.step_advantage_retrieval_weight
+        )
+
+    @property
+    def effective_step_advantage_m2m_weight(self) -> float:
+        return float(
+            self.advantage_m2m_weight
+            if self.step_advantage_m2m_weight is None
+            else self.step_advantage_m2m_weight
+        )
+
+    @property
+    def effective_step_advantage_step_weight(self) -> float:
+        return float(
+            self.advantage_step_weight
+            if self.step_advantage_step_weight is None
+            else self.step_advantage_step_weight
+        )
+
     def step_detector_config(self) -> dict[str, Any]:
         return {
             "backend": self.step_detector_backend,
@@ -633,6 +683,15 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--step-split-seed", type=int, default=20260600)
     data.add_argument("--step-prompt-seed", type=int, default=20260612)
     data.add_argument("--step-eval-samples-per-target", type=int, default=8)
+    data.add_argument(
+        "--step-balanced-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Interleave step targets uniformly so short rollout windows do "
+            "not over-sample an easy or difficult target."
+        ),
+    )
     data.add_argument("--step-min-frames", type=int, default=40)
     data.add_argument("--step-max-frames", type=int, default=196)
 
@@ -796,6 +855,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--advantage-step-weight",
         type=float,
         default=0.25,
+    )
+    train.add_argument(
+        "--step-advantage-retrieval-weight",
+        type=float,
+        default=None,
+        help=(
+            "Retrieval advantage weight for step-labelled groups only; "
+            "default inherits --advantage-retrieval-weight."
+        ),
+    )
+    train.add_argument(
+        "--step-advantage-m2m-weight",
+        type=float,
+        default=None,
+        help=(
+            "M2M advantage weight for step-labelled groups only; default "
+            "inherits --advantage-m2m-weight."
+        ),
+    )
+    train.add_argument(
+        "--step-advantage-step-weight",
+        type=float,
+        default=None,
+        help=(
+            "Hard-step advantage weight for step-labelled groups; default "
+            "inherits --advantage-step-weight."
+        ),
     )
 
     policy = parser.add_argument_group("policy parameters")

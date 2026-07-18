@@ -70,6 +70,9 @@ def summarize_run(run_dir: str | Path) -> dict[str, Any]:
         if step_updates
         else None
     )
+    step_retrieval_weight = config.get("step_advantage_retrieval_weight")
+    step_m2m_weight = config.get("step_advantage_m2m_weight")
+    step_weight = config.get("step_advantage_step_weight")
     return {
         "run": run_path.name,
         "run_dir": str(run_path),
@@ -81,7 +84,23 @@ def summarize_run(run_dir: str | Path) -> dict[str, Any]:
         "anchor_grad_ratio_target": config.get("anchor_auto_grad_ratio", 0.0),
         "step_reward_enabled": config.get("enable_step_reward", False),
         "step_data_ratio": config.get("step_data_ratio", 0.0),
-        "step_advantage_weight": config.get("advantage_step_weight", 0.0),
+        "step_samples_per_prompt": config.get("step_samples_per_prompt"),
+        "step_balanced_sampling": config.get("step_balanced_sampling", False),
+        "step_retrieval_advantage_weight": (
+            config.get("advantage_retrieval_weight", 0.0)
+            if step_retrieval_weight is None
+            else step_retrieval_weight
+        ),
+        "step_m2m_advantage_weight": (
+            config.get("advantage_m2m_weight", 0.0)
+            if step_m2m_weight is None
+            else step_m2m_weight
+        ),
+        "step_advantage_weight": (
+            config.get("advantage_step_weight", 0.0)
+            if step_weight is None
+            else step_weight
+        ),
         "epochs_completed": len(training),
         "global_step": training[-1].get("global_step") if training else None,
         "clip_fraction_mean": _mean(training, "clip_fraction"),
@@ -123,11 +142,22 @@ def summarize_run(run_dir: str | Path) -> dict[str, Any]:
             if best_step
             else None
         ),
+        "best_step_within_one_delta": (
+            best_step.get("eval_step_within_one_fraction_delta")
+            if best_step
+            else None
+        ),
         "final_step_reward_delta": (
             final.get("eval_step_reward_delta") if final else None
         ),
         "final_step_mae_delta": (
             final.get("eval_step_mae_delta") if final else None
+        ),
+        "final_step_exact_delta": (
+            final.get("eval_step_exact_fraction_delta") if final else None
+        ),
+        "final_step_within_one_delta": (
+            final.get("eval_step_within_one_fraction_delta") if final else None
         ),
         "best_balanced_checkpoint": str(run_path / "best_balanced.pt"),
         "best_step_checkpoint": str(run_path / "best_step.pt"),
@@ -156,6 +186,10 @@ def write_comparison_tables(
         "anchor_grad_ratio_target",
         "step_reward_enabled",
         "step_data_ratio",
+        "step_samples_per_prompt",
+        "step_balanced_sampling",
+        "step_retrieval_advantage_weight",
+        "step_m2m_advantage_weight",
         "step_advantage_weight",
         "epochs_completed",
         "best_epoch",
@@ -168,6 +202,7 @@ def write_comparison_tables(
         "best_step_reward_delta",
         "best_step_mae_delta",
         "best_step_exact_delta",
+        "best_step_within_one_delta",
         "clip_fraction_mean",
         "ratio_std_mean",
         "log_ratio_abs_max",

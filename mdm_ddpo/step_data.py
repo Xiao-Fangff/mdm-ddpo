@@ -10,7 +10,7 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 
 STEP_POOL_VERSION = 1
@@ -308,6 +308,62 @@ class StepMotionDataset(Dataset[dict[str, Any]]):
         }
 
 
+class BalancedStepTargetSampler(Sampler[int]):
+    """Interleave target classes so every short prefix is nearly balanced."""
+
+    def __init__(
+        self,
+        target_steps: Sequence[int],
+        *,
+        generator: torch.Generator,
+    ) -> None:
+        if not target_steps:
+            raise ValueError("Balanced step sampler requires non-empty targets.")
+        grouped: dict[int, list[int]] = {}
+        for index, target in enumerate(target_steps):
+            grouped.setdefault(int(target), []).append(index)
+        if any(not indices for indices in grouped.values()):
+            raise ValueError("Every balanced step target must have samples.")
+        self.grouped_indices = {
+            target: tuple(indices)
+            for target, indices in sorted(grouped.items())
+        }
+        self.generator = generator
+        self.sample_count = len(target_steps)
+
+    def __len__(self) -> int:
+        return self.sample_count
+
+    def _shuffled_group(self, target: int) -> list[int]:
+        values = self.grouped_indices[target]
+        order = torch.randperm(len(values), generator=self.generator).tolist()
+        return [values[position] for position in order]
+
+    def __iter__(self):
+        targets = list(self.grouped_indices)
+        queues = {
+            target: self._shuffled_group(target)
+            for target in targets
+        }
+        positions = {target: 0 for target in targets}
+        yielded = 0
+        while yielded < self.sample_count:
+            target_order = torch.randperm(
+                len(targets),
+                generator=self.generator,
+            ).tolist()
+            for target_position in target_order:
+                target = targets[target_position]
+                if yielded >= self.sample_count:
+                    break
+                if positions[target] >= len(queues[target]):
+                    queues[target] = self._shuffled_group(target)
+                    positions[target] = 0
+                yield queues[target][positions[target]]
+                positions[target] += 1
+                yielded += 1
+
+
 def collate_step_motions(items: list[dict[str, Any]]) -> tuple[torch.Tensor, dict[str, Any]]:
     if not items:
         raise ValueError("Cannot collate an empty step batch.")
@@ -339,16 +395,26 @@ def build_step_data_loader(
     seed: int,
     workers: int,
     pin_memory: bool,
+    balanced_targets: bool = True,
 ) -> DataLoader:
     if len(dataset) < batch_size:
         raise ValueError(
             f"Step dataset has {len(dataset)} samples, fewer than batch size {batch_size}."
         )
     generator = torch.Generator().manual_seed(seed)
+    sampler = (
+        BalancedStepTargetSampler(
+            [record.target_steps for record in dataset.records],
+            generator=generator,
+        )
+        if balanced_targets
+        else None
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=not balanced_targets,
+        sampler=sampler,
         num_workers=workers,
         drop_last=True,
         collate_fn=collate_step_motions,
@@ -536,6 +602,7 @@ def target_histogram(records: Iterable[StepSampleRecord]) -> dict[str, int]:
 
 
 __all__ = [
+    "BalancedStepTargetSampler",
     "FixedStepEvalPool",
     "StepMotionDataset",
     "StepSampleRecord",
