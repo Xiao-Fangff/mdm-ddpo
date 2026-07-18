@@ -77,6 +77,22 @@ class GroupedRolloutTest(unittest.TestCase):
         )
         self.assertEqual(prompt_ids.tolist(), [0, 0, 0, 1, 1, 1])
 
+    def test_prompt_batch_supports_independent_group_sizes(self):
+        motion = torch.tensor([[[[1.0]]], [[[2.0]]]])
+        lengths = torch.tensor([10, 20])
+        texts = ["human", "step"]
+
+        repeated_motion, repeated_lengths, repeated_texts, prompt_ids = (
+            repeat_prompt_batch(motion, lengths, texts, samples_per_prompt=[4, 16])
+        )
+
+        self.assertEqual(repeated_motion.shape[0], 20)
+        self.assertEqual(repeated_motion[:4, 0, 0, 0].tolist(), [1.0] * 4)
+        self.assertEqual(repeated_motion[4:, 0, 0, 0].tolist(), [2.0] * 16)
+        self.assertEqual(repeated_lengths.tolist(), [10] * 4 + [20] * 16)
+        self.assertEqual(repeated_texts, ["human"] * 4 + ["step"] * 16)
+        self.assertEqual(prompt_ids.tolist(), [0] * 4 + [1] * 16)
+
     def test_advantages_are_standardized_within_each_prompt(self):
         rewards = torch.tensor([1.0, 2.0, 3.0, 10.0, 14.0, 18.0])
         prompt_ids = torch.tensor([0, 0, 0, 1, 1, 1])
@@ -220,6 +236,36 @@ class GroupedRolloutTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rollout_batch_size.*divisible"):
             config.validate()
 
+    def test_step_mixing_uses_exact_motion_allocation_with_independent_k(self):
+        config = TrainConfig(
+            enable_step_reward=True,
+            fixed_eval_every=0,
+            rollout_batch_size=64,
+            samples_per_prompt=4,
+            step_samples_per_prompt=16,
+            step_data_ratio=0.25,
+        )
+
+        config.validate()
+        self.assertEqual(config.humanml_rollout_samples, 48)
+        self.assertEqual(config.step_rollout_samples, 16)
+        self.assertEqual(config.humanml_prompts_per_rollout_batch, 12)
+        self.assertEqual(config.step_prompts_per_rollout_batch, 1)
+        self.assertEqual(config.prompts_per_rollout_batch, 13)
+
+    def test_step_mixing_rejects_incomplete_k16_step_group(self):
+        config = TrainConfig(
+            enable_step_reward=True,
+            fixed_eval_every=0,
+            rollout_batch_size=32,
+            samples_per_prompt=4,
+            step_samples_per_prompt=16,
+            step_data_ratio=0.25,
+        )
+
+        with self.assertRaisesRegex(ValueError, "step motion allocation"):
+            config.validate()
+
     def test_ppo_minibatches_shuffle_individual_samples(self):
         generator = torch.Generator().manual_seed(7)
 
@@ -271,6 +317,8 @@ class GroupedRolloutTest(unittest.TestCase):
         config = TrainConfig()
 
         self.assertEqual(config.samples_per_prompt, 4)
+        self.assertEqual(config.step_samples_per_prompt, 16)
+        self.assertEqual(config.fixed_step_eval_samples_per_prompt, 16)
         self.assertEqual(config.advantage_mode, "group_whiten")
         self.assertEqual(config.reward_embedding_mode, "mean")
         self.assertAlmostEqual(config.timestep_fraction, 0.5)

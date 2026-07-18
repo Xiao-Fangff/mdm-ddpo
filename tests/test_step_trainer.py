@@ -65,6 +65,7 @@ class StepTrainerTest(unittest.TestCase):
             fixed_eval_every=0,
             rollout_batch_size=4,
             samples_per_prompt=2,
+            step_samples_per_prompt=2,
             step_data_ratio=0.5,
         )
         human = torch.zeros(1, 263, 1, 8)
@@ -162,22 +163,27 @@ class StepTrainerTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["eval_step_mae_delta"], -0.75)
         self.assertEqual(metrics["eval_step_mae_improvement_fraction"], 1.0)
 
-    def test_step_prompt_mix_properties_round_to_exact_prompt_counts(self):
+    def test_step_prompt_mix_properties_preserve_exact_motion_counts(self):
         config = TrainConfig(
             enable_step_reward=True,
-            rollout_batch_size=32,
+            rollout_batch_size=64,
             samples_per_prompt=4,
+            step_samples_per_prompt=16,
             step_data_ratio=0.25,
         )
-        self.assertEqual(config.prompts_per_rollout_batch, 8)
-        self.assertEqual(config.step_prompts_per_rollout_batch, 2)
-        self.assertEqual(config.humanml_prompts_per_rollout_batch, 6)
+        self.assertEqual(config.prompts_per_rollout_batch, 13)
+        self.assertEqual(config.step_prompts_per_rollout_batch, 1)
+        self.assertEqual(config.humanml_prompts_per_rollout_batch, 12)
+        self.assertEqual(config.step_rollout_samples, 16)
+        self.assertEqual(config.humanml_rollout_samples, 48)
+        self.assertEqual(config.step_fixed_eval_prompts_per_batch, 4)
 
     def test_step_reward_rejects_total_group_shrink_calibration(self):
         config = TrainConfig(
             enable_step_reward=True,
             fixed_eval_every=0,
             advantage_mode="group_shrink",
+            rollout_batch_size=64,
         )
         with self.assertRaisesRegex(ValueError, "total calibration"):
             config.validate()
@@ -188,6 +194,7 @@ class StepTrainerTest(unittest.TestCase):
             fixed_eval_every=0,
             advantage_mode="component_shrink",
             reward_calibration_path="placeholder.json",
+            rollout_batch_size=64,
         )
         with self.assertRaisesRegex(ValueError, "step-reward-calibration"):
             config.validate()

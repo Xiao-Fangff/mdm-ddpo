@@ -4,9 +4,9 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/outputs/step_reward_ablations}"
 REWARD_CALIBRATION_PATH="${REWARD_CALIBRATION_PATH:-${PROJECT_ROOT}/reward_calibration.json}"
-STEP_REWARD_CALIBRATION_PATH="${STEP_REWARD_CALIBRATION_PATH:-${PROJECT_ROOT}/step_reward_calibration.json}"
+STEP_REWARD_CALIBRATION_PATH="${STEP_REWARD_CALIBRATION_PATH:-${PROJECT_ROOT}/step_reward_k16_calibration.json}"
 FIXED_EVAL_POOL_PATH="${FIXED_EVAL_POOL_PATH:-${PROJECT_ROOT}/artifacts/humanml_val_fixed_eval_pool.pt}"
-FIXED_STEP_EVAL_POOL_PATH="${FIXED_STEP_EVAL_POOL_PATH:-${PROJECT_ROOT}/artifacts/step_val_fixed_eval_pool.pt}"
+FIXED_STEP_EVAL_POOL_PATH="${FIXED_STEP_EVAL_POOL_PATH:-${PROJECT_ROOT}/artifacts/step_val_fixed_eval_pool_k16.pt}"
 SEED="${SEED:-42}"
 EPOCHS="${EPOCHS:-30}"
 

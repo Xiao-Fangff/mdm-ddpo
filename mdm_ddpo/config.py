@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,7 @@ class TrainConfig:
     rollout_batch_size: int = 32
     rollout_batches_per_epoch: int = 4
     samples_per_prompt: int = 4
+    step_samples_per_prompt: int = 16
 
     train_batch_size: int = 32
     inner_epochs: int = 1
@@ -122,6 +124,7 @@ class TrainConfig:
     fixed_eval_seed: int = 20260717
     fixed_eval_prompts: int = 128
     fixed_eval_samples_per_prompt: int = 4
+    fixed_step_eval_samples_per_prompt: int = 16
     fixed_eval_bootstrap_samples: int = 2000
     fixed_eval_pool_path: str = ""
     fixed_step_eval_pool_path: str = ""
@@ -177,8 +180,10 @@ class TrainConfig:
             "save_every",
             "log_every",
             "samples_per_prompt",
+            "step_samples_per_prompt",
             "fixed_eval_prompts",
             "fixed_eval_samples_per_prompt",
+            "fixed_step_eval_samples_per_prompt",
             "fixed_eval_bootstrap_samples",
         ):
             if getattr(self, name) <= 0:
@@ -198,7 +203,22 @@ class TrainConfig:
             raise ValueError(
                 "--samples-per-prompt must be at least 2 for grouped advantages."
             )
-        if self.rollout_batch_size % self.samples_per_prompt != 0:
+        if self.step_samples_per_prompt < 2:
+            raise ValueError(
+                "--step-samples-per-prompt must be at least 2 for grouped "
+                "step advantages."
+            )
+        if self.fixed_eval_samples_per_prompt < 2:
+            raise ValueError(
+                "--fixed-eval-samples-per-prompt must be at least 2."
+            )
+        if self.fixed_step_eval_samples_per_prompt < 2:
+            raise ValueError(
+                "--fixed-step-eval-samples-per-prompt must be at least 2."
+            )
+        if not self.enable_step_reward and (
+            self.rollout_batch_size % self.samples_per_prompt != 0
+        ):
             raise ValueError(
                 "--rollout-batch-size must be divisible by "
                 "--samples-per-prompt."
@@ -262,6 +282,33 @@ class TrainConfig:
         if self.enable_step_reward:
             if not 0 < self.step_data_ratio < 1:
                 raise ValueError("--step-data-ratio must be in (0,1).")
+            requested_step_samples = (
+                self.rollout_batch_size * self.step_data_ratio
+            )
+            if not math.isclose(
+                requested_step_samples,
+                round(requested_step_samples),
+                rel_tol=0.0,
+                abs_tol=1.0e-8,
+            ):
+                raise ValueError(
+                    "--step-data-ratio must produce an integral number of "
+                    "step motion samples per rollout batch."
+                )
+            if self.step_rollout_samples % self.step_samples_per_prompt != 0:
+                raise ValueError(
+                    "The step motion allocation "
+                    "(rollout_batch_size * step_data_ratio) must be divisible "
+                    "by --step-samples-per-prompt so every step prompt has a "
+                    "complete group."
+                )
+            if self.humanml_rollout_samples % self.samples_per_prompt != 0:
+                raise ValueError(
+                    "The HumanML motion allocation "
+                    "(rollout_batch_size * (1 - step_data_ratio)) must be "
+                    "divisible by --samples-per-prompt so every HumanML prompt "
+                    "has a complete group."
+                )
             if self.prompts_per_rollout_batch < 2:
                 raise ValueError(
                     "Step mixing requires at least two prompts per rollout batch."
@@ -413,7 +460,28 @@ class TrainConfig:
 
     @property
     def prompts_per_rollout_batch(self) -> int:
-        return self.rollout_batch_size // self.samples_per_prompt
+        """Total prompt groups assembled into one mixed rollout batch."""
+        return (
+            self.humanml_prompts_per_rollout_batch
+            + self.step_prompts_per_rollout_batch
+        )
+
+    @property
+    def human_samples_per_prompt(self) -> int:
+        """Alias that makes the two independent grouped rollout sizes clear."""
+        return self.samples_per_prompt
+
+    @property
+    def step_rollout_samples(self) -> int:
+        """Number of step-labelled motion samples in one rollout batch."""
+        if not self.enable_step_reward:
+            return 0
+        return int(round(self.rollout_batch_size * self.step_data_ratio))
+
+    @property
+    def humanml_rollout_samples(self) -> int:
+        """Number of ordinary HumanML motion samples in one rollout batch."""
+        return self.rollout_batch_size - self.step_rollout_samples
 
     @property
     def step_target_values(self) -> tuple[int, ...]:
@@ -425,12 +493,27 @@ class TrainConfig:
     def step_prompts_per_rollout_batch(self) -> int:
         if not self.enable_step_reward:
             return 0
-        count = int(self.prompts_per_rollout_batch * self.step_data_ratio + 0.5)
-        return min(self.prompts_per_rollout_batch - 1, max(1, count))
+        return self.step_rollout_samples // self.step_samples_per_prompt
 
     @property
     def humanml_prompts_per_rollout_batch(self) -> int:
-        return self.prompts_per_rollout_batch - self.step_prompts_per_rollout_batch
+        return self.humanml_rollout_samples // self.samples_per_prompt
+
+    @property
+    def humanml_fixed_eval_prompts_per_batch(self) -> int:
+        """Maximum held-out HumanML prompts evaluated in one diffusion batch."""
+        return max(
+            1,
+            self.rollout_batch_size // self.fixed_eval_samples_per_prompt,
+        )
+
+    @property
+    def step_fixed_eval_prompts_per_batch(self) -> int:
+        """Maximum held-out step prompts evaluated in one diffusion batch."""
+        return max(
+            1,
+            self.rollout_batch_size // self.fixed_step_eval_samples_per_prompt,
+        )
 
     def step_detector_config(self) -> dict[str, Any]:
         return {
@@ -593,8 +676,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help=(
-            "Independent motions generated for each prompt. Advantages are "
-            "normalized within these prompt groups."
+            "Independent motions generated for each HumanML prompt. "
+            "Advantages are normalized within these prompt groups."
+        ),
+    )
+    rollout.add_argument(
+        "--step-samples-per-prompt",
+        type=int,
+        default=16,
+        help=(
+            "Independent motions generated for each step-labelled prompt. "
+            "This is independent of --samples-per-prompt."
         ),
     )
 
@@ -778,6 +870,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generated motions evaluated for every held-out prompt.",
     )
     reward.add_argument(
+        "--fixed-step-eval-samples-per-prompt",
+        type=int,
+        default=16,
+        help=(
+            "Generated motions evaluated for every held-out step prompt. "
+            "This is independent of --fixed-eval-samples-per-prompt."
+        ),
+    )
+    reward.add_argument(
         "--fixed-eval-bootstrap-samples",
         type=int,
         default=2000,
@@ -890,9 +991,12 @@ def parse_config(argv: list[str] | None = None) -> TrainConfig:
         config.rollout_batches_per_epoch = 1
         config.train_batch_size = config.rollout_batch_size
         config.samples_per_prompt = 2
+        config.step_samples_per_prompt = 2
         config.fixed_eval_prompts = 1
         config.fixed_eval_samples_per_prompt = 2
+        config.fixed_step_eval_samples_per_prompt = 2
         if config.enable_step_reward:
+            config.step_data_ratio = 0.5
             config.step_eval_samples_per_target = 1
         config.inner_epochs = 1
         config.data_workers = 0

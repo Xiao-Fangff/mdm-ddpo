@@ -57,22 +57,25 @@ MotionRFT 的 `StepCountNet`。
   step reward 严格为 0。
 - 默认 reward：`exp(-abs(detected-target)/temperature)`；另支持 linear/exact/
   negative_l1。
-- 默认 physical batch 32、K=4 时为 6 HumanML prompts + 2 step prompts，motion
-  sample 比例 24:8（3:1）。
+- mixed K 已解耦：HumanML `K=4`，step `K=16`。`step_data_ratio` 现在按 motion
+  sample 计，而非 prompt 计；默认 physical batch 64 严格组装为 12 HumanML prompts
+  × 4 = 48 与 1 step prompt × 16 = 16（仍为 3:1）。
+- step K=16 需要独立 `step_reward_k16_calibration.json`（以及建议独立
+  `step_val_fixed_eval_pool_k16.pt`）；旧 K=4 calibration 会在加载时明确拒绝。
 - step train/held-out val 按 target 分层、seed 固定且 source sample 不重叠；
   `fixed_step_eval_pool.pt` 保存 exact motion/text/target/length/noise seed/checksum。
 - fixed step eval 记录 reward、exact、within-1、MAE、detected mean，以及 step prompt
   上 retrieval/M2M delta。
 - 原 balanced checkpoint 定义保持 retrieval+M2M 不变；step 单项最佳保存
   `best_step.pt`。
-- `component_shrink` 可使用第三个 masked step component；step floor 只能来自
-  `step_reward_calibration.json`。离散 reward 的 raw p25/p50 可能为 0，因此实际
+- `component_shrink` 可使用第三个 masked step component；step floor 只能来自与当前
+  step K 匹配的 calibration。离散 reward 的 raw p25/p50 可能为 0，因此实际
   floor 使用正方差 prompt groups 的 quantile，并保留 zero-std fraction 日志。
 - diffusion anchor 明确跳过 step pseudo-GT，仅锚定真实 HumanML3D。
 
 ## Step reward 已完成验证
 
-- 单元测试总数由 61 增加到 82，当前全部通过。
+- 单元测试总数已增加到 85，当前全部通过。
 - `compileall`、`bash -n scripts/*.sh`、`git diff --check` 通过。
 - 真实 RFT_MLD 263-D GT detector 对齐：3/3 exact。
 - 6 prompts × 2 motions × 4 diffusion steps 的 calibration GPU smoke 成功；输出
@@ -93,7 +96,7 @@ MotionRFT 的 `StepCountNet`。
 正式使用前需要运行：
 
 ```text
-tools/calibrate_step_reward_stats.py --prompts 384 --samples-per-prompt 4
+tools/calibrate_step_reward_stats.py --prompts 384 --samples-per-prompt 16 --batch-size 64
 scripts/train_humanml_step.sh
 ```
 

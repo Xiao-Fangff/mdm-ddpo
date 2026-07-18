@@ -72,7 +72,10 @@ def resolve_reward_device(config: TrainConfig, policy_device: torch.device) -> t
 def load_model_args(config: TrainConfig) -> SimpleNamespace:
     with open(config.model_args_path, "r", encoding="utf-8") as handle:
         values = json.load(handle)
-    values["batch_size"] = config.prompts_per_rollout_batch
+    # MDM keeps this legacy argument for its HumanML data path. Mixed DDPO
+    # rollouts may contain variable K groups, so use the actual HumanML loader
+    # prompt count rather than the total number of mixed prompt groups.
+    values["batch_size"] = config.humanml_prompts_per_rollout_batch
     values["dataset"] = config.dataset
     values["device"] = (
         int(config.device.split(":", 1)[1])

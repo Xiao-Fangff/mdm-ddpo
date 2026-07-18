@@ -5,8 +5,8 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 export MDM_DDPO_ENABLE_STEP_REWARD=1
 export OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/humanml_step_ddpo}"
-export MDM_DDPO_STEP_REWARD_CALIBRATION_PATH="${MDM_DDPO_STEP_REWARD_CALIBRATION_PATH:-${PROJECT_ROOT}/step_reward_calibration.json}"
-export MDM_DDPO_FIXED_STEP_EVAL_POOL_PATH="${MDM_DDPO_FIXED_STEP_EVAL_POOL_PATH:-${PROJECT_ROOT}/artifacts/step_val_fixed_eval_pool.pt}"
+export MDM_DDPO_STEP_REWARD_CALIBRATION_PATH="${MDM_DDPO_STEP_REWARD_CALIBRATION_PATH:-${PROJECT_ROOT}/step_reward_k16_calibration.json}"
+export MDM_DDPO_FIXED_STEP_EVAL_POOL_PATH="${MDM_DDPO_FIXED_STEP_EVAL_POOL_PATH:-${PROJECT_ROOT}/artifacts/step_val_fixed_eval_pool_k16.pt}"
 
 if [[ ! -f "${MDM_DDPO_STEP_REWARD_CALIBRATION_PATH}" ]]; then
   echo "Missing step reward calibration: ${MDM_DDPO_STEP_REWARD_CALIBRATION_PATH}" >&2
@@ -20,5 +20,13 @@ exec bash "${PROJECT_ROOT}/scripts/train_humanml.sh" \
   --advantage-m2m-weight 0.375 \
   --advantage-step-weight 0.25 \
   --step-data-ratio 0.25 \
+  --samples-per-prompt 4 \
+  --step-samples-per-prompt 16 \
+  --fixed-eval-samples-per-prompt 4 \
+  --fixed-step-eval-samples-per-prompt 16 \
+  --rollout-batch-size 64 \
+  --rollout-batches-per-epoch 2 \
+  --train-batch-size 32 \
+  --gradient-accumulation-steps 2 \
   --step-reward-weight 0.5 \
   "$@"

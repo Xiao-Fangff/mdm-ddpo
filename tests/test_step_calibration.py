@@ -78,6 +78,12 @@ class StepCalibrationTest(unittest.TestCase):
                 detector_config={"backend": "rgdno"},
                 reward_config={"mode": "exp"},
             )
+        with self.assertRaisesRegex(ValueError, "samples_per_prompt"):
+            calibration.validate_settings(
+                detector_config={"backend": "progressive"},
+                reward_config={"mode": "exp"},
+                samples_per_prompt=16,
+            )
 
     def test_checksum_detects_mutation(self):
         payload = self._payload()

@@ -533,22 +533,44 @@ def repeat_prompt_batch(
     motion: torch.Tensor,
     lengths: torch.Tensor,
     texts: list[str],
-    samples_per_prompt: int,
+    samples_per_prompt: int | list[int] | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str], torch.Tensor]:
-    """Repeat each conditioning item contiguously for grouped DDPO rollouts."""
+    """Repeat conditioning items contiguously for grouped DDPO rollouts.
+
+    ``samples_per_prompt`` may be one shared group size or one size per
+    prompt. The latter is used for mixed HumanML (K=4) and step (K=16)
+    rollouts while preserving complete, contiguous advantage groups.
+    """
     prompt_count = motion.shape[0]
     if lengths.shape[0] != prompt_count or len(texts) != prompt_count:
         raise ValueError("Motion, length, and text prompt counts must match.")
-    if samples_per_prompt < 2:
+    if isinstance(samples_per_prompt, int):
+        repeat_counts = torch.full(
+            (prompt_count,),
+            samples_per_prompt,
+            dtype=torch.long,
+        )
+    else:
+        repeat_counts = torch.as_tensor(samples_per_prompt, dtype=torch.long)
+    if repeat_counts.ndim != 1 or repeat_counts.shape[0] != prompt_count:
+        raise ValueError(
+            "samples_per_prompt must be one integer or one count for each "
+            "motion/text prompt."
+        )
+    if (repeat_counts < 2).any():
         raise ValueError("Grouped DDPO requires at least two samples per prompt.")
-    repeated_motion = motion.repeat_interleave(samples_per_prompt, dim=0)
-    repeated_lengths = lengths.repeat_interleave(samples_per_prompt, dim=0)
+    repeat_counts = repeat_counts.to(device=motion.device)
+    repeated_motion = motion.repeat_interleave(repeat_counts, dim=0)
+    repeated_lengths = lengths.repeat_interleave(repeat_counts, dim=0)
     repeated_texts = [
         text
-        for text in texts
-        for _ in range(samples_per_prompt)
+        for text, count in zip(texts, repeat_counts.tolist())
+        for _ in range(count)
     ]
-    prompt_ids = torch.arange(prompt_count).repeat_interleave(samples_per_prompt)
+    prompt_ids = torch.arange(
+        prompt_count,
+        device=motion.device,
+    ).repeat_interleave(repeat_counts)
     return repeated_motion, repeated_lengths, repeated_texts, prompt_ids
 
 
@@ -1018,6 +1040,7 @@ class DDPOTrainer:
                 self.step_reward_calibration.validate_settings(
                     detector_config=config.step_detector_config(),
                     reward_config=config.step_reward_config(),
+                    samples_per_prompt=config.step_samples_per_prompt,
                 )
             self.step_detector = HardStepDetector(
                 backend=config.step_detector_backend,
@@ -1167,6 +1190,16 @@ class DDPOTrainer:
                 self.config.prompts_per_rollout_batch
             ),
             "samples_per_prompt": self.config.samples_per_prompt,
+            "humanml_samples_per_prompt": (
+                self.config.human_samples_per_prompt
+            ),
+            "step_samples_per_prompt": self.config.step_samples_per_prompt,
+            "humanml_rollout_samples": self.config.humanml_rollout_samples,
+            "step_rollout_samples": self.config.step_rollout_samples,
+            "step_motion_ratio": (
+                self.config.step_rollout_samples
+                / self.config.rollout_batch_size
+            ),
             "advantage_mode": self.config.advantage_mode,
             "advantage_std_floor_quantile": (
                 self.config.advantage_std_floor_quantile
@@ -1289,13 +1322,16 @@ class DDPOTrainer:
         )
         LOGGER.info(
             "Step mixed data: train=%d, held_out_val=%d, targets=%s, "
-            "target_histogram=%s, prompts_per_batch=%d/%d.",
+            "target_histogram=%s, prompts_per_batch=humanml:%d step:%d, "
+            "motions_per_batch=humanml:%d step:%d.",
             len(training),
             len(evaluation),
             self.config.step_target_values,
             target_histogram(training),
+            self.config.humanml_prompts_per_rollout_batch,
             self.config.step_prompts_per_rollout_batch,
-            self.config.prompts_per_rollout_batch,
+            self.config.humanml_rollout_samples,
+            self.config.step_rollout_samples,
         )
 
     def _load_or_create_fixed_step_eval_pool(self) -> FixedStepEvalPool:
@@ -1507,7 +1543,7 @@ class DDPOTrainer:
             raise RuntimeError("Fixed evaluation is disabled.")
         prompt_batch_size = min(
             self.fixed_eval_pool.prompt_count,
-            self.config.prompts_per_rollout_batch,
+            self.config.humanml_fixed_eval_prompts_per_batch,
         )
         precision_code = {"no": 0.0, "fp16": 1.0, "bf16": 2.0}
         signature = {
@@ -1542,13 +1578,13 @@ class DDPOTrainer:
                 {
                     "step_eval_samples": float(
                         step_pool.prompt_count
-                        * self.config.fixed_eval_samples_per_prompt
+                        * self.config.fixed_step_eval_samples_per_prompt
                     ),
                     "step_eval_prompts": float(
                         step_pool.prompt_count
                     ),
                     "step_eval_samples_per_prompt": float(
-                        self.config.fixed_eval_samples_per_prompt
+                        self.config.fixed_step_eval_samples_per_prompt
                     ),
                     "step_eval_seed": float(
                         step_pool.noise_seed
@@ -1571,7 +1607,7 @@ class DDPOTrainer:
         if self.fixed_eval_pool is None:
             raise RuntimeError("Fixed evaluation is disabled.")
 
-        prompt_batch_size = self.config.prompts_per_rollout_batch
+        prompt_batch_size = self.config.humanml_fixed_eval_prompts_per_batch
         total_prompt_count = self.fixed_eval_pool.prompt_count
         chunk_count = math.ceil(total_prompt_count / prompt_batch_size)
         progress = tqdm(
@@ -1729,7 +1765,7 @@ class DDPOTrainer:
         ):
             raise RuntimeError("Step detector is not initialized.")
 
-        prompt_batch_size = self.config.prompts_per_rollout_batch
+        prompt_batch_size = self.config.step_fixed_eval_prompts_per_batch
         total_prompt_count = self.fixed_step_eval_pool.prompt_count
         chunk_count = math.ceil(total_prompt_count / prompt_batch_size)
         progress = tqdm(
@@ -1751,11 +1787,11 @@ class DDPOTrainer:
                 self.fixed_step_eval_pool.motion[prompt_start:prompt_end],
                 self.fixed_step_eval_pool.lengths[prompt_start:prompt_end],
                 self.fixed_step_eval_pool.texts[prompt_start:prompt_end],
-                self.config.fixed_eval_samples_per_prompt,
+                self.config.fixed_step_eval_samples_per_prompt,
             )
             target_steps = self.fixed_step_eval_pool.target_steps[
                 prompt_start:prompt_end
-            ].repeat_interleave(self.config.fixed_eval_samples_per_prompt)
+            ].repeat_interleave(self.config.fixed_step_eval_samples_per_prompt)
             motion = motion.to(self.device, dtype=torch.float32)
             batch_size, _, _, num_frames = motion.shape
             model_kwargs = build_model_kwargs(
@@ -1782,7 +1818,7 @@ class DDPOTrainer:
                 noise_parts.append(
                     torch.randn(
                         (
-                            self.config.fixed_eval_samples_per_prompt,
+                            self.config.fixed_step_eval_samples_per_prompt,
                             *prompt_shape,
                         ),
                         device=self.device,
@@ -1802,7 +1838,7 @@ class DDPOTrainer:
                     [
                         torch.randn(
                             (
-                                self.config.fixed_eval_samples_per_prompt,
+                                self.config.fixed_step_eval_samples_per_prompt,
                                 *prompt_shape,
                             ),
                             device=self.device,
@@ -1872,7 +1908,7 @@ class DDPOTrainer:
         target_steps = torch.cat(target_parts)
         group_shape = (
             self.fixed_step_eval_pool.prompt_count,
-            self.config.fixed_eval_samples_per_prompt,
+            self.config.fixed_step_eval_samples_per_prompt,
         )
         total_by_prompt = total.reshape(group_shape)
         retrieval_by_prompt = retrieval.reshape(group_shape)
@@ -1891,7 +1927,7 @@ class DDPOTrainer:
                     self.fixed_step_eval_pool.prompt_count
                 ),
                 "step_eval_samples_per_prompt": float(
-                    self.config.fixed_eval_samples_per_prompt
+                    self.config.fixed_step_eval_samples_per_prompt
                 ),
                 "step_eval_seed": float(
                     self.fixed_step_eval_pool.noise_seed
@@ -1929,6 +1965,12 @@ class DDPOTrainer:
             self.data_iterator = iter(self.data_loader)
             human_motion, human_condition = next(self.data_iterator)
         human_count = human_motion.shape[0]
+        expected_human_count = self.config.humanml_prompts_per_rollout_batch
+        if human_count != expected_human_count:
+            raise RuntimeError(
+                "HumanML rollout loader returned an unexpected prompt count: "
+                f"expected={expected_human_count}, actual={human_count}."
+            )
         human_condition["y"]["target_steps"] = torch.full(
             (human_count,),
             -1,
@@ -1949,6 +1991,12 @@ class DDPOTrainer:
         except StopIteration:
             self.step_data_iterator = iter(self.step_data_loader)
             step_motion, step_condition = next(self.step_data_iterator)
+        expected_step_count = self.config.step_prompts_per_rollout_batch
+        if step_motion.shape[0] != expected_step_count:
+            raise RuntimeError(
+                "Step rollout loader returned an unexpected prompt count: "
+                f"expected={expected_step_count}, actual={step_motion.shape[0]}."
+            )
         target_frames = human_motion.shape[-1]
         if step_motion.shape[-1] > target_frames:
             step_motion = step_motion[..., :target_frames]
@@ -1997,18 +2045,31 @@ class DDPOTrainer:
         texts = list(condition["y"]["text"])
         prompt_target_steps = condition["y"]["target_steps"].long()
         prompt_step_mask = condition["y"]["step_mask"].bool()
+        prompt_sample_counts = torch.where(
+            prompt_step_mask,
+            torch.full_like(
+                prompt_target_steps,
+                self.config.step_samples_per_prompt,
+            ),
+            torch.full_like(
+                prompt_target_steps,
+                self.config.human_samples_per_prompt,
+            ),
+        )
         motion, lengths, texts, prompt_ids = repeat_prompt_batch(
             motion,
             lengths,
             texts,
-            self.config.samples_per_prompt,
+            prompt_sample_counts,
         )
-        target_steps = prompt_target_steps.repeat_interleave(
-            self.config.samples_per_prompt
-        )
-        step_mask = prompt_step_mask.repeat_interleave(
-            self.config.samples_per_prompt
-        )
+        target_steps = prompt_target_steps.repeat_interleave(prompt_sample_counts)
+        step_mask = prompt_step_mask.repeat_interleave(prompt_sample_counts)
+        if motion.shape[0] != self.config.rollout_batch_size:
+            raise RuntimeError(
+                "Mixed rollout assembly produced an unexpected motion count: "
+                f"expected={self.config.rollout_batch_size}, "
+                f"actual={motion.shape[0]}."
+            )
         motion = motion.to(
             self.device,
             dtype=torch.float32,
@@ -2754,6 +2815,19 @@ class DDPOTrainer:
             "advantage_std": advantages.std(unbiased=False).item(),
             "rollout_samples": float(len(trajectory.rewards)),
             "samples_per_prompt": float(self.config.samples_per_prompt),
+            "humanml_samples_per_prompt": float(
+                self.config.human_samples_per_prompt
+            ),
+            "step_samples_per_prompt": float(
+                self.config.step_samples_per_prompt
+            ),
+            "humanml_rollout_samples": float(
+                self.config.humanml_rollout_samples
+            ),
+            "step_motion_ratio": (
+                self.config.step_rollout_samples
+                / self.config.rollout_batch_size
+            ),
             **group_stats,
         }
         if trajectory.step_mask is not None and trajectory.step_mask.any():

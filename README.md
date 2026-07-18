@@ -90,9 +90,20 @@ reward_step = exp(-error / temperature)
 `target_steps=-1` 和 `step_mask=false`，其 step reward 严格为 0；步数样本同时保留
 retrieval、M2M 和 step reward。
 
-默认 physical rollout batch 32、每 prompt 4 motions 时，共 8 个 prompt groups：
-6 个 HumanML + 2 个 step，等价于 24:8 motion samples（3:1），接近 RFT_MLD 的
-约 3.2:1 混合比例。比例由 `--step-data-ratio` 配置并记录实际整数 prompt 数。
+默认 step 配置使用两套独立的 group size：HumanML 每条文本 `K_human=4`，step
+每条文本 `K_step=16`。`--step-data-ratio` 的语义是 **motion sample 占比**，不是
+prompt 占比；默认 0.25 时，一个完整 physical rollout batch 为 64 motions：
+
+```text
+12 HumanML prompts x 4 motions = 48
+ 1 step prompt      x 16 motions = 16
+-----------------------------------
+total                              64
+```
+
+因此 HumanML:step 仍为 3:1，同时 K=16 提高同一 step 文本内的排序信息。配置会拒绝
+无法组成完整 group 的组合，例如 `rollout_batch_size=32`、`K_step=16`、ratio=0.25，
+不会静默改变 step 占比。
 
 ## Advantage 模式
 
@@ -131,7 +142,8 @@ A      = w_ret*A_ret + w_m2m*A_m2m + step_mask*w_step*A_step
 floor 只能来自固定 `reward_calibration.json` 的 p25 或 p50，不会在 minibatch
 中动态估计。训练日志包含两个 component advantage 的 correlation、sign conflict
 fraction、各自 mean-absolute contribution 和 effective maximum scale。
-启用 step 时，step floor 来自独立的 `step_reward_calibration.json`。hard reward
+启用 step 时，step floor 来自与当前 step K 对应的独立 calibration（默认
+`step_reward_k16_calibration.json`）。hard reward
 离散且经常产生零方差 prompt group，所以 calibration 同时记录 raw quantile 和
 zero-std fraction，实际 floor 使用正方差 group 的 p25/p50，避免得到 0 floor。
 
@@ -172,7 +184,7 @@ max(early_stop_min_delta,
 ```
 
 step held-out pool 独立持久化为 `fixed_step_eval_pool.pt`，默认每个目标 8 prompts、
-每 prompt 4 motions。它记录 hard reward、exact、within-1、MAE、detected mean，以及
+每 prompt 16 motions。它记录 hard reward、exact、within-1、MAE、detected mean，以及
 步数 prompt 上的 retrieval/M2M paired delta。为避免悄然改变已有模型选择语义，
 `best_balanced.pt` 仍只由 HumanML val retrieval+M2M 决定；step 单项最佳另存为
 `best_step.pt`。
@@ -265,12 +277,12 @@ python tools/calibrate_reward_stats.py \
 ```bash
 CUDA_VISIBLE_DEVICES=7 \
 python tools/calibrate_step_reward_stats.py \
-  --output step_reward_calibration.json \
-  --pool-path artifacts/step_reward_calibration_pool.pt \
-  --samples-output artifacts/step_reward_calibration_samples.pt \
+  --output step_reward_k16_calibration.json \
+  --pool-path artifacts/step_reward_k16_calibration_pool.pt \
+  --samples-output artifacts/step_reward_k16_calibration_samples.pt \
   --prompts 384 \
-  --samples-per-prompt 4 \
-  --batch-size 32 \
+  --samples-per-prompt 16 \
+  --batch-size 64 \
   --sample-steps 50 \
   --step-targets 1,2,3,4,5,6 \
   --step-detector-backend progressive \
@@ -283,7 +295,8 @@ python tools/calibrate_step_reward_stats.py \
 生产 calibration 强制至少 256 prompts × 4 samples，并要求 prompt 数能被目标类别数
 整除，以保持分层平衡。`--allow-small-run` 只用于流程 smoke；训练端会拒绝
 `full_calibration=false`。恢复训练时还会校验 detector backend/threshold 和 reward
-mode/temperature 是否与 calibration 完全一致。
+mode/temperature 是否与 calibration 完全一致。calibration 还绑定 step K：已有的
+`step_reward_calibration.json`（K=4）不能用于新的 K=16 训练，必须按上面的命令重新生成。
 
 ## 2. 预检和 smoke test
 
@@ -382,18 +395,19 @@ REWARD_DEVICE=same \
 OUTPUT_DIR=$PWD/outputs/humanml_step_component_shrink \
 MDM_DDPO_ENABLE_STEP_REWARD=1 \
 MDM_DDPO_REWARD_CALIBRATION_PATH=$PWD/reward_calibration.json \
-MDM_DDPO_STEP_REWARD_CALIBRATION_PATH=$PWD/step_reward_calibration.json \
+MDM_DDPO_STEP_REWARD_CALIBRATION_PATH=$PWD/step_reward_k16_calibration.json \
 MDM_DDPO_FIXED_EVAL_POOL_PATH=$PWD/artifacts/humanml_val_fixed_eval_pool.pt \
-MDM_DDPO_FIXED_STEP_EVAL_POOL_PATH=$PWD/artifacts/step_val_fixed_eval_pool.pt \
+MDM_DDPO_FIXED_STEP_EVAL_POOL_PATH=$PWD/artifacts/step_val_fixed_eval_pool_k16.pt \
 MDM_DDPO_USE_SWANLAB=1 \
 MDM_DDPO_SWANLAB_PROJECT=mdm-ddpo-step \
 MDM_DDPO_SWANLAB_RUN_NAME=humanml-step-p25 \
 bash scripts/train_humanml_step.sh \
   --epochs 100 \
   --sample-steps 50 \
-  --rollout-batch-size 32 \
-  --rollout-batches-per-epoch 4 \
+  --rollout-batch-size 64 \
+  --rollout-batches-per-epoch 2 \
   --samples-per-prompt 4 \
+  --step-samples-per-prompt 16 \
   --train-batch-size 32 \
   --gradient-accumulation-steps 2 \
   --timestep-fraction 0.5 \
@@ -406,6 +420,8 @@ bash scripts/train_humanml_step.sh \
   --advantage-m2m-weight 0.375 \
   --advantage-step-weight 0.25 \
   --fixed-eval-every 5 \
+  --fixed-eval-samples-per-prompt 4 \
+  --fixed-step-eval-samples-per-prompt 16 \
   --early-stop-patience 8
 ```
 
@@ -420,7 +436,7 @@ PPO step component 梯度占比的是 `--advantage-step-weight`。
 CUDA_VISIBLE_DEVICES=7 \
 DEVICE=cuda:0 \
 REWARD_CALIBRATION_PATH=$PWD/reward_calibration.json \
-STEP_REWARD_CALIBRATION_PATH=$PWD/step_reward_calibration.json \
+STEP_REWARD_CALIBRATION_PATH=$PWD/step_reward_k16_calibration.json \
 bash scripts/run_step_reward_ablations.sh
 ```
 
@@ -523,7 +539,9 @@ bash scripts/run_anchor_seed_sweep.sh outputs/followup_sweeps/BEST_RUN
 | `--reward-calibration-path` | 固定 calibration JSON；fixed checkpoint selection 和 shrink 模式必需 |
 | `--step-reward-calibration-path` | hard-step 固定 calibration；step `component_shrink` 必需 |
 | `--enable-step-reward` | 启用 HumanML + step 混合数据与 hard reward；默认关闭 |
-| `--step-data-ratio` | 每个 rollout prompt batch 中 step prompt 的目标比例；默认 0.25 |
+| `--step-data-ratio` | 每个 rollout 中 step **motion sample** 的比例；默认 0.25 |
+| `--samples-per-prompt` | HumanML 每条文本的 rollout K；默认 4 |
+| `--step-samples-per-prompt` | step 每条文本的 rollout K；默认 16 |
 | `--step-targets` | hard label 类别，默认 `1,2,3,4,5,6` |
 | `--step-data-manifest` | RFT_MLD/Motion-Rule step pseudo-label manifest |
 | `--step-detector-backend` | `progressive`（默认）或本地 `rgdno` |
@@ -536,6 +554,7 @@ bash scripts/run_anchor_seed_sweep.sh outputs/followup_sweeps/BEST_RUN
 | `--fixed-eval-pool-path` | 跨 run 共享的精确 fixed pool；恢复时必须匹配 pool id |
 | `--fixed-eval-prompts` | 默认 128 |
 | `--fixed-eval-samples-per-prompt` | 默认 4，与 rollout K 独立 |
+| `--fixed-step-eval-samples-per-prompt` | step fixed eval 的 K；默认 16 |
 | `--fixed-eval-bootstrap-samples` | paired bootstrap 次数，默认 2000 |
 | `--advantage-mode` | `group_whiten`、`group_centered`、`group_shrink`、`component_shrink` |
 | `--advantage-std-floor-quantile` | calibration floor 的 `p25` 或 `p50` |

@@ -138,6 +138,7 @@ class StepRewardCalibration:
         *,
         detector_config: dict[str, Any],
         reward_config: dict[str, Any],
+        samples_per_prompt: int | None = None,
     ) -> None:
         if self.payload["detector"] != detector_config:
             raise ValueError(
@@ -146,6 +147,18 @@ class StepRewardCalibration:
         if self.payload["reward"] != reward_config:
             raise ValueError(
                 "Step reward calibration reward settings do not match training."
+            )
+        if (
+            samples_per_prompt is not None
+            and int(self.payload["samples_per_prompt"])
+            != int(samples_per_prompt)
+        ):
+            raise ValueError(
+                "Step reward calibration samples_per_prompt does not match "
+                "training: calibration was generated with "
+                f"K={int(self.payload['samples_per_prompt'])}, but training "
+                f"uses --step-samples-per-prompt={int(samples_per_prompt)}. "
+                "Regenerate the calibration with the training step K."
             )
 
 

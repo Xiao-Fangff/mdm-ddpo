@@ -73,12 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Calibrate fixed hard-step reward scales on the original MDM."
         )
     )
-    parser.add_argument("--output", default="step_reward_calibration.json")
+    parser.add_argument("--output", default="step_reward_k16_calibration.json")
     parser.add_argument("--pool-path", default="")
     parser.add_argument("--samples-output", default="")
     parser.add_argument("--prompts", type=int, default=384)
-    parser.add_argument("--samples-per-prompt", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--samples-per-prompt", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--sample-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=2.5)
     parser.add_argument("--ddim-eta", type=float, default=1.0)
@@ -140,6 +140,22 @@ def _validate_args(
         parser.error("--samples-per-prompt must be at least 2.")
     if args.batch_size % args.samples_per_prompt != 0:
         parser.error("--batch-size must be divisible by --samples-per-prompt.")
+    step_samples = args.batch_size * 0.25
+    if not step_samples.is_integer():
+        parser.error(
+            "--batch-size must make the fixed 25% step sample allocation an "
+            "integer."
+        )
+    if int(step_samples) % args.samples_per_prompt != 0:
+        parser.error(
+            "At --step-data-ratio=0.25, the step sample allocation in "
+            "--batch-size must be divisible by --samples-per-prompt. "
+            "For K=16 use --batch-size 64 (or another compatible size)."
+        )
+    if (args.batch_size - int(step_samples)) % 4 != 0:
+        parser.error(
+            "The remaining HumanML allocation must be divisible by its fixed K=4."
+        )
     if not args.allow_small_run and (
         args.prompts < MIN_STEP_CALIBRATION_PROMPTS
         or args.samples_per_prompt < MIN_STEP_CALIBRATION_SAMPLES_PER_PROMPT
@@ -169,10 +185,12 @@ def _build_config(args: argparse.Namespace, output: Path) -> TrainConfig:
         ddim_eta=args.ddim_eta,
         rollout_batch_size=args.batch_size,
         rollout_batches_per_epoch=1,
-        samples_per_prompt=args.samples_per_prompt,
+        samples_per_prompt=4,
+        step_samples_per_prompt=args.samples_per_prompt,
         train_batch_size=args.batch_size,
         advantage_mode="group_centered",
         fixed_eval_every=0,
+        fixed_step_eval_samples_per_prompt=args.samples_per_prompt,
         enable_step_reward=True,
         step_data_ratio=0.25,
         step_targets=args.step_targets,
@@ -325,6 +343,7 @@ def main(argv: list[str] | None = None) -> None:
         "ddim_eta": config.ddim_eta,
         "precision": config.precision,
         "step_targets": list(config.step_target_values),
+        "step_samples_per_prompt": config.step_samples_per_prompt,
     }
     payload = compute_step_reward_calibration(
         evaluation.step_reward_by_prompt,
