@@ -5,4 +5,5 @@ __pycache__/
 outputs/
 artifacts/
 reward_calibration.json
+step_reward*_calibration.json
 *.tmp

@@ -89,6 +89,45 @@ class TrainScriptTest(unittest.TestCase):
         ):
             self.assertIn(expected, result.stdout)
 
+    def test_soft_counterfactual_script_removes_step_side_objectives(self):
+        project_root = Path(__file__).resolve().parents[1]
+        with tempfile.NamedTemporaryFile() as calibration:
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "PYTHON": "/bin/echo",
+                    "MDM_DDPO_STEP_REWARD_CALIBRATION_PATH": calibration.name,
+                    "MDM_DDPO_FIXED_STEP_EVAL_POOL_PATH": "/tmp/soft-pool.pt",
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(
+                        project_root
+                        / "scripts"
+                        / "train_step_soft_counterfactual.sh"
+                    ),
+                ],
+                cwd=project_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        for expected in (
+            "--step-rollout-source synthetic",
+            "--step-samples-per-prompt 8",
+            "--step-advantage-retrieval-weight 0.0",
+            "--step-advantage-m2m-weight 0.0",
+            "--step-advantage-step-weight 1.0",
+            "--no-step-use-m2m-reward",
+            "--step-reward-mode soft_huber_exact",
+        ):
+            self.assertIn(expected, result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

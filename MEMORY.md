@@ -1,6 +1,6 @@
 # MDM-DDPO 项目记忆
 
-最后更新：2026-07-18
+最后更新：2026-07-19
 
 ## 当前实现状态
 
@@ -9,6 +9,9 @@ retrieval + M2M DDPO 稳定化已按阶段完成，外部
 
 2026-07-18 已继续加入 hard step-count DDPO；仍然只读外部仓库，不使用
 MotionRFT 的 `StepCountNet`。
+
+2026-07-19 已加入 event-level soft count、counterfactual number probe 和
+target-length 去混杂 synthetic step rollout。外部仓库仍未修改。
 
 独立提交：
 
@@ -81,9 +84,62 @@ MotionRFT 的 `StepCountNet`。
   floor 使用正方差 prompt groups 的 quantile，并保留 zero-std fraction 日志。
 - diffusion anchor 明确跳过 step pseudo-GT，仅锚定真实 HumanML3D。
 
+## Soft count 与 counterfactual 实现
+
+- `progressive_step` 的 kept/filtered candidates 会按时间聚类；每个 cluster 只取
+  lead/length/progress signed-margin confidence 的最大值，避免重复奖励同一脚踝事件。
+- soft gate 使用相对阈值 margin：
+  `sigmoid((measured-threshold)/(abs(threshold)*temperature))`；lead、length、
+  progress 默认 temperature 均为 1.0，cluster gap 为 0.15 秒。
+- 新 reward `soft_huber_exact`：
+  `-Huber((soft_count-target)/per_target_scale) + 0.15*hard_exact`。
+  per-target scale 来自原始 MDM calibration 的 soft error RMSE，训练中固定不更新。
+- 新增 reward 信息量日志：unique levels、pairwise tie fraction、nonzero advantage
+  fraction、top-1 concentration；新增 candidate count/spacing、soft-hard difference、
+  ankle velocity 高频能量及其与 reward 的相关性。
+- `--step-rollout-source synthetic` 不绑定 target-specific GT；target 与 length 独立，
+  所有 target 使用相同模板顺序和共同支持区间中的同一 length distribution。该模式
+  强制关闭 step M2M。
+- `tools/probe_step_number_conditioning.py` 固定 initial/transition noise、length、
+  template，只替换数字 1--6；报告 hard/soft target effect、length effect、text
+  embedding separability 和生成 motion 成对距离。
+- `best_step_acceptance.pt` 只有在 HumanML feasible 且 hard MAE/exact/within-one
+  三项同时改善时才更新；仍需人工确认至少三个连续 counterfactual 验证点。
+
+## Counterfactual number probe 结论
+
+正式 pool 为 24 conditions × 2 paired noises × 6 targets，共 288 motions/policy；
+pool id 为 `52127be993e53464a44b96d2524c4e382d3765b1eacbc5539f0b640b77e0bf69`。
+
+原始 MDM：
+
+```text
+hard target-count Spearman = 0.4540
+target standardized effect = 0.5247
+length standardized effect = 0.1810
+projected embed_text min RMS distance = 0.02306
+adjacent target motion RMS = 0.31483
+```
+
+因此数字 embedding 与生成结果都可区分，explicit count embedding fallback 暂不触发。
+当前根因是 count response 非线性并在约 4 步处饱和，而不是模型完全不看数字；target 2
+在去混杂 pool 上 exact 仍为 0。
+
+旧 K8 negative-L1：
+
+```text
+original: MAE=1.14236 exact=.28125 within-one=.65625 Spearman=.45403
+epoch 11: MAE=1.14583 exact=.28125 within-one=.65278 Spearman=.44934
+epoch 29: MAE=1.13542 exact=.28472 within-one=.65625 Spearman=.46389
+```
+
+epoch 29 仅 MAE `-0.00694`、exact `+0.00347`，不应继续延长旧 run 或增加 hard
+step 权重。soft temperature 0.25 时 mean `abs(soft-hard)=0.0051`，几乎退化为 hard；
+temperature 1.0 时为 0.1742，因此生产 calibration 必须按新默认重跑。
+
 ## Step reward 已完成验证
 
-- 95 个单元测试全部通过。
+- 110 个单元测试全部通过（最终提交前需再次运行并以实际计数为准）。
 - GT/reference audit（1,842 motions）显示：manifest pseudo label 可 100% 复现，
   但相对原 caption 请求步数 exact 仅 14.0%、MAE 2.61，且没有原始 target-1
   caption。step 结果必须视为 detector pseudo-count，而非已验证的真实数字控制。
@@ -105,11 +161,13 @@ MotionRFT 的 `StepCountNet`。
   `component_shrink` GPU smoke 成功；step group 恰为零方差时贡献保持 0，未出现
   非有限梯度，首次 ratio 仍为 1，checkpoint 正常保存。
 
-正式使用前需要运行：
+新的 soft-count 诊断正式使用前需要运行：
 
 ```text
-tools/calibrate_step_reward_stats.py --prompts 384 --samples-per-prompt 16 --batch-size 64
-scripts/train_humanml_step.sh
+tools/calibrate_step_reward_stats.py --prompts 384 --samples-per-prompt 8 \
+  --step-pool-source synthetic --step-reward-mode soft_huber_exact --batch-size 64
+scripts/train_step_soft_counterfactual.sh
+scripts/probe_step_counterfactual_checkpoints.sh outputs/step_k8_soft_counterfactual
 ```
 
 ## 当前推荐起点
@@ -130,20 +188,24 @@ timestep_fraction=0.5
 anchor_auto_grad_ratio=0
 ```
 
-启用 step reward 的保守起点：
+当前 count-learnability 隔离实验：
 
 ```text
-step_data_ratio=0.25
+step_data_ratio=0.5
+step_samples_per_prompt=8
+step_rollout_source=synthetic
 step_targets=1,2,3,4,5,6
 step_detector_backend=progressive
-step_reward_mode=exp
-step_reward_temperature=1.0
-step_reward_weight=0.5
-advantage weights retrieval/m2m/step=0.375/0.375/0.25
+step_reward_mode=soft_huber_exact
+HumanML advantage weights=0.5 retrieval / 0.5 M2M
+Step advantage weights=0 retrieval / 0 M2M / 1.0 step
+rollout_batches_per_epoch=4
+fixed_eval_every=2
+epochs=30, early_stop=off
 ```
 
-该配置是理论稳定化起点，不是已经由三 seed 长实验确认的最终最优配置。必须先运行
-A0–A4、follow-up 和 anchor × seed 实验。
+该配置只回答 detector count 是否可学习，不是最终多任务最优配置。先完成单 seed
+30-epoch 与 counterfactual checkpoint sequence；通过后才进行多 seed/权重回调。
 
 ## 已完成验证
 
@@ -167,8 +229,9 @@ A0–A4、follow-up 和 anchor × seed 实验。
 - 最佳配置的 anchor ratio `{0,0.1,0.2}` × seed `{42,43,44}`。
 - 三 seed 平均 retrieval、M2M、balanced score 验收。
 - 标准 HumanML baseline/candidate replication 对比。
-- K8 negative-L1 step calibration（384 prompts × 8，50 diffusion steps）。
-- K8/50% step/分类型 `0.5,0.5` vs `0.2,0,0.8` 的 30-epoch count 隔离实验。
+- K8 synthetic soft-Huber calibration（384 prompts × 8，50 diffusion steps）。
+- K8/50% step、HumanML `0.5/0.5`、step `0/0/1.0` 的 30-epoch soft-count
+  隔离实验及所有 checkpoint 的 counterfactual probe。
 - step advantage weight 最小消融 S0/S1/S2 与三个 seed 复现。
 - step exact/MAE 改善后的可视化人工审计和按 target/length 分层统计。
 
@@ -185,4 +248,9 @@ A0–A4、follow-up 和 anchor × seed 实验。
 - step pseudo labels 来自 detector 而非人工标注，存在 reward hacking 风险；
   `best_step.pt` 不能替代 `best_balanced.pt` 的 HumanML 可行性约束。
 - step count 与 clip length 有显著混杂；实现不使用 target-conditioned length oracle，
-  但正式结论仍必须按 length 分层并配合视频审计。
+  synthetic rollout/counterfactual probe 已做 target-length 解耦，但 reference fixed
+  pool 仍有混杂，正式结论必须按 length 分层并配合视频审计。
+- soft count 仍来自 detector metadata；filtered candidate margin 可能带来新的 reward
+  hacking 路径，必须审计 temporal spacing、ankle 高频能量和生成视频。
+- detector pseudo-count 尚未由人工 held-out motion 标注验证，不能直接对外称为真实
+  人类可见步数控制。
