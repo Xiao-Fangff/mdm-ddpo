@@ -57,6 +57,25 @@ TRAINING_METRIC_NAMES = {
     "step_mae": "step/mae",
     "step_detected_mean": "step/detected_mean",
     "step_target_mean": "step/target_mean",
+    "step_soft_count_mean": "step/soft_count_mean",
+    "step_soft_count_error_mean": "step/soft_count_error_mean",
+    "step_soft_count_mae": "step/soft_count_mae",
+    "step_soft_hard_count_difference_mean": (
+        "step/soft_hard_count_difference_mean"
+    ),
+    "step_raw_candidate_count_mean": "step/raw_candidate_count_mean",
+    "step_candidate_count_mean": "step/candidate_count_mean",
+    "step_candidate_spacing_mean": "step/candidate_spacing_mean",
+    "step_candidate_spacing_min_mean": "step/candidate_spacing_min_mean",
+    "step_ankle_high_frequency_ratio": (
+        "step/ankle_high_frequency_ratio"
+    ),
+    "step_reward_candidate_count_correlation": (
+        "step/reward_candidate_count_correlation"
+    ),
+    "step_reward_ankle_high_frequency_correlation": (
+        "step/reward_ankle_high_frequency_correlation"
+    ),
     "step_rollout_samples": "step/rollout_samples",
     "step_use_m2m_reward": "step/use_m2m_reward",
     "step_target_1_samples": "step/target_1_samples",
@@ -158,6 +177,24 @@ TRAINING_METRIC_NAMES = {
         "advantage/m2m_step_conflict_fraction"
     ),
     "component_advantage_step_samples": "advantage/step_samples",
+    "component_advantage_step_unique_reward_levels_mean": (
+        "advantage/step_unique_reward_levels_mean"
+    ),
+    "component_advantage_step_unique_reward_levels_median": (
+        "advantage/step_unique_reward_levels_median"
+    ),
+    "component_advantage_step_unique_reward_levels_min": (
+        "advantage/step_unique_reward_levels_min"
+    ),
+    "component_advantage_step_pairwise_reward_tie_fraction": (
+        "advantage/step_pairwise_reward_tie_fraction"
+    ),
+    "component_advantage_step_nonzero_advantage_sample_fraction": (
+        "advantage/step_nonzero_advantage_sample_fraction"
+    ),
+    "component_advantage_step_top1_advantage_concentration": (
+        "advantage/step_top1_advantage_concentration"
+    ),
     "advantage_mean": "ppo/advantage_mean",
     "advantage_std": "ppo/advantage_std",
     "loss": "ppo/loss",
@@ -262,6 +299,17 @@ TRAINING_METRIC_NAMES = {
     "eval_is_best_retrieval": "eval/is_best_retrieval",
     "eval_is_best_m2m": "eval/is_best_m2m",
     "eval_is_best_step": "step_eval/is_best_step",
+    "eval_step_acceptance": "step_eval/acceptance",
+    "eval_step_acceptance_score": "step_eval/acceptance_score",
+    "eval_is_best_step_acceptance": (
+        "step_eval/is_best_acceptance"
+    ),
+    "eval_best_step_acceptance_score": (
+        "step_eval/best_acceptance_score"
+    ),
+    "eval_best_step_acceptance_epoch": (
+        "step_eval/best_acceptance_epoch"
+    ),
     "eval_best_balanced_score": "eval/best_balanced_score",
     "eval_best_balanced_epoch": "eval/best_balanced_epoch",
     "eval_best_retrieval_delta": "eval/best_retrieval_delta",
@@ -277,6 +325,17 @@ TRAINING_METRIC_NAMES = {
     "step_eval_reward_std": "step_eval/reward_std",
     "step_eval_detected_mean": "step_eval/detected_mean",
     "step_eval_target_mean": "step_eval/target_mean",
+    "step_eval_soft_count_mean": "step_eval/soft_count_mean",
+    "step_eval_soft_count_error_mean": "step_eval/soft_count_error_mean",
+    "step_eval_soft_count_mae": "step_eval/soft_count_mae",
+    "step_eval_soft_hard_count_difference_mean": (
+        "step_eval/soft_hard_count_difference_mean"
+    ),
+    "step_eval_candidate_count_mean": "step_eval/candidate_count_mean",
+    "step_eval_candidate_spacing_mean": "step_eval/candidate_spacing_mean",
+    "step_eval_ankle_high_frequency_ratio": (
+        "step_eval/ankle_high_frequency_ratio"
+    ),
     "step_eval_samples": "step_eval/samples",
     "step_eval_prompts": "step_eval/prompts",
     "step_eval_samples_per_prompt": "step_eval/samples_per_prompt",
@@ -312,6 +371,19 @@ TRAINING_METRIC_NAMES = {
     ),
     "eval_step_detected_mean": "step_eval/detected_mean_per_prompt",
     "eval_step_detected_mean_delta": "step_eval/detected_mean_delta",
+    "eval_step_soft_count": "step_eval/soft_count",
+    "eval_step_soft_count_delta": "step_eval/soft_count_delta",
+    "eval_step_soft_error_mean": "step_eval/soft_error_mean",
+    "eval_step_soft_error_mean_delta": "step_eval/soft_error_mean_delta",
+    "eval_step_soft_mae": "step_eval/soft_mae",
+    "eval_step_soft_mae_delta": "step_eval/soft_mae_delta",
+    "eval_step_candidate_count_delta": "step_eval/candidate_count_delta",
+    "eval_step_candidate_spacing_delta": (
+        "step_eval/candidate_spacing_delta"
+    ),
+    "eval_step_ankle_high_frequency_ratio_delta": (
+        "step_eval/ankle_high_frequency_ratio_delta"
+    ),
     "eval_normalized_step_delta": "step_eval/normalized_reward_delta",
 }
 

@@ -10,6 +10,10 @@ import torch
 
 from mdm_ddpo.step_data import (
     BalancedStepTargetSampler,
+    BalancedSyntheticStepSampler,
+    StepSampleRecord,
+    create_synthetic_fixed_step_eval_pool,
+    create_synthetic_step_records,
     StepMotionDataset,
     create_fixed_step_eval_pool,
     load_fixed_step_eval_pool,
@@ -80,6 +84,54 @@ class StepDataTest(unittest.TestCase):
             max(first_window_counts.values()) - min(first_window_counts.values()),
             1,
         )
+
+    def test_synthetic_step_records_cross_targets_with_identical_lengths(self):
+        records = [
+            StepSampleRecord(
+                manifest_index=target * 10 + slot,
+                sample_id=f"t{target}-{slot}",
+                target_steps=target,
+                feature_path=Path("unused.npy"),
+                length=length,
+            )
+            for target in (1, 2, 3)
+            for slot, length in enumerate((40, 50, 60, 70))
+        ]
+
+        synthetic, interval = create_synthetic_step_records(
+            records,
+            targets=(1, 2, 3),
+            seed=11,
+            samples_per_target=4,
+        )
+        lengths = {
+            target: [item.length for item in synthetic if item.target_steps == target]
+            for target in (1, 2, 3)
+        }
+
+        self.assertEqual(interval, (40, 70))
+        self.assertEqual(lengths[1], lengths[2])
+        self.assertEqual(lengths[2], lengths[3])
+        pool = create_synthetic_fixed_step_eval_pool(
+            synthetic,
+            max_frames=80,
+            noise_seed=7,
+            detector_backend="progressive",
+        )
+        self.assertEqual(pool.split, "synthetic")
+        self.assertEqual(pool.motion.abs().sum().item(), 0.0)
+
+        sampler = BalancedSyntheticStepSampler(
+            synthetic,
+            generator=torch.Generator().manual_seed(13),
+        )
+        first_block = [synthetic[index] for index in list(sampler)[:3]]
+        self.assertEqual(
+            {record.target_steps for record in first_block},
+            {1, 2, 3},
+        )
+        self.assertEqual(len({record.length for record in first_block}), 1)
+        self.assertEqual(len({record.template_slot for record in first_block}), 1)
 
     def test_manifest_split_is_stratified_disjoint_and_reproducible(self):
         with tempfile.TemporaryDirectory() as directory:

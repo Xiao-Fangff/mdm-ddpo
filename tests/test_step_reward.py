@@ -11,6 +11,7 @@ from mdm_ddpo.step_reward import (
     HardStepDetector,
     compute_step_count_reward,
     rgdno_hard_step_count,
+    temporal_clustered_soft_count,
 )
 
 
@@ -106,6 +107,108 @@ class HardStepRewardTest(unittest.TestCase):
             mode="exact",
         )
         self.assertEqual(output.reward.tolist(), [1.0, 0.0, 0.0])
+
+    def test_temporal_soft_count_clusters_candidates_and_uses_margins(self):
+        def candidate(frame, *, kept, lead, length, progress):
+            return {
+                "foot": "l_foot",
+                "start": frame - 2,
+                "end": frame,
+                "key_frame": frame,
+                "lead_margin_measured": lead,
+                "min_lead_margin": 1.0,
+                "swing_foot_forward_delta": length,
+                "min_step_length": 1.0,
+                "root_forward_delta": progress,
+                "min_root_progress": 1.0,
+                "root_progress_gate_applied": True,
+                "min_global_root_progress": None,
+                **({"reason_kept": "verified"} if kept else {"reason_filtered": "margin"}),
+            }
+
+        kept = SimpleNamespace(
+            start=8,
+            end=10,
+            key_frame=10,
+            meta=candidate(
+                10,
+                kept=True,
+                lead=2.0,
+                length=2.0,
+                progress=2.0,
+            ),
+        )
+        track = SimpleNamespace(
+            instances=[[kept]],
+            meta={
+                "filtered_candidates": [[
+                    candidate(11, kept=False, lead=0.9, length=2.0, progress=2.0),
+                    candidate(30, kept=False, lead=1.0, length=1.0, progress=1.0),
+                ]]
+            },
+        )
+
+        soft, raw, clusters, spacing_mean, spacing_min = (
+            temporal_clustered_soft_count(
+                track,
+                fps=20,
+                cluster_gap_seconds=0.15,
+                lead_temperature=0.25,
+                length_temperature=0.25,
+                progress_temperature=0.25,
+            )
+        )
+
+        self.assertEqual(raw, 3)
+        self.assertEqual(clusters, 2)
+        self.assertGreater(soft, 1.0)
+        self.assertLess(soft, 1.2)
+        self.assertEqual(spacing_mean, spacing_min)
+        self.assertGreater(spacing_min, 0.5)
+
+    def test_soft_huber_reward_combines_continuous_error_and_hard_exact(self):
+        output = compute_step_count_reward(
+            torch.tensor([2, 3]),
+            torch.tensor([2, 2]),
+            soft_count=torch.tensor([2.5, 3.0]),
+            target_scale=torch.tensor([1.0, 2.0]),
+            mode="soft_huber_exact",
+            huber_delta=1.0,
+            exact_bonus=0.2,
+        )
+
+        torch.testing.assert_close(
+            output.reward,
+            torch.tensor([0.075, -0.125]),
+        )
+        torch.testing.assert_close(output.soft_error, torch.tensor([0.5, 1.0]))
+
+    def test_soft_huber_distinguishes_actions_with_the_same_hard_count(self):
+        output = compute_step_count_reward(
+            torch.tensor([4, 4, 4, 4]),
+            torch.tensor([2, 2, 2, 2]),
+            soft_count=torch.tensor([3.7, 3.8, 3.9, 4.0]),
+            target_scale=1.0,
+            mode="soft_huber_exact",
+        )
+
+        self.assertEqual(torch.unique(output.reward).numel(), 4)
+
+    def test_detector_reports_high_frequency_ankle_jitter(self):
+        smooth = torch.zeros(40, 22, 3)
+        smooth[:, 7, 0] = torch.linspace(0.0, 1.0, 40)
+        jitter = smooth.clone()
+        jitter[:, 7, 0] += 0.1 * torch.tensor(
+            [(-1.0) ** frame for frame in range(40)]
+        )
+        detector = HardStepDetector(backend="rgdno")
+
+        output = detector.detect_xyz(torch.stack([smooth, jitter]))
+
+        self.assertLess(
+            output.ankle_high_frequency_ratio[0].item(),
+            output.ankle_high_frequency_ratio[1].item(),
+        )
 
 
 if __name__ == "__main__":

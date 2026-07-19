@@ -55,6 +55,8 @@ class TrainConfig:
     pin_memory: bool = True
     enable_step_reward: bool = False
     step_data_ratio: float = 0.25
+    step_rollout_source: str = "reference"
+    step_synthetic_seed: int = 20260719
     step_targets: str = "1,2,3,4,5,6"
     step_split_seed: int = 20260600
     step_prompt_seed: int = 20260612
@@ -123,6 +125,14 @@ class TrainConfig:
     step_detector_fps: int = 20
     step_detector_lead_threshold: float = 0.138
     step_detector_rgdno_threshold: float = 0.005
+    step_soft_lead_temperature: float = 1.0
+    step_soft_length_temperature: float = 1.0
+    step_soft_progress_temperature: float = 1.0
+    step_soft_cluster_gap_seconds: float = 0.15
+    step_ankle_high_frequency_cutoff_hz: float = 4.0
+    step_soft_huber_delta: float = 1.0
+    step_soft_exact_bonus: float = 0.15
+    step_soft_target_scale_floor: float = 0.25
     reward_embedding_mode: str = "mean"
 
     fixed_eval_every: int = 5
@@ -149,6 +159,7 @@ class TrainConfig:
     swanlab_log_dir: str = ""
     preflight: bool = False
     dry_run: bool = False
+    allow_uncalibrated_soft_step_reward: bool = False
 
     def validate(self) -> None:
         if self.dataset != "humanml":
@@ -285,6 +296,18 @@ class TrainConfig:
                     "--reward-calibration-path."
                 )
         if self.enable_step_reward:
+            if self.step_rollout_source not in {"reference", "synthetic"}:
+                raise ValueError(
+                    "--step-rollout-source must be reference or synthetic."
+                )
+            if (
+                self.step_rollout_source == "synthetic"
+                and self.step_use_m2m_reward
+            ):
+                raise ValueError(
+                    "Synthetic step rollouts have no target-specific GT "
+                    "motion; use --no-step-use-m2m-reward."
+                )
             if not 0 < self.step_data_ratio < 1:
                 raise ValueError("--step-data-ratio must be in (0,1).")
             requested_step_samples = (
@@ -362,9 +385,28 @@ class TrainConfig:
                 "linear",
                 "exact",
                 "negative_l1",
+                "soft_huber_exact",
             }:
                 raise ValueError(
-                    "--step-reward-mode must be exp, linear, exact, or negative_l1."
+                    "--step-reward-mode must be exp, linear, exact, "
+                    "negative_l1, or soft_huber_exact."
+                )
+            if (
+                self.step_reward_mode == "soft_huber_exact"
+                and self.step_detector_backend != "progressive"
+            ):
+                raise ValueError(
+                    "soft_huber_exact requires the progressive detector "
+                    "metadata backend."
+                )
+            if (
+                self.step_reward_mode == "soft_huber_exact"
+                and not self.step_reward_calibration_path
+                and not self.allow_uncalibrated_soft_step_reward
+            ):
+                raise ValueError(
+                    "soft_huber_exact requires --step-reward-calibration-path "
+                    "for immutable per-target scales."
                 )
             if self.step_detector_fps <= 0:
                 raise ValueError("--step-detector-fps must be positive.")
@@ -373,9 +415,30 @@ class TrainConfig:
                 "step_reward_linear_tolerance",
                 "step_detector_lead_threshold",
                 "step_detector_rgdno_threshold",
+                "step_soft_lead_temperature",
+                "step_soft_length_temperature",
+                "step_soft_progress_temperature",
+                "step_soft_cluster_gap_seconds",
+                "step_ankle_high_frequency_cutoff_hz",
+                "step_soft_huber_delta",
+                "step_soft_target_scale_floor",
             ):
-                if getattr(self, name) <= 0:
+                value = float(getattr(self, name))
+                if not math.isfinite(value) or value <= 0:
                     raise ValueError(f"--{name.replace('_', '-')} must be positive.")
+            if (
+                self.step_ankle_high_frequency_cutoff_hz
+                >= self.step_detector_fps / 2
+            ):
+                raise ValueError(
+                    "--step-ankle-high-frequency-cutoff-hz must be below "
+                    "the detector Nyquist frequency."
+                )
+            if (
+                not math.isfinite(self.step_soft_exact_bonus)
+                or self.step_soft_exact_bonus < 0
+            ):
+                raise ValueError("--step-soft-exact-bonus cannot be negative.")
             if self.step_reward_weight < 0:
                 raise ValueError("--step-reward-weight cannot be negative.")
         if (
@@ -567,19 +630,47 @@ class TrainConfig:
         )
 
     def step_detector_config(self) -> dict[str, Any]:
-        return {
+        output: dict[str, Any] = {
             "backend": self.step_detector_backend,
             "fps": int(self.step_detector_fps),
             "lead_threshold": float(self.step_detector_lead_threshold),
             "rgdno_threshold": float(self.step_detector_rgdno_threshold),
         }
+        if self.step_reward_mode == "soft_huber_exact":
+            output["soft"] = {
+                "lead_temperature": float(self.step_soft_lead_temperature),
+                "length_temperature": float(
+                    self.step_soft_length_temperature
+                ),
+                "progress_temperature": float(
+                    self.step_soft_progress_temperature
+                ),
+                "cluster_gap_seconds": float(
+                    self.step_soft_cluster_gap_seconds
+                ),
+                "ankle_high_frequency_cutoff_hz": float(
+                    self.step_ankle_high_frequency_cutoff_hz
+                ),
+            }
+        return output
 
     def step_reward_config(self) -> dict[str, Any]:
-        return {
+        output: dict[str, Any] = {
             "mode": self.step_reward_mode,
             "temperature": float(self.step_reward_temperature),
             "linear_tolerance": float(self.step_reward_linear_tolerance),
         }
+        if self.step_reward_mode == "soft_huber_exact":
+            output.update(
+                {
+                    "huber_delta": float(self.step_soft_huber_delta),
+                    "exact_bonus": float(self.step_soft_exact_bonus),
+                    "target_scale_floor": float(
+                        self.step_soft_target_scale_floor
+                    ),
+                }
+            )
+        return output
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -679,6 +770,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
     )
     data.add_argument("--step-data-ratio", type=float, default=0.25)
+    data.add_argument(
+        "--step-rollout-source",
+        choices=["reference", "synthetic"],
+        default="reference",
+        help=(
+            "Use pseudo-labelled reference motions or target/length-"
+            "independent synthetic step conditions."
+        ),
+    )
+    data.add_argument("--step-synthetic-seed", type=int, default=20260719)
     data.add_argument("--step-targets", default="1,2,3,4,5,6")
     data.add_argument("--step-split-seed", type=int, default=20260600)
     data.add_argument("--step-prompt-seed", type=int, default=20260612)
@@ -908,7 +1009,13 @@ def build_parser() -> argparse.ArgumentParser:
     reward.add_argument("--step-reward-weight", type=float, default=0.5)
     reward.add_argument(
         "--step-reward-mode",
-        choices=["exp", "linear", "exact", "negative_l1"],
+        choices=[
+            "exp",
+            "linear",
+            "exact",
+            "negative_l1",
+            "soft_huber_exact",
+        ],
         default="exp",
     )
     reward.add_argument("--step-reward-temperature", type=float, default=1.0)
@@ -932,6 +1039,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--step-detector-rgdno-threshold",
         type=float,
         default=0.005,
+    )
+    reward.add_argument("--step-soft-lead-temperature", type=float, default=1.0)
+    reward.add_argument("--step-soft-length-temperature", type=float, default=1.0)
+    reward.add_argument(
+        "--step-soft-progress-temperature",
+        type=float,
+        default=1.0,
+    )
+    reward.add_argument(
+        "--step-soft-cluster-gap-seconds",
+        type=float,
+        default=0.15,
+    )
+    reward.add_argument(
+        "--step-ankle-high-frequency-cutoff-hz",
+        type=float,
+        default=4.0,
+    )
+    reward.add_argument("--step-soft-huber-delta", type=float, default=1.0)
+    reward.add_argument("--step-soft-exact-bonus", type=float, default=0.15)
+    reward.add_argument(
+        "--step-soft-target-scale-floor",
+        type=float,
+        default=0.25,
     )
     reward.add_argument(
         "--reward-embedding-mode",

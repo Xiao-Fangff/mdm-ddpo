@@ -40,12 +40,27 @@ RGDNO_HARD_THRESHOLD = 0.005
 
 
 @dataclass(frozen=True)
+class StepDetectionOutput:
+    """Hard count plus event-level continuous detector diagnostics."""
+
+    hard_count: torch.Tensor
+    soft_count: torch.Tensor
+    raw_candidate_count: torch.Tensor
+    candidate_count: torch.Tensor
+    candidate_spacing_mean: torch.Tensor
+    candidate_spacing_min: torch.Tensor
+    ankle_high_frequency_ratio: torch.Tensor
+
+
+@dataclass(frozen=True)
 class StepRewardOutput:
     reward: torch.Tensor
     detected_steps: torch.Tensor
     target_steps: torch.Tensor
     mask: torch.Tensor
     absolute_error: torch.Tensor
+    soft_count: torch.Tensor | None = None
+    soft_error: torch.Tensor | None = None
 
     @property
     def exact(self) -> torch.Tensor:
@@ -121,6 +136,208 @@ def _transition_count(binary: torch.Tensor) -> torch.Tensor:
     return torch.maximum(one_to_zero, zero_to_one)
 
 
+def _finite_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        resolved = float(value)
+    except (TypeError, ValueError):
+        return None
+    return resolved if math.isfinite(resolved) else None
+
+
+def _margin_gate(
+    measured: Any,
+    threshold: Any,
+    *,
+    temperature: float,
+) -> float | None:
+    measured_value = _finite_float(measured)
+    threshold_value = _finite_float(threshold)
+    if measured_value is None or threshold_value is None:
+        return None
+    denominator = max(abs(threshold_value), 1.0e-6) * temperature
+    normalized_margin = (measured_value - threshold_value) / denominator
+    # Avoid overflow while retaining an effectively hard tail.
+    normalized_margin = max(-30.0, min(30.0, normalized_margin))
+    return 1.0 / (1.0 + math.exp(-normalized_margin))
+
+
+def _candidate_confidence(
+    candidate: dict[str, Any],
+    *,
+    lead_temperature: float,
+    length_temperature: float,
+    progress_temperature: float,
+) -> float:
+    gates: list[float] = []
+    for measured_name, threshold_name, temperature in (
+        (
+            "lead_margin_measured",
+            "min_lead_margin",
+            lead_temperature,
+        ),
+        (
+            "swing_foot_forward_delta",
+            "min_step_length",
+            length_temperature,
+        ),
+    ):
+        gate = _margin_gate(
+            candidate.get(measured_name),
+            candidate.get(threshold_name),
+            temperature=temperature,
+        )
+        if gate is not None:
+            gates.append(gate)
+
+    if bool(candidate.get("root_progress_gate_applied", False)):
+        gate = _margin_gate(
+            candidate.get("root_forward_delta"),
+            candidate.get("min_root_progress"),
+            temperature=progress_temperature,
+        )
+        if gate is not None:
+            gates.append(gate)
+
+    if candidate.get("min_global_root_progress") is not None:
+        gate = _margin_gate(
+            candidate.get("global_root_forward_delta"),
+            candidate.get("min_global_root_progress"),
+            temperature=progress_temperature,
+        )
+        if gate is not None:
+            gates.append(gate)
+
+    if not gates:
+        return 1.0 if candidate.get("reason_kept") else 0.0
+    confidence = 1.0
+    for gate in gates:
+        confidence *= gate
+    return float(max(0.0, min(1.0, confidence)))
+
+
+def _candidate_payload(instance: Any) -> dict[str, Any]:
+    if isinstance(instance, dict):
+        return dict(instance)
+    metadata = dict(getattr(instance, "meta", {}) or {})
+    for name in ("start", "end", "key_frame"):
+        if name not in metadata and hasattr(instance, name):
+            metadata[name] = getattr(instance, name)
+    metadata.setdefault("reason_kept", "progressive_step_verified")
+    return metadata
+
+
+def _candidate_frame(candidate: dict[str, Any]) -> int | None:
+    for name in ("key_frame", "landing_frame", "start", "end"):
+        value = _finite_float(candidate.get(name))
+        if value is not None:
+            return int(round(value))
+    return None
+
+
+def temporal_clustered_soft_count(
+    track: Any,
+    *,
+    fps: int,
+    cluster_gap_seconds: float,
+    lead_temperature: float,
+    length_temperature: float,
+    progress_temperature: float,
+) -> tuple[float, int, int, float, float]:
+    """Convert progressive-step metadata into a jitter-resistant soft count.
+
+    Kept and filtered candidates are clustered on the time axis.  Every
+    cluster contributes only its maximum signed-margin confidence, preventing
+    several near-identical ankle events from being rewarded multiple times.
+    """
+
+    instances_by_batch = getattr(track, "instances", [[]])
+    kept = list(instances_by_batch[0]) if instances_by_batch else []
+    metadata = dict(getattr(track, "meta", {}) or {})
+    filtered_by_batch = metadata.get("filtered_candidates", [[]])
+    filtered = list(filtered_by_batch[0]) if filtered_by_batch else []
+    hard_count = len(kept)
+
+    candidates = [_candidate_payload(value) for value in kept]
+    candidates.extend(_candidate_payload(value) for value in filtered)
+    by_identity: dict[tuple[Any, ...], tuple[int, float]] = {}
+    for candidate in candidates:
+        frame = _candidate_frame(candidate)
+        if frame is None:
+            continue
+        confidence = _candidate_confidence(
+            candidate,
+            lead_temperature=lead_temperature,
+            length_temperature=length_temperature,
+            progress_temperature=progress_temperature,
+        )
+        identity = (
+            candidate.get("foot"),
+            candidate.get("start"),
+            candidate.get("end"),
+            frame,
+        )
+        previous = by_identity.get(identity)
+        if previous is None or confidence > previous[1]:
+            by_identity[identity] = (frame, confidence)
+
+    events = sorted(by_identity.values(), key=lambda item: item[0])
+    if not events:
+        # Test doubles and legacy Motion-Rule tracks may expose only instances.
+        return float(hard_count), hard_count, hard_count, 0.0, 0.0
+
+    gap_frames = max(1, int(round(cluster_gap_seconds * fps)))
+    clusters: list[list[tuple[int, float]]] = []
+    for event in events:
+        if not clusters or event[0] - clusters[-1][-1][0] > gap_frames:
+            clusters.append([event])
+        else:
+            clusters[-1].append(event)
+    representatives = [max(cluster, key=lambda item: item[1]) for cluster in clusters]
+    soft_count = sum(confidence for _, confidence in representatives)
+    frames = [frame for frame, _ in representatives]
+    spacings = [
+        (later - earlier) / float(fps)
+        for earlier, later in zip(frames, frames[1:])
+    ]
+    spacing_mean = sum(spacings) / len(spacings) if spacings else 0.0
+    spacing_min = min(spacings) if spacings else 0.0
+    return (
+        float(soft_count),
+        len(events),
+        len(clusters),
+        float(spacing_mean),
+        float(spacing_min),
+    )
+
+
+def _ankle_high_frequency_ratio(
+    joints: torch.Tensor,
+    *,
+    fps: int,
+    cutoff_hz: float,
+) -> torch.Tensor:
+    """Fraction of ankle-velocity spectrum above a gait-safe cutoff."""
+
+    if joints.shape[0] < 4:
+        return torch.zeros((), device=joints.device, dtype=torch.float32)
+    velocity = joints[1:, (7, 8)].float() - joints[:-1, (7, 8)].float()
+    spectrum = torch.fft.rfft(velocity, dim=0)
+    energy = spectrum.abs().square().sum(dim=(1, 2))
+    frequencies = torch.fft.rfftfreq(
+        velocity.shape[0],
+        d=1.0 / float(fps),
+        device=velocity.device,
+    )
+    # Exclude DC, which represents sustained translation rather than jitter.
+    active = frequencies > 0
+    denominator = energy[active].sum()
+    if denominator <= 0:
+        return torch.zeros((), device=joints.device, dtype=torch.float32)
+    return energy[frequencies >= cutoff_hz].sum().div(denominator).float()
+
+
 def rgdno_hard_step_count(
     joints: torch.Tensor,
     lengths: Sequence[int] | torch.Tensor | None = None,
@@ -188,6 +405,11 @@ class HardStepDetector:
         motion_rule_root: str = "",
         lead_threshold: float = 0.138,
         rgdno_threshold: float = RGDNO_HARD_THRESHOLD,
+        soft_lead_temperature: float = 1.0,
+        soft_length_temperature: float = 1.0,
+        soft_progress_temperature: float = 1.0,
+        soft_cluster_gap_seconds: float = 0.15,
+        ankle_high_frequency_cutoff_hz: float = 4.0,
         progressive_detector: Callable[..., Any] | None = None,
         motion_batch_factory: Callable[..., Any] | None = None,
     ) -> None:
@@ -201,11 +423,31 @@ class HardStepDetector:
             raise ValueError("Progressive lead threshold must be positive.")
         if rgdno_threshold <= 0 or not math.isfinite(rgdno_threshold):
             raise ValueError("RG-DNO threshold must be positive.")
+        for name, value in (
+            ("soft lead temperature", soft_lead_temperature),
+            ("soft length temperature", soft_length_temperature),
+            ("soft progress temperature", soft_progress_temperature),
+            ("soft cluster gap", soft_cluster_gap_seconds),
+            ("ankle high-frequency cutoff", ankle_high_frequency_cutoff_hz),
+        ):
+            if value <= 0 or not math.isfinite(value):
+                raise ValueError(f"Step detector {name} must be positive.")
+        if ankle_high_frequency_cutoff_hz >= fps / 2:
+            raise ValueError(
+                "Ankle high-frequency cutoff must be below the Nyquist rate."
+            )
         self.backend = backend
         self.fps = int(fps)
         self.motion_rule_root = str(motion_rule_root)
         self.lead_threshold = float(lead_threshold)
         self.rgdno_threshold = float(rgdno_threshold)
+        self.soft_lead_temperature = float(soft_lead_temperature)
+        self.soft_length_temperature = float(soft_length_temperature)
+        self.soft_progress_temperature = float(soft_progress_temperature)
+        self.soft_cluster_gap_seconds = float(soft_cluster_gap_seconds)
+        self.ankle_high_frequency_cutoff_hz = float(
+            ankle_high_frequency_cutoff_hz
+        )
         self._progressive_detector = progressive_detector
         self._motion_batch_factory = motion_batch_factory
 
@@ -252,23 +494,53 @@ class HardStepDetector:
         return progressive_step, factory
 
     @torch.no_grad()
-    def count_xyz(
+    def detect_xyz(
         self,
         joints: torch.Tensor,
         lengths: Sequence[int] | torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> StepDetectionOutput:
         batch = _as_joint_batch(joints)
+        resolved_lengths = _resolve_lengths(
+            batch,
+            lengths,
+            minimum=(RGDNO_MIN_FRAMES if self.backend == "rgdno" else 1),
+        )
+        high_frequency = torch.stack(
+            [
+                _ankle_high_frequency_ratio(
+                    sample[:length],
+                    fps=self.fps,
+                    cutoff_hz=self.ankle_high_frequency_cutoff_hz,
+                )
+                for sample, length in zip(batch, resolved_lengths)
+            ]
+        ).to(device=batch.device, dtype=torch.float32)
         if self.backend == "rgdno":
-            return rgdno_hard_step_count(
+            hard = rgdno_hard_step_count(
                 batch,
-                lengths,
+                resolved_lengths,
                 threshold=self.rgdno_threshold,
             ).to(device=batch.device)
+            values = hard.float()
+            zeros = torch.zeros_like(values)
+            return StepDetectionOutput(
+                hard_count=hard,
+                soft_count=values,
+                raw_candidate_count=hard.clone(),
+                candidate_count=hard.clone(),
+                candidate_spacing_mean=zeros,
+                candidate_spacing_min=zeros,
+                ankle_high_frequency_ratio=high_frequency,
+            )
 
-        resolved_lengths = _resolve_lengths(batch, lengths)
         detector, batch_factory = self._load_progressive_backend()
         xyz = batch.detach().float().cpu().numpy()
         counts: list[int] = []
+        soft_counts: list[float] = []
+        raw_candidate_counts: list[int] = []
+        candidate_counts: list[int] = []
+        spacing_means: list[float] = []
+        spacing_mins: list[float] = []
         for sample_index, length in enumerate(resolved_lengths):
             motion_batch = batch_factory(
                 xyz[sample_index : sample_index + 1, :length],
@@ -282,8 +554,64 @@ class HardStepDetector:
                 step_candidate_source="lead_offsets",
                 lead_threshold=self.lead_threshold,
             )
-            counts.append(len(track.instances[0]))
-        return torch.tensor(counts, device=batch.device, dtype=torch.long)
+            hard_count = len(track.instances[0])
+            soft_count, raw_count, cluster_count, spacing_mean, spacing_min = (
+                temporal_clustered_soft_count(
+                    track,
+                    fps=self.fps,
+                    cluster_gap_seconds=self.soft_cluster_gap_seconds,
+                    lead_temperature=self.soft_lead_temperature,
+                    length_temperature=self.soft_length_temperature,
+                    progress_temperature=self.soft_progress_temperature,
+                )
+            )
+            counts.append(hard_count)
+            soft_counts.append(soft_count)
+            raw_candidate_counts.append(raw_count)
+            candidate_counts.append(cluster_count)
+            spacing_means.append(spacing_mean)
+            spacing_mins.append(spacing_min)
+        return StepDetectionOutput(
+            hard_count=torch.tensor(
+                counts,
+                device=batch.device,
+                dtype=torch.long,
+            ),
+            soft_count=torch.tensor(
+                soft_counts,
+                device=batch.device,
+                dtype=torch.float32,
+            ),
+            raw_candidate_count=torch.tensor(
+                raw_candidate_counts,
+                device=batch.device,
+                dtype=torch.long,
+            ),
+            candidate_count=torch.tensor(
+                candidate_counts,
+                device=batch.device,
+                dtype=torch.long,
+            ),
+            candidate_spacing_mean=torch.tensor(
+                spacing_means,
+                device=batch.device,
+                dtype=torch.float32,
+            ),
+            candidate_spacing_min=torch.tensor(
+                spacing_mins,
+                device=batch.device,
+                dtype=torch.float32,
+            ),
+            ankle_high_frequency_ratio=high_frequency,
+        )
+
+    @torch.no_grad()
+    def count_xyz(
+        self,
+        joints: torch.Tensor,
+        lengths: Sequence[int] | torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.detect_xyz(joints, lengths).hard_count
 
     @torch.no_grad()
     def count_normalized(
@@ -301,6 +629,22 @@ class HardStepDetector:
         )
         return self.count_xyz(joints, lengths)
 
+    @torch.no_grad()
+    def detect_normalized(
+        self,
+        normalized_motion: torch.Tensor,
+        lengths: Sequence[int] | torch.Tensor,
+        *,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+    ) -> StepDetectionOutput:
+        joints = recover_humanml263_joints(
+            normalized_motion,
+            mean=mean,
+            std=std,
+        )
+        return self.detect_xyz(joints, lengths)
+
 
 def compute_step_count_reward(
     detected_steps: torch.Tensor,
@@ -310,8 +654,12 @@ def compute_step_count_reward(
     mode: str = "exp",
     temperature: float = 1.0,
     linear_tolerance: float = 3.0,
+    soft_count: torch.Tensor | None = None,
+    target_scale: torch.Tensor | float | None = None,
+    huber_delta: float = 1.0,
+    exact_bonus: float = 0.15,
 ) -> StepRewardOutput:
-    """Turn integer hard-detector counts into a bounded terminal reward."""
+    """Turn hard/soft detector counts into a masked terminal reward."""
     detected = torch.as_tensor(detected_steps).reshape(-1).long()
     target = torch.as_tensor(
         target_steps,
@@ -345,9 +693,48 @@ def compute_step_count_reward(
         if temperature <= 0 or not math.isfinite(temperature):
             raise ValueError("Step reward temperature must be positive.")
         reward = -error / float(temperature)
+    elif mode == "soft_huber_exact":
+        if soft_count is None or target_scale is None:
+            raise ValueError(
+                "soft_huber_exact requires soft_count and calibrated "
+                "target_scale values."
+            )
+        if huber_delta <= 0 or not math.isfinite(huber_delta):
+            raise ValueError("Soft step Huber delta must be positive.")
+        if exact_bonus < 0 or not math.isfinite(exact_bonus):
+            raise ValueError("Soft step exact bonus cannot be negative.")
+        resolved_soft_count = torch.as_tensor(
+            soft_count,
+            device=detected.device,
+            dtype=torch.float32,
+        ).reshape(-1)
+        if resolved_soft_count.shape != target.shape:
+            raise ValueError("Soft count must match detected step tensors.")
+        resolved_scale = torch.as_tensor(
+            target_scale,
+            device=detected.device,
+            dtype=torch.float32,
+        )
+        if resolved_scale.ndim == 0:
+            resolved_scale = resolved_scale.expand_as(resolved_soft_count)
+        else:
+            resolved_scale = resolved_scale.reshape(-1)
+        if resolved_scale.shape != target.shape:
+            raise ValueError("Target scales must be scalar or match targets.")
+        if not torch.isfinite(resolved_scale).all() or (resolved_scale <= 0).any():
+            raise ValueError("Target scales must be finite and positive.")
+        normalized = (resolved_soft_count - target.float()) / resolved_scale
+        absolute_normalized = normalized.abs()
+        huber = torch.where(
+            absolute_normalized <= huber_delta,
+            0.5 * normalized.square(),
+            huber_delta * (absolute_normalized - 0.5 * huber_delta),
+        )
+        reward = -huber + float(exact_bonus) * (absolute_error == 0).float()
     else:
         raise ValueError(
-            "Step reward mode must be exp, linear, exact, or negative_l1."
+            "Step reward mode must be exp, linear, exact, negative_l1, or "
+            "soft_huber_exact."
         )
     reward = torch.where(resolved_mask, reward, torch.zeros_like(reward))
     return StepRewardOutput(
@@ -356,6 +743,32 @@ def compute_step_count_reward(
         target_steps=target,
         mask=resolved_mask,
         absolute_error=absolute_error,
+        soft_count=(
+            resolved_soft_count
+            if mode == "soft_huber_exact"
+            else (
+                torch.as_tensor(
+                    soft_count,
+                    device=detected.device,
+                    dtype=torch.float32,
+                ).reshape(-1)
+                if soft_count is not None
+                else None
+            )
+        ),
+        soft_error=(
+            (
+                resolved_soft_count - target.float()
+                if mode == "soft_huber_exact"
+                else torch.as_tensor(
+                    soft_count,
+                    device=detected.device,
+                    dtype=torch.float32,
+                ).reshape(-1) - target.float()
+            )
+            if soft_count is not None
+            else None
+        ),
     )
 
 
@@ -364,8 +777,10 @@ __all__ = [
     "HardStepDetector",
     "RGDNO_HARD_THRESHOLD",
     "RGDNO_MIN_FRAMES",
+    "StepDetectionOutput",
     "StepRewardOutput",
     "compute_step_count_reward",
     "recover_humanml263_joints",
     "rgdno_hard_step_count",
+    "temporal_clustered_soft_count",
 ]

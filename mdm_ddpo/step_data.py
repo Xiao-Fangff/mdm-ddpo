@@ -53,6 +53,14 @@ ZERO_STEP_PROMPTS = (
     "a person stands still and does not walk forward.",
     "a person stands in place without taking any steps.",
 )
+SHARED_STEP_PROMPT_TEMPLATES = (
+    "walk forward {n} {steps}",
+    "take exactly {n} {steps} forward",
+    "walk straight ahead for {n} {steps}",
+    "go straight ahead for {n} {steps}",
+    "a person walks forward {n} {steps}.",
+    "a person takes {n} {steps} forward and stops.",
+)
 
 
 @dataclass(frozen=True)
@@ -64,6 +72,16 @@ class StepSampleRecord:
     length: int
     prompt: str = ""
     source_prompt: str = ""
+
+
+@dataclass(frozen=True)
+class SyntheticStepSampleRecord:
+    manifest_index: int
+    sample_id: str
+    target_steps: int
+    length: int
+    prompt: str
+    template_slot: int
 
 
 @dataclass(frozen=True)
@@ -102,6 +120,23 @@ def render_step_prompt(target: int, slot: int, seed: int) -> str:
         n=number,
         steps="step" if target == 1 else "steps",
         times="time" if target == 1 else "times",
+    )
+
+
+def render_shared_step_prompt(target: int, slot: int, seed: int) -> str:
+    """Render target-independent template ordering for causal count tests."""
+
+    if target < 1 or target > 6:
+        raise ValueError("Shared step prompts currently support targets 1..6.")
+    if slot < 0:
+        raise ValueError("Shared step prompt slot cannot be negative.")
+    order = list(range(len(SHARED_STEP_PROMPT_TEMPLATES)))
+    random.Random(seed * 31).shuffle(order)
+    template = SHARED_STEP_PROMPT_TEMPLATES[order[slot % len(order)]]
+    number = str(target) if (slot // len(order)) % 2 == 0 else NUMBER_WORDS[target]
+    return template.format(
+        n=number,
+        steps="step" if target == 1 else "steps",
     )
 
 
@@ -250,6 +285,80 @@ def stratified_step_split(
     return training, evaluation
 
 
+def shared_step_length_support(
+    records: Sequence[StepSampleRecord],
+    *,
+    targets: Sequence[int],
+) -> tuple[list[int], tuple[int, int]]:
+    """Return pooled lengths inside every target's common support interval."""
+
+    target_values = parse_step_targets(targets)
+    grouped = {
+        target: [record.length for record in records if record.target_steps == target]
+        for target in target_values
+    }
+    missing = [target for target, values in grouped.items() if not values]
+    if missing:
+        raise ValueError(f"No step lengths available for targets: {missing}.")
+    lower = max(min(values) for values in grouped.values())
+    upper = min(max(values) for values in grouped.values())
+    if lower > upper:
+        raise ValueError(
+            "Step target length distributions have no shared support interval."
+        )
+    support = sorted(
+        record.length
+        for record in records
+        if lower <= record.length <= upper
+    )
+    if not support:
+        raise ValueError("Shared step length support contains no samples.")
+    return support, (lower, upper)
+
+
+def create_synthetic_step_records(
+    records: Sequence[StepSampleRecord],
+    *,
+    targets: Sequence[int],
+    seed: int,
+    samples_per_target: int | None = None,
+) -> tuple[list[SyntheticStepSampleRecord], tuple[int, int]]:
+    """Cross targets with one identical length and template distribution."""
+
+    target_values = parse_step_targets(targets)
+    grouped_counts = {
+        target: sum(record.target_steps == target for record in records)
+        for target in target_values
+    }
+    if any(count <= 0 for count in grouped_counts.values()):
+        raise ValueError("Synthetic step data requires every configured target.")
+    count = (
+        min(grouped_counts.values())
+        if samples_per_target is None
+        else int(samples_per_target)
+    )
+    if count <= 0:
+        raise ValueError("Synthetic samples_per_target must be positive.")
+    support, interval = shared_step_length_support(records, targets=target_values)
+    order = list(range(len(support)))
+    random.Random(seed).shuffle(order)
+    shared_lengths = [support[order[index % len(order)]] for index in range(count)]
+    output: list[SyntheticStepSampleRecord] = []
+    for target in target_values:
+        for slot, length in enumerate(shared_lengths):
+            output.append(
+                SyntheticStepSampleRecord(
+                    manifest_index=-1,
+                    sample_id=f"synthetic_t{target}_slot{slot:06d}",
+                    target_steps=target,
+                    length=length,
+                    prompt=render_shared_step_prompt(target, slot, seed),
+                    template_slot=slot,
+                )
+            )
+    return output, interval
+
+
 def load_humanml_stats(mdm_root: str | Path) -> tuple[np.ndarray, np.ndarray]:
     root = Path(mdm_root).expanduser().resolve() / "dataset" / "HumanML3D"
     mean_path = root / "Mean.npy"
@@ -301,6 +410,37 @@ class StepMotionDataset(Dataset[dict[str, Any]]):
         return {
             "motion": motion,
             "length": length,
+            "text": record.prompt,
+            "target_steps": record.target_steps,
+            "sample_id": record.sample_id,
+            "manifest_index": record.manifest_index,
+        }
+
+
+class SyntheticStepConditionDataset(Dataset[dict[str, Any]]):
+    """Length/text-only step conditions with no target-specific GT motion."""
+
+    def __init__(
+        self,
+        records: Sequence[SyntheticStepSampleRecord],
+        *,
+        max_frames: int,
+    ) -> None:
+        if not records:
+            raise ValueError("Synthetic step dataset cannot be empty.")
+        self.records = list(records)
+        self.max_frames = int(max_frames)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        record = self.records[index]
+        if record.length <= 0 or record.length > self.max_frames:
+            raise ValueError("Synthetic step length is outside model support.")
+        return {
+            "motion": torch.zeros(263, 1, self.max_frames),
+            "length": record.length,
             "text": record.prompt,
             "target_steps": record.target_steps,
             "sample_id": record.sample_id,
@@ -364,6 +504,59 @@ class BalancedStepTargetSampler(Sampler[int]):
                 yielded += 1
 
 
+class BalancedSyntheticStepSampler(Sampler[int]):
+    """Cross every sampled length/template slot with a target permutation."""
+
+    def __init__(
+        self,
+        records: Sequence[SyntheticStepSampleRecord],
+        *,
+        generator: torch.Generator,
+    ) -> None:
+        if not records:
+            raise ValueError("Balanced synthetic sampler requires records.")
+        self.generator = generator
+        self.sample_count = len(records)
+        self.targets = sorted({record.target_steps for record in records})
+        self.slots = sorted({record.template_slot for record in records})
+        self.index_by_target_slot = {
+            (record.target_steps, record.template_slot): index
+            for index, record in enumerate(records)
+        }
+        expected = {
+            (target, slot)
+            for target in self.targets
+            for slot in self.slots
+        }
+        if set(self.index_by_target_slot) != expected:
+            raise ValueError(
+                "Synthetic sampler requires the full target x slot design."
+            )
+
+    def __len__(self) -> int:
+        return self.sample_count
+
+    def __iter__(self):
+        yielded = 0
+        while yielded < self.sample_count:
+            slot_order = torch.randperm(
+                len(self.slots),
+                generator=self.generator,
+            ).tolist()
+            for slot_position in slot_order:
+                slot = self.slots[slot_position]
+                target_order = torch.randperm(
+                    len(self.targets),
+                    generator=self.generator,
+                ).tolist()
+                for target_position in target_order:
+                    if yielded >= self.sample_count:
+                        return
+                    target = self.targets[target_position]
+                    yield self.index_by_target_slot[(target, slot)]
+                    yielded += 1
+
+
 def collate_step_motions(items: list[dict[str, Any]]) -> tuple[torch.Tensor, dict[str, Any]]:
     if not items:
         raise ValueError("Cannot collate an empty step batch.")
@@ -389,7 +582,7 @@ def collate_step_motions(items: list[dict[str, Any]]) -> tuple[torch.Tensor, dic
 
 
 def build_step_data_loader(
-    dataset: StepMotionDataset,
+    dataset: StepMotionDataset | SyntheticStepConditionDataset,
     *,
     batch_size: int,
     seed: int,
@@ -402,14 +595,19 @@ def build_step_data_loader(
             f"Step dataset has {len(dataset)} samples, fewer than batch size {batch_size}."
         )
     generator = torch.Generator().manual_seed(seed)
-    sampler = (
-        BalancedStepTargetSampler(
-            [record.target_steps for record in dataset.records],
-            generator=generator,
+    sampler: Sampler[int] | None = None
+    if balanced_targets:
+        sampler = (
+            BalancedSyntheticStepSampler(
+                dataset.records,
+                generator=generator,
+            )
+            if isinstance(dataset, SyntheticStepConditionDataset)
+            else BalancedStepTargetSampler(
+                [record.target_steps for record in dataset.records],
+                generator=generator,
+            )
         )
-        if balanced_targets
-        else None
-    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -526,6 +724,39 @@ def create_fixed_step_eval_pool(
     )
 
 
+def create_synthetic_fixed_step_eval_pool(
+    records: Sequence[SyntheticStepSampleRecord],
+    *,
+    max_frames: int,
+    noise_seed: int,
+    detector_backend: str,
+) -> FixedStepEvalPool:
+    dataset = SyntheticStepConditionDataset(
+        records,
+        max_frames=max_frames,
+    )
+    items = [dataset[index] for index in range(len(dataset))]
+    motion, condition = collate_step_motions(items)
+    count = len(items)
+    return validate_fixed_step_eval_pool(
+        FixedStepEvalPool(
+            manifest_indices=condition["y"]["manifest_index"],
+            sample_ids=list(condition["y"]["sample_id"]),
+            motion=motion,
+            lengths=condition["y"]["lengths"],
+            texts=list(condition["y"]["text"]),
+            target_steps=condition["y"]["target_steps"],
+            split="synthetic",
+            noise_seed=noise_seed,
+            prompt_noise_seeds=(
+                torch.arange(count, dtype=torch.long) * 1_000_003
+                + noise_seed
+            ),
+            detector_backend=detector_backend,
+        )
+    )
+
+
 def save_fixed_step_eval_pool(
     pool: FixedStepEvalPool,
     path: str | Path,
@@ -603,18 +834,25 @@ def target_histogram(records: Iterable[StepSampleRecord]) -> dict[str, int]:
 
 __all__ = [
     "BalancedStepTargetSampler",
+    "BalancedSyntheticStepSampler",
     "FixedStepEvalPool",
     "StepMotionDataset",
+    "SyntheticStepConditionDataset",
+    "SyntheticStepSampleRecord",
     "StepSampleRecord",
     "build_step_data_loader",
     "collate_step_motions",
     "create_fixed_step_eval_pool",
+    "create_synthetic_fixed_step_eval_pool",
+    "create_synthetic_step_records",
     "fixed_step_eval_pool_id",
     "load_fixed_step_eval_pool",
     "load_humanml_stats",
     "load_step_manifest",
     "parse_step_targets",
     "render_step_prompt",
+    "render_shared_step_prompt",
+    "shared_step_length_support",
     "save_fixed_step_eval_pool",
     "stratified_step_split",
     "target_histogram",

@@ -29,17 +29,23 @@ from mdm_ddpo.step_calibration import (  # noqa: E402
     MIN_STEP_CALIBRATION_PROMPTS,
     MIN_STEP_CALIBRATION_SAMPLES_PER_PROMPT,
     compute_step_reward_calibration,
+    compute_target_error_scales,
     save_step_reward_calibration,
 )
 from mdm_ddpo.step_data import (  # noqa: E402
     create_fixed_step_eval_pool,
+    create_synthetic_fixed_step_eval_pool,
+    create_synthetic_step_records,
     load_fixed_step_eval_pool,
     load_humanml_stats,
     load_step_manifest,
     save_fixed_step_eval_pool,
     stratified_step_split,
 )
-from mdm_ddpo.step_reward import HardStepDetector  # noqa: E402
+from mdm_ddpo.step_reward import (  # noqa: E402
+    HardStepDetector,
+    compute_step_count_reward,
+)
 from mdm_ddpo.trainer import DDPOTrainer  # noqa: E402
 
 
@@ -70,7 +76,7 @@ class _ZeroMotionReward:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Calibrate fixed hard-step reward scales on the original MDM."
+            "Calibrate fixed hard/soft step reward scales on the original MDM."
         )
     )
     parser.add_argument("--output", default="step_reward_k16_calibration.json")
@@ -86,6 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split-seed", type=int, default=20260600)
     parser.add_argument("--prompt-seed", type=int, default=20260612)
     parser.add_argument("--step-targets", default="1,2,3,4,5,6")
+    parser.add_argument(
+        "--step-pool-source",
+        choices=["reference", "synthetic"],
+        default="reference",
+    )
     parser.add_argument("--step-data-manifest", default=TrainConfig.step_data_manifest)
     parser.add_argument("--step-motion-root", default=TrainConfig.step_motion_root)
     parser.add_argument("--step-detector-root", default=TrainConfig.step_detector_root)
@@ -97,9 +108,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-detector-fps", type=int, default=20)
     parser.add_argument("--step-detector-lead-threshold", type=float, default=0.138)
     parser.add_argument("--step-detector-rgdno-threshold", type=float, default=0.005)
+    parser.add_argument("--step-soft-lead-temperature", type=float, default=1.0)
+    parser.add_argument("--step-soft-length-temperature", type=float, default=1.0)
+    parser.add_argument("--step-soft-progress-temperature", type=float, default=1.0)
+    parser.add_argument("--step-soft-cluster-gap-seconds", type=float, default=0.15)
+    parser.add_argument(
+        "--step-ankle-high-frequency-cutoff-hz",
+        type=float,
+        default=4.0,
+    )
+    parser.add_argument("--step-soft-huber-delta", type=float, default=1.0)
+    parser.add_argument("--step-soft-exact-bonus", type=float, default=0.15)
+    parser.add_argument("--step-soft-target-scale-floor", type=float, default=0.25)
     parser.add_argument(
         "--step-reward-mode",
-        choices=["exp", "linear", "exact", "negative_l1"],
+        choices=[
+            "exp",
+            "linear",
+            "exact",
+            "negative_l1",
+            "soft_huber_exact",
+        ],
         default="exp",
     )
     parser.add_argument("--step-reward-temperature", type=float, default=1.0)
@@ -193,6 +222,8 @@ def _build_config(args: argparse.Namespace, output: Path) -> TrainConfig:
         fixed_step_eval_samples_per_prompt=args.samples_per_prompt,
         enable_step_reward=True,
         step_data_ratio=0.25,
+        step_rollout_source=args.step_pool_source,
+        step_use_m2m_reward=False,
         step_targets=args.step_targets,
         step_split_seed=args.split_seed,
         step_prompt_seed=args.prompt_seed,
@@ -208,9 +239,20 @@ def _build_config(args: argparse.Namespace, output: Path) -> TrainConfig:
         step_detector_fps=args.step_detector_fps,
         step_detector_lead_threshold=args.step_detector_lead_threshold,
         step_detector_rgdno_threshold=args.step_detector_rgdno_threshold,
+        step_soft_lead_temperature=args.step_soft_lead_temperature,
+        step_soft_length_temperature=args.step_soft_length_temperature,
+        step_soft_progress_temperature=args.step_soft_progress_temperature,
+        step_soft_cluster_gap_seconds=args.step_soft_cluster_gap_seconds,
+        step_ankle_high_frequency_cutoff_hz=(
+            args.step_ankle_high_frequency_cutoff_hz
+        ),
+        step_soft_huber_delta=args.step_soft_huber_delta,
+        step_soft_exact_bonus=args.step_soft_exact_bonus,
+        step_soft_target_scale_floor=args.step_soft_target_scale_floor,
         step_reward_mode=args.step_reward_mode,
         step_reward_temperature=args.step_reward_temperature,
         step_reward_linear_tolerance=args.step_reward_linear_tolerance,
+        allow_uncalibrated_soft_step_reward=True,
     )
     config.validate()
     return config
@@ -233,28 +275,48 @@ def _load_or_create_pool(
             min_frames=config.step_min_frames,
             max_frames=config.step_max_frames,
         )
-        _, selected = stratified_step_split(
+        training, selected = stratified_step_split(
             records,
             eval_per_target=prompts // len(config.step_target_values),
             split_seed=config.step_split_seed,
             prompt_seed=config.step_prompt_seed,
         )
-        pool = create_fixed_step_eval_pool(
-            selected,
-            mean=mean,
-            std=std,
-            max_frames=config.step_max_frames,
-            noise_seed=config.seed + 104729,
-            detector_backend=config.step_detector_backend,
-        )
+        if config.step_rollout_source == "synthetic":
+            synthetic, _ = create_synthetic_step_records(
+                training,
+                targets=config.step_target_values,
+                seed=config.step_synthetic_seed,
+                samples_per_target=prompts // len(config.step_target_values),
+            )
+            pool = create_synthetic_fixed_step_eval_pool(
+                synthetic,
+                max_frames=config.step_max_frames,
+                noise_seed=config.seed + 104729,
+                detector_backend=config.step_detector_backend,
+            )
+        else:
+            pool = create_fixed_step_eval_pool(
+                selected,
+                mean=mean,
+                std=std,
+                max_frames=config.step_max_frames,
+                noise_seed=config.seed + 104729,
+                detector_backend=config.step_detector_backend,
+            )
         save_fixed_step_eval_pool(pool, path)
         LOGGER.info("Created step calibration pool: %s", path)
     expected = (
         prompts,
         config.seed + 104729,
         config.step_detector_backend,
+        "synthetic" if config.step_rollout_source == "synthetic" else "val",
     )
-    actual = (pool.prompt_count, pool.noise_seed, pool.detector_backend)
+    actual = (
+        pool.prompt_count,
+        pool.noise_seed,
+        pool.detector_backend,
+        pool.split,
+    )
     if actual != expected:
         raise ValueError(
             "Existing step calibration pool does not match requested settings: "
@@ -319,11 +381,18 @@ def main(argv: list[str] | None = None) -> None:
         motion_rule_root=config.step_detector_root,
         lead_threshold=config.step_detector_lead_threshold,
         rgdno_threshold=config.step_detector_rgdno_threshold,
+        soft_lead_temperature=config.step_soft_lead_temperature,
+        soft_length_temperature=config.step_soft_length_temperature,
+        soft_progress_temperature=config.step_soft_progress_temperature,
+        soft_cluster_gap_seconds=config.step_soft_cluster_gap_seconds,
+        ankle_high_frequency_cutoff_hz=(
+            config.step_ankle_high_frequency_cutoff_hz
+        ),
     )
     evaluator.step_mdm_mean = mean.to(device=device, dtype=torch.float32)
     evaluator.step_mdm_std = std.to(device=device, dtype=torch.float32)
     evaluator.fixed_step_eval_pool = pool
-    evaluation = evaluator.evaluate_fixed_step_pool()
+    evaluation = evaluator.evaluate_fixed_step_pool(calibrating=True)
     if (
         evaluation.step_reward_by_prompt is None
         or evaluation.detected_steps_by_prompt is None
@@ -332,6 +401,31 @@ def main(argv: list[str] | None = None) -> None:
     targets = pool.target_steps[:, None].expand_as(
         evaluation.detected_steps_by_prompt
     )
+    if evaluation.soft_count_by_prompt is None:
+        raise RuntimeError("Step calibration did not retain soft-count values.")
+    target_error_scales = compute_target_error_scales(
+        evaluation.soft_count_by_prompt,
+        targets,
+        minimum_scale=config.step_soft_target_scale_floor,
+    )
+    calibrated_reward = evaluation.step_reward_by_prompt
+    if config.step_reward_mode == "soft_huber_exact":
+        target_scale = torch.tensor(
+            [
+                target_error_scales[str(int(value))]
+                for value in targets.reshape(-1)
+            ],
+            dtype=torch.float32,
+        ).reshape_as(targets)
+        calibrated_reward = compute_step_count_reward(
+            evaluation.detected_steps_by_prompt,
+            targets,
+            mode=config.step_reward_mode,
+            soft_count=evaluation.soft_count_by_prompt,
+            target_scale=target_scale,
+            huber_delta=config.step_soft_huber_delta,
+            exact_bonus=config.step_soft_exact_bonus,
+        ).reward.reshape_as(targets)
     metadata = {
         "model_path": str(Path(config.model_path).expanduser().resolve()),
         "policy": "original_mdm_without_lora",
@@ -344,14 +438,24 @@ def main(argv: list[str] | None = None) -> None:
         "precision": config.precision,
         "step_targets": list(config.step_target_values),
         "step_samples_per_prompt": config.step_samples_per_prompt,
+        "step_pool_source": config.step_rollout_source,
     }
     payload = compute_step_reward_calibration(
-        evaluation.step_reward_by_prompt,
+        calibrated_reward,
         evaluation.detected_steps_by_prompt,
         targets,
         detector_config=config.step_detector_config(),
         reward_config=config.step_reward_config(),
         metadata=metadata,
+        soft_counts=evaluation.soft_count_by_prompt,
+        target_error_scales=target_error_scales,
+        detection_diagnostics={
+            "candidate_count": evaluation.candidate_count_by_prompt,
+            "candidate_spacing": evaluation.candidate_spacing_by_prompt,
+            "ankle_high_frequency_ratio": (
+                evaluation.ankle_high_frequency_ratio_by_prompt
+            ),
+        },
     )
     save_step_reward_calibration(payload, output)
     samples_output.parent.mkdir(parents=True, exist_ok=True)
@@ -359,8 +463,9 @@ def main(argv: list[str] | None = None) -> None:
         {
             "calibration_id": payload["calibration_id"],
             "pool_id": pool.pool_id,
-            "step_reward": evaluation.step_reward_by_prompt,
+            "step_reward": calibrated_reward,
             "detected_steps": evaluation.detected_steps_by_prompt,
+            "soft_count": evaluation.soft_count_by_prompt,
             "target_steps": targets,
         },
         samples_output,

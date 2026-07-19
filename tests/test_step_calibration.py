@@ -9,6 +9,7 @@ import torch
 from mdm_ddpo.step_calibration import (
     StepRewardCalibration,
     compute_step_reward_calibration,
+    compute_target_error_scales,
     load_step_reward_calibration,
     save_step_reward_calibration,
     validate_step_reward_calibration,
@@ -90,6 +91,35 @@ class StepCalibrationTest(unittest.TestCase):
         payload["component"]["global_scale"] += 0.1
         with self.assertRaisesRegex(ValueError, "checksum"):
             validate_step_reward_calibration(payload, require_full=False)
+
+    def test_soft_calibration_stores_positive_per_target_scales(self):
+        soft = torch.tensor([[1.0, 1.5], [3.0, 4.0]])
+        targets = torch.tensor([[1, 1], [3, 3]])
+        scales = compute_target_error_scales(
+            soft,
+            targets,
+            minimum_scale=0.25,
+        )
+        rewards = torch.tensor([[0.1, -0.1], [0.2, -0.2]])
+        detected = torch.tensor([[1, 2], [3, 4]])
+        payload = compute_step_reward_calibration(
+            rewards,
+            detected,
+            targets,
+            detector_config={"backend": "progressive", "soft": {}},
+            reward_config={
+                "mode": "soft_huber_exact",
+                "target_scale_floor": 0.25,
+            },
+            soft_counts=soft,
+            target_error_scales=scales,
+        )
+
+        validate_step_reward_calibration(payload, require_full=False)
+        self.assertEqual(set(payload["target_error_scales"]), {"1", "3"})
+        calibration = StepRewardCalibration(payload, Path("unused"))
+        resolved = calibration.target_error_scales(torch.tensor([3, 1]))
+        self.assertGreater(resolved.min().item(), 0.0)
 
 
 if __name__ == "__main__":

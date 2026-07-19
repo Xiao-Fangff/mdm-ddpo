@@ -51,13 +51,16 @@ from .runtime import (
 from .tracking import SwanLabTracker, format_training_metrics
 from .step_calibration import (
     StepRewardCalibration,
+    compute_target_error_scales,
     load_step_reward_calibration,
 )
 from .step_data import (
     FixedStepEvalPool,
     StepMotionDataset,
+    SyntheticStepConditionDataset,
     build_step_data_loader,
     create_fixed_step_eval_pool,
+    create_synthetic_step_records,
     load_fixed_step_eval_pool,
     load_humanml_stats,
     load_step_manifest,
@@ -276,11 +279,22 @@ class FixedStepEvalResult:
     within_one_per_prompt: torch.Tensor
     mae_per_prompt: torch.Tensor
     detected_mean_per_prompt: torch.Tensor
+    soft_count_mean_per_prompt: torch.Tensor
+    soft_error_mean_per_prompt: torch.Tensor
+    soft_mae_per_prompt: torch.Tensor
+    candidate_count_mean_per_prompt: torch.Tensor
+    candidate_spacing_mean_per_prompt: torch.Tensor
+    ankle_high_frequency_ratio_per_prompt: torch.Tensor
     total_by_prompt: torch.Tensor | None = None
     retrieval_by_prompt: torch.Tensor | None = None
     m2m_by_prompt: torch.Tensor | None = None
     step_reward_by_prompt: torch.Tensor | None = None
     detected_steps_by_prompt: torch.Tensor | None = None
+    soft_count_by_prompt: torch.Tensor | None = None
+    candidate_count_by_prompt: torch.Tensor | None = None
+    candidate_spacing_by_prompt: torch.Tensor | None = None
+    ankle_high_frequency_ratio_by_prompt: torch.Tensor | None = None
+    target_error_scales: dict[str, float] | None = None
 
 
 def _update_hash_with_tensor(
@@ -670,6 +684,68 @@ def _pearson_tensor(first: torch.Tensor, second: torch.Tensor) -> float:
     return (first * second).sum().div(denominator).item()
 
 
+def grouped_reward_information_metrics(
+    rewards: torch.Tensor,
+    prompt_ids: torch.Tensor,
+    advantages: torch.Tensor,
+    *,
+    epsilon: float,
+    prefix: str,
+    tie_tolerance: float = 1.0e-6,
+) -> dict[str, float]:
+    """Measure how much within-prompt ranking information a reward carries."""
+
+    if rewards.ndim != 1 or prompt_ids.shape != rewards.shape:
+        raise ValueError("Grouped reward information tensors must be matching 1-D.")
+    if advantages.shape != rewards.shape:
+        raise ValueError("Grouped reward advantages must match rewards.")
+    if tie_tolerance <= 0:
+        raise ValueError("Reward tie tolerance must be positive.")
+    unique_levels: list[float] = []
+    concentrations: list[float] = []
+    tied_pairs = 0
+    total_pairs = 0
+    for prompt_id in torch.unique(prompt_ids, sorted=True):
+        active = prompt_ids == prompt_id
+        group_rewards = rewards[active].detach().float()
+        group_advantages = advantages[active].detach().float()
+        quantized = torch.round(group_rewards / tie_tolerance)
+        unique_levels.append(float(torch.unique(quantized).numel()))
+        if len(group_rewards) >= 2:
+            differences = (
+                group_rewards[:, None] - group_rewards[None, :]
+            ).abs()
+            upper = torch.triu(
+                torch.ones_like(differences, dtype=torch.bool),
+                diagonal=1,
+            )
+            tied_pairs += int((differences[upper] <= tie_tolerance).sum())
+            total_pairs += int(upper.sum())
+        positive = group_advantages.clamp_min(0.0)
+        positive_sum = positive.sum()
+        concentrations.append(
+            positive.max().div(positive_sum).item()
+            if positive_sum > epsilon
+            else 0.0
+        )
+    levels = torch.tensor(unique_levels, dtype=torch.float32)
+    concentration = torch.tensor(concentrations, dtype=torch.float32)
+    return {
+        f"{prefix}_unique_reward_levels_mean": levels.mean().item(),
+        f"{prefix}_unique_reward_levels_median": levels.median().item(),
+        f"{prefix}_unique_reward_levels_min": levels.min().item(),
+        f"{prefix}_pairwise_reward_tie_fraction": (
+            tied_pairs / total_pairs if total_pairs else 0.0
+        ),
+        f"{prefix}_nonzero_advantage_sample_fraction": (
+            (advantages.abs() > epsilon).float().mean().item()
+        ),
+        f"{prefix}_top1_advantage_concentration": (
+            concentration.mean().item()
+        ),
+    }
+
+
 def compute_component_shrink_advantages(
     retrieval_rewards: torch.Tensor,
     m2m_rewards: torch.Tensor,
@@ -912,6 +988,15 @@ def compute_component_shrink_advantages(
                     "component_advantage_step_samples": float(active.sum()),
                 }
             )
+            stats.update(
+                grouped_reward_information_metrics(
+                    step_rewards[active],
+                    prompt_ids[active],
+                    active_advantages,
+                    epsilon=epsilon,
+                    prefix="component_advantage_step",
+                )
+            )
         else:
             stats["component_advantage_step_samples"] = 0.0
     return combined, stats
@@ -936,6 +1021,13 @@ class Trajectory:
     detected_steps: torch.Tensor | None = None
     target_steps: torch.Tensor | None = None
     step_absolute_error: torch.Tensor | None = None
+    soft_step_count: torch.Tensor | None = None
+    soft_step_error: torch.Tensor | None = None
+    step_raw_candidate_count: torch.Tensor | None = None
+    step_candidate_count: torch.Tensor | None = None
+    step_candidate_spacing_mean: torch.Tensor | None = None
+    step_candidate_spacing_min: torch.Tensor | None = None
+    step_ankle_high_frequency_ratio: torch.Tensor | None = None
     advantages: torch.Tensor | None = None
     group_stats: dict[str, float] | None = None
 
@@ -994,6 +1086,21 @@ class Trajectory:
             detected_steps=concatenate_optional("detected_steps"),
             target_steps=concatenate_optional("target_steps"),
             step_absolute_error=concatenate_optional("step_absolute_error"),
+            soft_step_count=concatenate_optional("soft_step_count"),
+            soft_step_error=concatenate_optional("soft_step_error"),
+            step_raw_candidate_count=concatenate_optional(
+                "step_raw_candidate_count"
+            ),
+            step_candidate_count=concatenate_optional("step_candidate_count"),
+            step_candidate_spacing_mean=concatenate_optional(
+                "step_candidate_spacing_mean"
+            ),
+            step_candidate_spacing_min=concatenate_optional(
+                "step_candidate_spacing_min"
+            ),
+            step_ankle_high_frequency_ratio=concatenate_optional(
+                "step_ankle_high_frequency_ratio"
+            ),
         )
 
 
@@ -1105,6 +1212,17 @@ class DDPOTrainer:
                 motion_rule_root=config.step_detector_root,
                 lead_threshold=config.step_detector_lead_threshold,
                 rgdno_threshold=config.step_detector_rgdno_threshold,
+                soft_lead_temperature=config.step_soft_lead_temperature,
+                soft_length_temperature=config.step_soft_length_temperature,
+                soft_progress_temperature=(
+                    config.step_soft_progress_temperature
+                ),
+                soft_cluster_gap_seconds=(
+                    config.step_soft_cluster_gap_seconds
+                ),
+                ankle_high_frequency_cutoff_hz=(
+                    config.step_ankle_high_frequency_cutoff_hz
+                ),
             )
             self._initialize_step_training_data()
         if (
@@ -1141,6 +1259,8 @@ class DDPOTrainer:
         ) = None
         self.best_step_reward_delta: float | None = None
         self.best_step_epoch: int | None = None
+        self.best_step_acceptance_score: float | None = None
+        self.best_step_acceptance_epoch: int | None = None
         self.evals_without_improvement = 0
         self.fixed_step_eval_pool: FixedStepEvalPool | None = None
         self.checkpoint_fixed_step_eval_pool_id: str | None = None
@@ -1183,6 +1303,7 @@ class DDPOTrainer:
                 "best_retrieval.pt",
                 "best_m2m.pt",
                 "best_step.pt",
+                "best_step_acceptance.pt",
             ):
                 source = resume_dir / name
                 target = self.output_dir / name
@@ -1364,12 +1485,26 @@ class DDPOTrainer:
             split_seed=self.config.step_split_seed,
             prompt_seed=self.config.step_prompt_seed,
         )
-        dataset = StepMotionDataset(
-            training,
-            mean=mean,
-            std=std,
-            max_frames=self.config.step_max_frames,
-        )
+        synthetic_length_interval: tuple[int, int] | None = None
+        if self.config.step_rollout_source == "synthetic":
+            synthetic_records, synthetic_length_interval = (
+                create_synthetic_step_records(
+                    training,
+                    targets=self.config.step_target_values,
+                    seed=self.config.step_synthetic_seed,
+                )
+            )
+            dataset = SyntheticStepConditionDataset(
+                synthetic_records,
+                max_frames=self.config.step_max_frames,
+            )
+        else:
+            dataset = StepMotionDataset(
+                training,
+                mean=mean,
+                std=std,
+                max_frames=self.config.step_max_frames,
+            )
         self.step_data_loader = build_step_data_loader(
             dataset,
             batch_size=self.config.step_prompts_per_rollout_batch,
@@ -1392,16 +1527,19 @@ class DDPOTrainer:
         LOGGER.info(
             "Step mixed data: train=%d, held_out_val=%d, targets=%s, "
             "target_histogram=%s, prompts_per_batch=humanml:%d step:%d, "
-            "motions_per_batch=humanml:%d step:%d, balanced_sampling=%s.",
+            "motions_per_batch=humanml:%d step:%d, balanced_sampling=%s, "
+            "rollout_source=%s, shared_length_interval=%s.",
             len(training),
             len(evaluation),
             self.config.step_target_values,
-            target_histogram(training),
+            target_histogram(dataset.records),
             self.config.humanml_prompts_per_rollout_batch,
             self.config.step_prompts_per_rollout_batch,
             self.config.humanml_rollout_samples,
             self.config.step_rollout_samples,
             self.config.step_balanced_sampling,
+            self.config.step_rollout_source,
+            synthetic_length_interval,
         )
 
     def _load_or_create_fixed_step_eval_pool(self) -> FixedStepEvalPool:
@@ -1670,6 +1808,18 @@ class DDPOTrainer:
                     "step_eval_use_m2m_reward": float(
                         self.config.step_use_m2m_reward
                     ),
+                    "step_eval_soft_lead_temperature": float(
+                        self.config.step_soft_lead_temperature
+                    ),
+                    "step_eval_soft_length_temperature": float(
+                        self.config.step_soft_length_temperature
+                    ),
+                    "step_eval_soft_progress_temperature": float(
+                        self.config.step_soft_progress_temperature
+                    ),
+                    "step_eval_soft_cluster_gap_seconds": float(
+                        self.config.step_soft_cluster_gap_seconds
+                    ),
                 }
             )
         return signature
@@ -1827,8 +1977,12 @@ class DDPOTrainer:
         )
 
     @torch.no_grad()
-    def evaluate_fixed_step_pool(self) -> FixedStepEvalResult:
-        """Evaluate held-out step prompts with fixed noise and hard counts."""
+    def evaluate_fixed_step_pool(
+        self,
+        *,
+        calibrating: bool = False,
+    ) -> FixedStepEvalResult:
+        """Evaluate fixed step prompts with hard and event-level soft counts."""
         if self.fixed_step_eval_pool is None:
             raise RuntimeError("Fixed step evaluation is disabled.")
         if (
@@ -1847,11 +2001,14 @@ class DDPOTrainer:
             leave=False,
             dynamic_ncols=True,
         )
-        total_parts: list[torch.Tensor] = []
+        base_total_parts: list[torch.Tensor] = []
         retrieval_parts: list[torch.Tensor] = []
         m2m_parts: list[torch.Tensor] = []
-        step_reward_parts: list[torch.Tensor] = []
         detected_parts: list[torch.Tensor] = []
+        soft_count_parts: list[torch.Tensor] = []
+        candidate_count_parts: list[torch.Tensor] = []
+        candidate_spacing_parts: list[torch.Tensor] = []
+        ankle_high_frequency_parts: list[torch.Tensor] = []
         target_parts: list[torch.Tensor] = []
 
         for prompt_start in range(0, total_prompt_count, prompt_batch_size):
@@ -1955,36 +2112,79 @@ class DDPOTrainer:
                 m2m_weight=self.config.m2m_weight,
                 enabled=self.config.step_use_m2m_reward,
             )
-            detected = self.step_detector.count_normalized(
+            detection = self.step_detector.detect_normalized(
                 generated_motion,
                 lengths,
                 mean=self.step_mdm_mean,
                 std=self.step_mdm_std,
             )
-            step_output = compute_step_count_reward(
-                detected,
-                target_steps.to(self.device),
-                mode=self.config.step_reward_mode,
-                temperature=self.config.step_reward_temperature,
-                linear_tolerance=self.config.step_reward_linear_tolerance,
-            )
-            combined = base_reward.total + (
-                self.config.step_reward_weight * step_output.reward
-            )
-            total_parts.append(combined.detach().float().cpu())
+            base_total_parts.append(base_reward.total.detach().float().cpu())
             retrieval_parts.append(base_reward.retrieval.detach().float().cpu())
             m2m_parts.append(base_reward.m2m.detach().float().cpu())
-            step_reward_parts.append(step_output.reward.detach().float().cpu())
-            detected_parts.append(detected.detach().long().cpu())
+            detected_parts.append(detection.hard_count.detach().long().cpu())
+            soft_count_parts.append(detection.soft_count.detach().float().cpu())
+            candidate_count_parts.append(
+                detection.candidate_count.detach().float().cpu()
+            )
+            candidate_spacing_parts.append(
+                detection.candidate_spacing_mean.detach().float().cpu()
+            )
+            ankle_high_frequency_parts.append(
+                detection.ankle_high_frequency_ratio.detach().float().cpu()
+            )
             target_parts.append(target_steps.detach().long().cpu())
 
         progress.close()
-        total = torch.cat(total_parts)
+        base_total = torch.cat(base_total_parts)
         retrieval = torch.cat(retrieval_parts)
         m2m = torch.cat(m2m_parts)
-        step_reward = torch.cat(step_reward_parts)
         detected_steps = torch.cat(detected_parts)
+        soft_count = torch.cat(soft_count_parts)
+        candidate_count = torch.cat(candidate_count_parts)
+        candidate_spacing = torch.cat(candidate_spacing_parts)
+        ankle_high_frequency = torch.cat(ankle_high_frequency_parts)
         target_steps = torch.cat(target_parts)
+        target_error_scales: dict[str, float] | None = None
+        target_scale: torch.Tensor | None = None
+        if self.config.step_reward_mode == "soft_huber_exact":
+            calibration = getattr(self, "step_reward_calibration", None)
+            if calibration is not None and not calibrating:
+                target_scale = calibration.target_error_scales(target_steps)
+                target_error_scales = {
+                    str(target): float(
+                        calibration.target_error_scales(
+                            torch.tensor([target])
+                        )[0]
+                    )
+                    for target in self.config.step_target_values
+                }
+            elif calibrating:
+                target_error_scales = compute_target_error_scales(
+                    soft_count,
+                    target_steps,
+                    minimum_scale=self.config.step_soft_target_scale_floor,
+                )
+                target_scale = torch.tensor(
+                    [target_error_scales[str(int(value))] for value in target_steps],
+                    dtype=torch.float32,
+                )
+            else:
+                raise RuntimeError(
+                    "Soft fixed step evaluation requires calibrated target scales."
+                )
+        step_output = compute_step_count_reward(
+            detected_steps,
+            target_steps,
+            mode=self.config.step_reward_mode,
+            temperature=self.config.step_reward_temperature,
+            linear_tolerance=self.config.step_reward_linear_tolerance,
+            soft_count=soft_count,
+            target_scale=target_scale,
+            huber_delta=self.config.step_soft_huber_delta,
+            exact_bonus=self.config.step_soft_exact_bonus,
+        )
+        step_reward = step_output.reward.detach().float().cpu()
+        total = base_total + self.config.step_reward_weight * step_reward
         group_shape = (
             self.fixed_step_eval_pool.prompt_count,
             self.config.fixed_step_eval_samples_per_prompt,
@@ -1994,13 +2194,37 @@ class DDPOTrainer:
         m2m_by_prompt = m2m.reshape(group_shape)
         step_reward_by_prompt = step_reward.reshape(group_shape)
         detected_by_prompt = detected_steps.reshape(group_shape)
+        soft_count_by_prompt = soft_count.reshape(group_shape)
+        candidate_count_by_prompt = candidate_count.reshape(group_shape)
+        candidate_spacing_by_prompt = candidate_spacing.reshape(group_shape)
+        ankle_high_frequency_by_prompt = ankle_high_frequency.reshape(
+            group_shape
+        )
         target_by_prompt = target_steps.reshape(group_shape)
         error_by_prompt = (detected_by_prompt - target_by_prompt).abs().float()
+        soft_error_by_prompt = soft_count_by_prompt - target_by_prompt.float()
         return FixedStepEvalResult(
             metrics={
                 "step_eval_reward_std": step_reward.std(unbiased=False).item(),
                 "step_eval_detected_mean": detected_steps.float().mean().item(),
                 "step_eval_target_mean": target_steps.float().mean().item(),
+                "step_eval_soft_count_mean": soft_count.mean().item(),
+                "step_eval_soft_count_error_mean": (
+                    soft_count.sub(target_steps.float()).mean().item()
+                ),
+                "step_eval_soft_count_mae": (
+                    soft_count.sub(target_steps.float()).abs().mean().item()
+                ),
+                "step_eval_soft_hard_count_difference_mean": (
+                    soft_count.sub(detected_steps.float()).abs().mean().item()
+                ),
+                "step_eval_candidate_count_mean": candidate_count.mean().item(),
+                "step_eval_candidate_spacing_mean": (
+                    candidate_spacing.mean().item()
+                ),
+                "step_eval_ankle_high_frequency_ratio": (
+                    ankle_high_frequency.mean().item()
+                ),
                 "step_eval_samples": float(len(step_reward)),
                 "step_eval_prompts": float(
                     self.fixed_step_eval_pool.prompt_count
@@ -2031,11 +2255,30 @@ class DDPOTrainer:
             within_one_per_prompt=(error_by_prompt <= 1).float().mean(dim=1),
             mae_per_prompt=error_by_prompt.mean(dim=1),
             detected_mean_per_prompt=detected_by_prompt.float().mean(dim=1),
+            soft_count_mean_per_prompt=soft_count_by_prompt.mean(dim=1),
+            soft_error_mean_per_prompt=soft_error_by_prompt.mean(dim=1),
+            soft_mae_per_prompt=soft_error_by_prompt.abs().mean(dim=1),
+            candidate_count_mean_per_prompt=(
+                candidate_count_by_prompt.mean(dim=1)
+            ),
+            candidate_spacing_mean_per_prompt=(
+                candidate_spacing_by_prompt.mean(dim=1)
+            ),
+            ankle_high_frequency_ratio_per_prompt=(
+                ankle_high_frequency_by_prompt.mean(dim=1)
+            ),
             total_by_prompt=total_by_prompt,
             retrieval_by_prompt=retrieval_by_prompt,
             m2m_by_prompt=m2m_by_prompt,
             step_reward_by_prompt=step_reward_by_prompt,
             detected_steps_by_prompt=detected_by_prompt,
+            soft_count_by_prompt=soft_count_by_prompt,
+            candidate_count_by_prompt=candidate_count_by_prompt,
+            candidate_spacing_by_prompt=candidate_spacing_by_prompt,
+            ankle_high_frequency_ratio_by_prompt=(
+                ankle_high_frequency_by_prompt
+            ),
+            target_error_scales=target_error_scales,
         )
 
     def _next_batch(self) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -2231,6 +2474,17 @@ class DDPOTrainer:
             dtype=torch.long,
         )
         step_absolute_error = torch.full_like(detected_steps, -1)
+        soft_step_count = torch.full(
+            (batch_size,),
+            -1.0,
+            device=self.device,
+        )
+        soft_step_error = torch.full_like(soft_step_count, float("nan"))
+        raw_candidate_count = torch.full_like(detected_steps, -1)
+        candidate_count = torch.full_like(detected_steps, -1)
+        candidate_spacing_mean = torch.zeros_like(soft_step_count)
+        candidate_spacing_min = torch.zeros_like(soft_step_count)
+        ankle_high_frequency_ratio = torch.zeros_like(soft_step_count)
         if step_mask.any():
             if (
                 self.step_detector is None
@@ -2239,22 +2493,52 @@ class DDPOTrainer:
             ):
                 raise RuntimeError("Step detector is not initialized.")
             active = step_mask.to(self.device)
-            active_detected = self.step_detector.count_normalized(
+            active_detection = self.step_detector.detect_normalized(
                 generated_motion[active],
                 lengths[step_mask],
                 mean=self.step_mdm_mean,
                 std=self.step_mdm_std,
             )
+            active_targets = target_steps[step_mask].to(self.device)
+            target_scale = (
+                self.step_reward_calibration.target_error_scales(
+                    active_targets
+                )
+                if self.config.step_reward_mode == "soft_huber_exact"
+                and self.step_reward_calibration is not None
+                else None
+            )
             active_output = compute_step_count_reward(
-                active_detected,
-                target_steps[step_mask].to(self.device),
+                active_detection.hard_count,
+                active_targets,
                 mode=self.config.step_reward_mode,
                 temperature=self.config.step_reward_temperature,
                 linear_tolerance=self.config.step_reward_linear_tolerance,
+                soft_count=active_detection.soft_count,
+                target_scale=target_scale,
+                huber_delta=self.config.step_soft_huber_delta,
+                exact_bonus=self.config.step_soft_exact_bonus,
             )
             step_reward[active] = active_output.reward
             detected_steps[active] = active_output.detected_steps
             step_absolute_error[active] = active_output.absolute_error
+            soft_step_count[active] = active_detection.soft_count
+            soft_step_error[active] = (
+                active_detection.soft_count - active_targets.float()
+            )
+            raw_candidate_count[active] = (
+                active_detection.raw_candidate_count
+            )
+            candidate_count[active] = active_detection.candidate_count
+            candidate_spacing_mean[active] = (
+                active_detection.candidate_spacing_mean
+            )
+            candidate_spacing_min[active] = (
+                active_detection.candidate_spacing_min
+            )
+            ankle_high_frequency_ratio[active] = (
+                active_detection.ankle_high_frequency_ratio
+            )
         reward_output = add_step_reward(
             reward_output,
             step=step_reward,
@@ -2263,6 +2547,13 @@ class DDPOTrainer:
             target_steps=target_steps.to(self.device),
             absolute_error=step_absolute_error,
             step_weight=self.config.step_reward_weight,
+            soft_step_count=soft_step_count,
+            soft_step_error=soft_step_error,
+            raw_candidate_count=raw_candidate_count,
+            candidate_count=candidate_count,
+            candidate_spacing_mean=candidate_spacing_mean,
+            candidate_spacing_min=candidate_spacing_min,
+            ankle_high_frequency_ratio=ankle_high_frequency_ratio,
         )
 
         return Trajectory(
@@ -2284,6 +2575,23 @@ class DDPOTrainer:
             target_steps=reward_output.target_steps.detach().cpu(),
             step_absolute_error=(
                 reward_output.step_absolute_error.detach().cpu()
+            ),
+            soft_step_count=reward_output.soft_step_count.detach().cpu(),
+            soft_step_error=reward_output.soft_step_error.detach().cpu(),
+            step_raw_candidate_count=(
+                reward_output.step_raw_candidate_count.detach().cpu()
+            ),
+            step_candidate_count=(
+                reward_output.step_candidate_count.detach().cpu()
+            ),
+            step_candidate_spacing_mean=(
+                reward_output.step_candidate_spacing_mean.detach().cpu()
+            ),
+            step_candidate_spacing_min=(
+                reward_output.step_candidate_spacing_min.detach().cpu()
+            ),
+            step_ankle_high_frequency_ratio=(
+                reward_output.step_ankle_high_frequency_ratio.detach().cpu()
             ),
         )
 
@@ -2939,6 +3247,13 @@ class DDPOTrainer:
             assert trajectory.detected_steps is not None
             assert trajectory.target_steps is not None
             assert trajectory.step_absolute_error is not None
+            assert trajectory.soft_step_count is not None
+            assert trajectory.soft_step_error is not None
+            assert trajectory.step_raw_candidate_count is not None
+            assert trajectory.step_candidate_count is not None
+            assert trajectory.step_candidate_spacing_mean is not None
+            assert trajectory.step_candidate_spacing_min is not None
+            assert trajectory.step_ankle_high_frequency_ratio is not None
             active = trajectory.step_mask.bool()
             errors = trajectory.step_absolute_error[active].float()
             result.update(
@@ -2954,6 +3269,61 @@ class DDPOTrainer:
                     ),
                     "step_target_mean": (
                         trajectory.target_steps[active].float().mean().item()
+                    ),
+                    "step_soft_count_mean": (
+                        trajectory.soft_step_count[active].mean().item()
+                    ),
+                    "step_soft_count_error_mean": (
+                        trajectory.soft_step_error[active].mean().item()
+                    ),
+                    "step_soft_count_mae": (
+                        trajectory.soft_step_error[active].abs().mean().item()
+                    ),
+                    "step_soft_hard_count_difference_mean": (
+                        trajectory.soft_step_count[active]
+                        .sub(trajectory.detected_steps[active].float())
+                        .abs()
+                        .mean()
+                        .item()
+                    ),
+                    "step_raw_candidate_count_mean": (
+                        trajectory.step_raw_candidate_count[active]
+                        .float()
+                        .mean()
+                        .item()
+                    ),
+                    "step_candidate_count_mean": (
+                        trajectory.step_candidate_count[active]
+                        .float()
+                        .mean()
+                        .item()
+                    ),
+                    "step_candidate_spacing_mean": (
+                        trajectory.step_candidate_spacing_mean[active]
+                        .mean()
+                        .item()
+                    ),
+                    "step_candidate_spacing_min_mean": (
+                        trajectory.step_candidate_spacing_min[active]
+                        .mean()
+                        .item()
+                    ),
+                    "step_ankle_high_frequency_ratio": (
+                        trajectory.step_ankle_high_frequency_ratio[active]
+                        .mean()
+                        .item()
+                    ),
+                    "step_reward_candidate_count_correlation": (
+                        _pearson_tensor(
+                            trajectory.step_rewards[active],
+                            trajectory.step_candidate_count[active].float(),
+                        )
+                    ),
+                    "step_reward_ankle_high_frequency_correlation": (
+                        _pearson_tensor(
+                            trajectory.step_rewards[active],
+                            trajectory.step_ankle_high_frequency_ratio[active],
+                        )
                     ),
                     "step_rollout_samples": float(active.sum()),
                 }
@@ -3072,9 +3442,25 @@ class DDPOTrainer:
                 "detected_mean": (
                     evaluation.detected_mean_per_prompt[index].item()
                 ),
+                "soft_count_mean": (
+                    evaluation.soft_count_mean_per_prompt[index].item()
+                ),
+                "soft_error_mean": (
+                    evaluation.soft_error_mean_per_prompt[index].item()
+                ),
+                "soft_mae": evaluation.soft_mae_per_prompt[index].item(),
+                "candidate_count_mean": (
+                    evaluation.candidate_count_mean_per_prompt[index].item()
+                ),
+                "candidate_spacing_mean": (
+                    evaluation.candidate_spacing_mean_per_prompt[index].item()
+                ),
+                "ankle_high_frequency_ratio": (
+                    evaluation.ankle_high_frequency_ratio_per_prompt[index].item()
+                ),
             }
             for name, current in current_values.items():
-                baseline = self.fixed_step_eval_baseline_per_prompt[name][
+                baseline = self._fixed_step_baseline_component(name)[
                     index
                 ].item()
                 entry[f"{name}_baseline"] = baseline
@@ -3096,6 +3482,33 @@ class DDPOTrainer:
             encoding="utf-8",
         ) as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _fixed_step_baseline_component(self, name: str) -> torch.Tensor:
+        """Read new diagnostics from old fixed-step checkpoint baselines safely."""
+
+        baseline = self.fixed_step_eval_baseline_per_prompt
+        if baseline is None:
+            raise RuntimeError(
+                "Fixed step evaluation baseline has not been initialized."
+            )
+        if name in baseline:
+            return baseline[name]
+        detected = baseline["detected_mean"]
+        if name in {"soft_count_mean", "candidate_count_mean"}:
+            return detected
+        if name == "soft_mae":
+            return baseline["mae"]
+        if name == "soft_error_mean":
+            pool = getattr(self, "fixed_step_eval_pool", None)
+            if pool is not None and len(pool.target_steps) == len(detected):
+                return detected - pool.target_steps.detach().float().cpu()
+            return torch.zeros_like(detected)
+        if name in {
+            "candidate_spacing_mean",
+            "ankle_high_frequency_ratio",
+        }:
+            return torch.zeros_like(detected)
+        raise KeyError(f"Fixed step baseline has no component {name!r}.")
 
     def _fixed_eval_with_deltas(
         self,
@@ -3195,6 +3608,30 @@ class DDPOTrainer:
                     "within_one_fraction"
                 ],
             ),
+            (
+                "eval_step_soft_count",
+                evaluation.soft_count_mean_per_prompt,
+                self._fixed_step_baseline_component("soft_count_mean"),
+            ),
+            (
+                "eval_step_candidate_count",
+                evaluation.candidate_count_mean_per_prompt,
+                self._fixed_step_baseline_component("candidate_count_mean"),
+            ),
+            (
+                "eval_step_candidate_spacing",
+                evaluation.candidate_spacing_mean_per_prompt,
+                self._fixed_step_baseline_component(
+                    "candidate_spacing_mean"
+                ),
+            ),
+            (
+                "eval_step_ankle_high_frequency_ratio",
+                evaluation.ankle_high_frequency_ratio_per_prompt,
+                self._fixed_step_baseline_component(
+                    "ankle_high_frequency_ratio"
+                ),
+            ),
         )
         for offset, (name, current, baseline) in enumerate(components):
             result.update(
@@ -3214,6 +3651,32 @@ class DDPOTrainer:
                 bootstrap_samples=self.config.fixed_eval_bootstrap_samples,
                 seed=self.config.fixed_eval_seed + 30_000,
             )
+        )
+        result.update(
+            summarize_fixed_eval_error(
+                "eval_step_soft_mae",
+                evaluation.soft_mae_per_prompt,
+                self._fixed_step_baseline_component("soft_mae"),
+                bootstrap_samples=self.config.fixed_eval_bootstrap_samples,
+                seed=self.config.fixed_eval_seed + 31_000,
+            )
+        )
+        soft_error_baseline = self._fixed_step_baseline_component(
+            "soft_error_mean"
+        )
+        result.update(
+            {
+                "eval_step_soft_error_mean": (
+                    evaluation.soft_error_mean_per_prompt.mean().item()
+                ),
+                "eval_step_soft_error_mean_baseline": (
+                    soft_error_baseline.mean().item()
+                ),
+                "eval_step_soft_error_mean_delta": (
+                    evaluation.soft_error_mean_per_prompt
+                    - soft_error_baseline
+                ).mean().item(),
+            }
         )
         detected_baseline = self.fixed_step_eval_baseline_per_prompt[
             "detected_mean"
@@ -3284,6 +3747,8 @@ class DDPOTrainer:
             self.fixed_step_eval_baseline_per_prompt = None
             self.best_step_reward_delta = None
             self.best_step_epoch = None
+            self.best_step_acceptance_score = None
+            self.best_step_acceptance_epoch = None
             self.evals_without_improvement = 0
         if self.fixed_eval_baseline is None:
             if self.config.resume:
@@ -3336,6 +3801,24 @@ class DDPOTrainer:
                     "detected_mean": (
                         step_baseline_evaluation.detected_mean_per_prompt.clone()
                     ),
+                    "soft_count_mean": (
+                        step_baseline_evaluation.soft_count_mean_per_prompt.clone()
+                    ),
+                    "soft_error_mean": (
+                        step_baseline_evaluation.soft_error_mean_per_prompt.clone()
+                    ),
+                    "soft_mae": (
+                        step_baseline_evaluation.soft_mae_per_prompt.clone()
+                    ),
+                    "candidate_count_mean": (
+                        step_baseline_evaluation.candidate_count_mean_per_prompt.clone()
+                    ),
+                    "candidate_spacing_mean": (
+                        step_baseline_evaluation.candidate_spacing_mean_per_prompt.clone()
+                    ),
+                    "ankle_high_frequency_ratio": (
+                        step_baseline_evaluation.ankle_high_frequency_ratio_per_prompt.clone()
+                    ),
                 }
                 self.fixed_eval_baseline.update(
                     self._fixed_step_eval_with_deltas(
@@ -3374,6 +3857,58 @@ class DDPOTrainer:
                         self.fixed_step_eval_baseline_per_prompt[
                             "detected_mean"
                         ]
+                    ),
+                    soft_count_mean_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt.get(
+                            "soft_count_mean",
+                            self.fixed_step_eval_baseline_per_prompt[
+                                "detected_mean"
+                            ],
+                        )
+                    ),
+                    soft_error_mean_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt.get(
+                            "soft_error_mean",
+                            torch.zeros_like(
+                                self.fixed_step_eval_baseline_per_prompt[
+                                    "detected_mean"
+                                ]
+                            ),
+                        )
+                    ),
+                    soft_mae_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt.get(
+                            "soft_mae",
+                            self.fixed_step_eval_baseline_per_prompt["mae"],
+                        )
+                    ),
+                    candidate_count_mean_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt.get(
+                            "candidate_count_mean",
+                            self.fixed_step_eval_baseline_per_prompt[
+                                "detected_mean"
+                            ],
+                        )
+                    ),
+                    candidate_spacing_mean_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt.get(
+                            "candidate_spacing_mean",
+                            torch.zeros_like(
+                                self.fixed_step_eval_baseline_per_prompt[
+                                    "detected_mean"
+                                ]
+                            ),
+                        )
+                    ),
+                    ankle_high_frequency_ratio_per_prompt=(
+                        self.fixed_step_eval_baseline_per_prompt.get(
+                            "ankle_high_frequency_ratio",
+                            torch.zeros_like(
+                                self.fixed_step_eval_baseline_per_prompt[
+                                    "detected_mean"
+                                ]
+                            ),
+                        )
                     ),
                 )
         initialized_best = self.best_balanced_score is None
@@ -3432,6 +3967,9 @@ class DDPOTrainer:
         metrics = self._fixed_eval_with_deltas(evaluation)
         step_evaluation: FixedStepEvalResult | None = None
         is_best_step = False
+        is_best_step_acceptance = False
+        step_acceptance = False
+        step_acceptance_score = 0.0
         if getattr(self, "fixed_step_eval_pool", None) is not None:
             step_evaluation = self.evaluate_fixed_step_pool()
             metrics.update(self._fixed_step_eval_with_deltas(step_evaluation))
@@ -3457,6 +3995,48 @@ class DDPOTrainer:
             metrics["eval_reward_retrieval_delta"] >= retrieval_tolerance
             and metrics["eval_reward_m2m_delta"] >= m2m_tolerance
         )
+        if step_evaluation is not None:
+            step_acceptance = bool(
+                feasible
+                and metrics["eval_step_mae_delta"] < 0
+                and metrics["eval_step_exact_fraction_delta"] > 0
+                and metrics["eval_step_within_one_fraction_delta"] > 0
+            )
+            sample_resolution = 1.0 / max(
+                1.0,
+                float(metrics["step_eval_samples"]),
+            )
+
+            def standardized_improvement(name: str, *, lower: bool) -> float:
+                delta = float(metrics[f"{name}_delta"])
+                standard_error = max(
+                    sample_resolution,
+                    float(metrics[f"{name}_delta_bootstrap_se"]),
+                )
+                return (-delta if lower else delta) / standard_error
+
+            step_acceptance_score = (
+                standardized_improvement("eval_step_mae", lower=True)
+                + standardized_improvement(
+                    "eval_step_exact_fraction",
+                    lower=False,
+                )
+                + standardized_improvement(
+                    "eval_step_within_one_fraction",
+                    lower=False,
+                )
+            )
+            is_best_step_acceptance = bool(
+                step_acceptance
+                and (
+                    self.best_step_acceptance_score is None
+                    or step_acceptance_score
+                    > self.best_step_acceptance_score
+                )
+            )
+            if is_best_step_acceptance:
+                self.best_step_acceptance_score = step_acceptance_score
+                self.best_step_acceptance_epoch = epoch
         automatic_min_delta = (
             self.config.early_stop_se_multiplier
             * metrics["eval_balanced_score_bootstrap_se"]
@@ -3515,6 +4095,11 @@ class DDPOTrainer:
                 "eval_is_best_retrieval": float(is_best_retrieval),
                 "eval_is_best_m2m": float(is_best_m2m),
                 "eval_is_best_step": float(is_best_step),
+                "eval_step_acceptance": float(step_acceptance),
+                "eval_step_acceptance_score": step_acceptance_score,
+                "eval_is_best_step_acceptance": float(
+                    is_best_step_acceptance
+                ),
                 "eval_best_balanced_score": self.best_balanced_score,
                 "eval_best_balanced_epoch": float(
                     self.best_balanced_epoch
@@ -3531,6 +4116,18 @@ class DDPOTrainer:
                 "eval_best_step_epoch": float(
                     getattr(self, "best_step_epoch", None)
                     if getattr(self, "best_step_epoch", None) is not None
+                    else -1
+                ),
+                "eval_best_step_acceptance_score": float(
+                    getattr(self, "best_step_acceptance_score", None) or 0.0
+                ),
+                "eval_best_step_acceptance_epoch": float(
+                    getattr(self, "best_step_acceptance_epoch", None)
+                    if getattr(
+                        self,
+                        "best_step_acceptance_epoch",
+                        None,
+                    ) is not None
                     else -1
                 ),
                 "eval_evals_without_improvement": float(
@@ -3653,6 +4250,8 @@ class DDPOTrainer:
             "best_m2m_epoch": self.best_m2m_epoch,
             "best_step_reward_delta": self.best_step_reward_delta,
             "best_step_epoch": self.best_step_epoch,
+            "best_step_acceptance_score": self.best_step_acceptance_score,
+            "best_step_acceptance_epoch": self.best_step_acceptance_epoch,
             "evals_without_improvement": self.evals_without_improvement,
         }
 
@@ -3662,6 +4261,7 @@ class DDPOTrainer:
             "best_retrieval.pt",
             "best_m2m.pt",
             "best_step.pt",
+            "best_step_acceptance.pt",
             "latest.pt",
         }:
             raise ValueError(f"Unsupported named checkpoint: {name!r}.")
@@ -3689,6 +4289,7 @@ class DDPOTrainer:
                 "best_retrieval.pt",
                 "best_m2m.pt",
                 "best_step.pt",
+                "best_step_acceptance.pt",
             }:
                 raise ValueError(f"Unsupported best checkpoint: {name!r}.")
             shutil.copy2(checkpoint_path, self.output_dir / name)
@@ -3808,6 +4409,12 @@ class DDPOTrainer:
             "best_step_reward_delta"
         )
         self.best_step_epoch = checkpoint.get("best_step_epoch")
+        self.best_step_acceptance_score = checkpoint.get(
+            "best_step_acceptance_score"
+        )
+        self.best_step_acceptance_epoch = checkpoint.get(
+            "best_step_acceptance_epoch"
+        )
         if (
             "best_balanced_score" not in checkpoint
             and self.fixed_eval_baseline is not None
@@ -3867,6 +4474,10 @@ class DDPOTrainer:
                         ("eval_is_best_retrieval", "best_retrieval.pt"),
                         ("eval_is_best_m2m", "best_m2m.pt"),
                         ("eval_is_best_step", "best_step.pt"),
+                        (
+                            "eval_is_best_step_acceptance",
+                            "best_step_acceptance.pt",
+                        ),
                     )
                     if bool(fixed_eval_metrics.get(metric_name, 0.0))
                 )

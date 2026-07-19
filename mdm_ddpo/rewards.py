@@ -21,6 +21,13 @@ class RewardOutput:
     detected_steps: torch.Tensor | None = None
     target_steps: torch.Tensor | None = None
     step_absolute_error: torch.Tensor | None = None
+    soft_step_count: torch.Tensor | None = None
+    soft_step_error: torch.Tensor | None = None
+    step_raw_candidate_count: torch.Tensor | None = None
+    step_candidate_count: torch.Tensor | None = None
+    step_candidate_spacing_mean: torch.Tensor | None = None
+    step_candidate_spacing_min: torch.Tensor | None = None
+    step_ankle_high_frequency_ratio: torch.Tensor | None = None
 
     def means(self) -> dict[str, float]:
         return {
@@ -74,6 +81,15 @@ def apply_step_m2m_policy(
         detected_steps=reward.detected_steps,
         target_steps=reward.target_steps,
         step_absolute_error=reward.step_absolute_error,
+        soft_step_count=reward.soft_step_count,
+        soft_step_error=reward.soft_step_error,
+        step_raw_candidate_count=reward.step_raw_candidate_count,
+        step_candidate_count=reward.step_candidate_count,
+        step_candidate_spacing_mean=reward.step_candidate_spacing_mean,
+        step_candidate_spacing_min=reward.step_candidate_spacing_min,
+        step_ankle_high_frequency_ratio=(
+            reward.step_ankle_high_frequency_ratio
+        ),
     )
 
 
@@ -86,6 +102,13 @@ def add_step_reward(
     target_steps: torch.Tensor,
     absolute_error: torch.Tensor,
     step_weight: float,
+    soft_step_count: torch.Tensor | None = None,
+    soft_step_error: torch.Tensor | None = None,
+    raw_candidate_count: torch.Tensor | None = None,
+    candidate_count: torch.Tensor | None = None,
+    candidate_spacing_mean: torch.Tensor | None = None,
+    candidate_spacing_min: torch.Tensor | None = None,
+    ankle_high_frequency_ratio: torch.Tensor | None = None,
 ) -> RewardOutput:
     if step.shape != reward.total.shape:
         raise ValueError("Step reward must match the base reward shape.")
@@ -97,6 +120,19 @@ def add_step_reward(
     ):
         if value.shape != reward.total.shape:
             raise ValueError("Step reward diagnostics must match base rewards.")
+    for value in (
+        soft_step_count,
+        soft_step_error,
+        raw_candidate_count,
+        candidate_count,
+        candidate_spacing_mean,
+        candidate_spacing_min,
+        ankle_high_frequency_ratio,
+    ):
+        if value is not None and value.shape != reward.total.shape:
+            raise ValueError(
+                "Optional step diagnostics must match base rewards."
+            )
     total = reward.total + float(step_weight) * step.to(reward.total)
     return RewardOutput(
         total=total,
@@ -107,6 +143,41 @@ def add_step_reward(
         detected_steps=detected_steps.to(reward.total.device),
         target_steps=target_steps.to(reward.total.device),
         step_absolute_error=absolute_error.to(reward.total.device),
+        soft_step_count=(
+            soft_step_count.to(reward.total.device)
+            if soft_step_count is not None
+            else None
+        ),
+        soft_step_error=(
+            soft_step_error.to(reward.total.device)
+            if soft_step_error is not None
+            else None
+        ),
+        step_raw_candidate_count=(
+            raw_candidate_count.to(reward.total.device)
+            if raw_candidate_count is not None
+            else None
+        ),
+        step_candidate_count=(
+            candidate_count.to(reward.total.device)
+            if candidate_count is not None
+            else None
+        ),
+        step_candidate_spacing_mean=(
+            candidate_spacing_mean.to(reward.total.device)
+            if candidate_spacing_mean is not None
+            else None
+        ),
+        step_candidate_spacing_min=(
+            candidate_spacing_min.to(reward.total.device)
+            if candidate_spacing_min is not None
+            else None
+        ),
+        step_ankle_high_frequency_ratio=(
+            ankle_high_frequency_ratio.to(reward.total.device)
+            if ankle_high_frequency_ratio is not None
+            else None
+        ),
     )
 
 
