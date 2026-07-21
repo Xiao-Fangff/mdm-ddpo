@@ -93,6 +93,140 @@ def load_model_args(config: TrainConfig) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def resolve_prediction_type(
+    model_args: SimpleNamespace,
+    requested: str = "auto",
+) -> str:
+    """Resolve checkpoint output parameterization without trusting MDM defaults."""
+
+    if requested not in {"auto", "x_start", "epsilon"}:
+        raise ValueError(
+            "Prediction type must be one of: auto, x_start, epsilon."
+        )
+    if requested != "auto":
+        return requested
+
+    stored = getattr(model_args, "prediction_type", None)
+    if stored is not None:
+        normalized = str(stored).strip().lower().replace("-", "_")
+        aliases = {
+            "x0": "x_start",
+            "xstart": "x_start",
+            "start_x": "x_start",
+            "x_start": "x_start",
+            "eps": "epsilon",
+            "epsilon": "epsilon",
+        }
+        if normalized not in aliases:
+            raise ValueError(
+                "Unsupported prediction_type in checkpoint args.json: "
+                f"{stored!r}."
+            )
+        return aliases[normalized]
+
+    predict_epsilon = getattr(model_args, "predict_epsilon", None)
+    if predict_epsilon is None:
+        return "x_start"
+    if not isinstance(predict_epsilon, bool):
+        raise ValueError(
+            "predict_epsilon in checkpoint args.json must be a JSON boolean."
+        )
+    return "epsilon" if predict_epsilon else "x_start"
+
+
+def configure_diffusion_prediction_type(
+    diffusion: Any,
+    prediction_type: str,
+) -> None:
+    """Apply a resolved type even when the external MDM hard-codes x-start."""
+
+    member_name = {
+        "x_start": "START_X",
+        "epsilon": "EPSILON",
+    }.get(prediction_type)
+    if member_name is None:
+        raise ValueError(f"Unsupported prediction type: {prediction_type!r}.")
+    current = diffusion.model_mean_type
+    enum_type = type(current)
+    try:
+        diffusion.model_mean_type = enum_type[member_name]
+    except (KeyError, TypeError) as error:
+        raise TypeError(
+            "Diffusion model_mean_type is not a compatible enum."
+        ) from error
+
+
+def diffusion_prediction_type(diffusion: Any) -> str:
+    name = getattr(diffusion.model_mean_type, "name", "")
+    if name == "START_X":
+        return "x_start"
+    if name == "EPSILON":
+        return "epsilon"
+    raise ValueError(f"Unsupported diffusion model mean type: {name!r}.")
+
+
+def diffusion_runtime_metadata(
+    model_args: SimpleNamespace,
+    diffusion: Any,
+) -> dict[str, Any]:
+    """Return and audit the checkpoint-specific diffusion configuration.
+
+    Prediction type is only one part of the policy definition.  In particular,
+    a linear epsilon checkpoint must not silently inherit a cosine x-start
+    schedule or the wrong fixed-variance convention from a default config.
+    """
+
+    training_steps = int(model_args.diffusion_steps)
+    sample_steps = int(diffusion.num_timesteps)
+    if sample_steps > training_steps:
+        raise RuntimeError(
+            "Sample diffusion has more timesteps than its checkpoint training "
+            f"diffusion: sample={sample_steps}, training={training_steps}."
+        )
+
+    sigma_small = getattr(model_args, "sigma_small", None)
+    if sigma_small is not None and not isinstance(sigma_small, bool):
+        raise TypeError("sigma_small in checkpoint args.json must be a JSON boolean.")
+    model_var_type = getattr(diffusion.model_var_type, "name", "")
+    if sigma_small is not None:
+        expected_var_type = "FIXED_SMALL" if sigma_small else "FIXED_LARGE"
+        if model_var_type != expected_var_type:
+            raise RuntimeError(
+                "Checkpoint sigma_small setting does not match the effective "
+                "diffusion variance type: "
+                f"expected={expected_var_type}, actual={model_var_type!r}."
+            )
+
+    return {
+        "prediction_type": diffusion_prediction_type(diffusion),
+        "training_diffusion_steps": training_steps,
+        "sample_steps": sample_steps,
+        "noise_schedule": str(model_args.noise_schedule),
+        "sigma_small": sigma_small,
+        "model_var_type": model_var_type,
+        "min_snr_gamma": float(getattr(model_args, "min_snr_gamma", 0.0)),
+        "lambda_xstart": float(getattr(model_args, "lambda_xstart", 0.0)),
+        "lambda_xstart_vel": float(
+            getattr(model_args, "lambda_xstart_vel", 0.0)
+        ),
+    }
+
+
+def validate_diffusion_runtime_metadata(
+    expected: dict[str, Any],
+    actual: dict[str, Any],
+    *,
+    source: str,
+) -> None:
+    """Reject reuse of an artifact produced by a different MDM policy."""
+
+    if expected != actual:
+        raise ValueError(
+            f"{source} MDM diffusion configuration does not match the current "
+            f"policy: expected={expected}, actual={actual}."
+        )
+
+
 def _seed_worker(worker_id: int) -> None:
     del worker_id
     worker_seed = torch.initial_seed() % (2**32)
@@ -222,15 +356,28 @@ def build_mdm(
 ) -> tuple[nn.Module, Any, Any, int]:
     from utils.model_util import create_model_and_diffusion, load_saved_model
 
+    prediction_type = resolve_prediction_type(
+        model_args,
+        config.prediction_type,
+    )
+    # Let external versions that support this flag do the right thing, then
+    # enforce it below for versions that still hard-code x-start.
+    model_args.predict_epsilon = prediction_type == "epsilon"
+    model_args.prediction_type = prediction_type
+
     # MDM's BERT path is relative in the reference source.
     with working_directory(config.mdm_root):
         model, base_diffusion = create_model_and_diffusion(model_args, data_loader)
+        configure_diffusion_prediction_type(base_diffusion, prediction_type)
         load_saved_model(model, config.model_path, use_avg=True)
 
     sample_steps = config.sample_steps or int(model_args.diffusion_steps)
     if sample_steps < 2:
         raise ValueError("DDPO needs at least two diffusion steps.")
     diffusion = _build_respaced_diffusion(base_diffusion, model_args, sample_steps)
+    # Fail during construction rather than after an expensive rollout if any
+    # checkpoint-specific diffusion setting was lost or overridden.
+    diffusion_runtime_metadata(model_args, diffusion)
     model.to(device)
     model.eval()
     return model, diffusion, base_diffusion, sample_steps

@@ -115,7 +115,7 @@ def _format(value: float) -> str:
 
 def render_markdown(runs: list[dict[str, Any]]) -> str:
     lines = [
-        "# K16 step M2M ablation analysis",
+        "# Step experiment analysis",
         "",
         "## Fixed step validation",
         "",

@@ -1,0 +1,99 @@
+{
+  "calibration_id": "375fd331fcb8385135abb980d95e24751ffdd617734e6f2e92c0da4903f03047",
+  "components": {
+    "m2m": {
+      "global_max": 0.9919762015342712,
+      "global_mean": 0.5124151706695557,
+      "global_min": -0.4805227816104889,
+      "global_scale": 0.27119916677474976,
+      "global_std": 0.27119916677474976,
+      "within_group_range_max": 1.2331442832946777,
+      "within_group_range_mean": 0.3586350679397583,
+      "within_group_range_min": 0.021421968936920166,
+      "within_group_range_p25": 0.20374739170074463,
+      "within_group_range_p50": 0.3231164813041687,
+      "within_group_std_max": 0.5164098143577576,
+      "within_group_std_mean": 0.14017713069915771,
+      "within_group_std_min": 0.009372192434966564,
+      "within_group_std_p25": 0.07925327122211456,
+      "within_group_std_p50": 0.12660595774650574
+    },
+    "retrieval": {
+      "global_max": 0.975416362285614,
+      "global_mean": 0.5617527961730957,
+      "global_min": -0.5510832071304321,
+      "global_scale": 0.24223947525024414,
+      "global_std": 0.24223947525024414,
+      "within_group_range_max": 1.1528611183166504,
+      "within_group_range_mean": 0.3388461470603943,
+      "within_group_range_min": 0.01966303586959839,
+      "within_group_range_p25": 0.18922270834445953,
+      "within_group_range_p50": 0.305667519569397,
+      "within_group_std_max": 0.4557686746120453,
+      "within_group_std_mean": 0.13220904767513275,
+      "within_group_std_min": 0.00752264354377985,
+      "within_group_std_p25": 0.07328519970178604,
+      "within_group_std_p50": 0.11915338039398193
+    },
+    "total": {
+      "global_max": 1.9449365139007568,
+      "global_mean": 1.0741679668426514,
+      "global_min": -1.0316059589385986,
+      "global_scale": 0.4895421862602234,
+      "global_std": 0.4895421862602234,
+      "within_group_range_max": 2.304718255996704,
+      "within_group_range_mean": 0.6596298813819885,
+      "within_group_range_min": 0.0528411865234375,
+      "within_group_range_p25": 0.3653959631919861,
+      "within_group_range_p50": 0.5813835263252258,
+      "within_group_std_max": 0.9672150611877441,
+      "within_group_std_mean": 0.2582911550998688,
+      "within_group_std_min": 0.02039450965821743,
+      "within_group_std_p25": 0.1441260427236557,
+      "within_group_std_p50": 0.22940215468406677
+    }
+  },
+  "full_calibration": true,
+  "metadata": {
+    "dataset": "humanml",
+    "ddim_eta": 1.0,
+    "guidance_scale": 2.5,
+    "mdm_diffusion": {
+      "lambda_xstart": 1.0,
+      "lambda_xstart_vel": 0.1,
+      "min_snr_gamma": 5.0,
+      "model_var_type": "FIXED_SMALL",
+      "noise_schedule": "linear",
+      "prediction_type": "epsilon",
+      "sample_steps": 50,
+      "sigma_small": true,
+      "training_diffusion_steps": 50
+    },
+    "model_args_path": "/home/zhiwei/projects/motion-diffusion-model/save/humanml_trans_dec_512_bert_epsilon_linear50_minsnr5_xstart1_vel01/args.json",
+    "model_path": "/home/zhiwei/projects/motion-diffusion-model/save/humanml_trans_dec_512_bert_epsilon_linear50_minsnr5_xstart1_vel01/model000150000.pt",
+    "policy": "original_mdm_without_lora",
+    "pool_id": "ca9135dfa8a3d000e7e270ccd7d20a2bb930a25f95134b2bc51b5924097c50be",
+    "pool_path": "/home/zhiwei/projects/mdm-ddpo/artifacts/reward_calibration_pool.pt",
+    "precision": "bf16",
+    "reward_embedding_mode": "mean",
+    "sample_steps": 50,
+    "seed": 20260718,
+    "split": "train"
+  },
+  "num_prompts": 1024,
+  "relationships": {
+    "global_pearson_correlation": 0.8175839185714722,
+    "ranking_comparable_pair_count": 6144.0,
+    "ranking_conflict_fraction": 0.19547526041666666,
+    "ranking_conflict_fraction_all_pairs": 0.19547526041666666,
+    "ranking_tie_fraction": 0.0,
+    "ranking_total_pair_count": 6144.0,
+    "within_group_centered_pearson_correlation": 0.8153789043426514
+  },
+  "reward_weights": {
+    "m2m": 1.0,
+    "retrieval": 1.0
+  },
+  "samples_per_prompt": 4,
+  "schema_version": 1
+}

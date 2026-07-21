@@ -33,6 +33,7 @@ class TrainConfig:
     model_args_path: str = (
         DEFAULT_MDM_ROOT + "/save/humanml_trans_dec_512_bert/args.json"
     )
+    prediction_type: str = "auto"
     reward_backbone_path: str = (
         DEFAULT_MOTIONRFT_ROOT
         + "/checkpoints/motionreward/stage1_retrieval_backbone_r128.pth"
@@ -162,6 +163,10 @@ class TrainConfig:
     allow_uncalibrated_soft_step_reward: bool = False
 
     def validate(self) -> None:
+        if self.prediction_type not in {"auto", "x_start", "epsilon"}:
+            raise ValueError(
+                "--prediction-type must be one of: auto, x_start, epsilon."
+            )
         if self.dataset != "humanml":
             raise ValueError(
                 "The MotionReward 263-D adapter currently supports dataset='humanml' only."
@@ -690,6 +695,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--model-args-path",
         default=TrainConfig.model_args_path,
         help="args.json paired with the pretrained MDM checkpoint.",
+    )
+    paths.add_argument(
+        "--prediction-type",
+        choices=["auto", "x_start", "epsilon"],
+        default="auto",
+        help=(
+            "How the MDM checkpoint parameterizes its denoising output. "
+            "'auto' reads prediction_type or predict_epsilon from args.json "
+            "and falls back to x_start for legacy checkpoints."
+        ),
     )
     paths.add_argument(
         "--reward-backbone-path",

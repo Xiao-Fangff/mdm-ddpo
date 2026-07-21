@@ -5,7 +5,10 @@ import torch
 from torch import nn
 import unittest
 
-from mdm_ddpo.diffusion import ddim_step_with_logprob
+from mdm_ddpo.diffusion import (
+    ddim_step_with_logprob,
+    ddim_transition_mean_std,
+)
 
 
 class ToyPolicy(nn.Module):
@@ -165,6 +168,34 @@ class DiffusionLogProbTest(unittest.TestCase):
 
         torch.testing.assert_close(first, second)
         torch.testing.assert_close(first_log_prob, second_log_prob)
+
+    def test_transition_parameters_reconstruct_an_explicit_noise_step(self):
+        diffusion = ToyDiffusion()
+        policy = ToyPolicy()
+        sample = torch.randn(2, 2, 1, 3)
+        timestep = torch.full((2,), 2, dtype=torch.long)
+        noise = torch.randn_like(sample)
+
+        mean, std, expected_xstart = ddim_transition_mean_std(
+            diffusion,
+            policy,
+            sample,
+            timestep,
+            model_kwargs={},
+            eta=1.0,
+        )
+        previous, _, actual_xstart = ddim_step_with_logprob(
+            diffusion,
+            policy,
+            sample,
+            timestep,
+            model_kwargs={},
+            eta=1.0,
+            noise=noise,
+        )
+
+        torch.testing.assert_close(previous, mean + std * noise)
+        torch.testing.assert_close(actual_xstart, expected_xstart)
 
 
 if __name__ == "__main__":

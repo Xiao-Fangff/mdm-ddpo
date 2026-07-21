@@ -29,6 +29,62 @@ def _masked_mean_per_sample(
     return numerator / denominator
 
 
+def ddim_transition_mean_std(
+    diffusion: Any,
+    model: torch.nn.Module,
+    sample: torch.Tensor,
+    timestep: torch.Tensor,
+    *,
+    model_kwargs: dict[str, Any],
+    eta: float,
+    clip_denoised: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the stochastic DDIM transition parameters for an MDM policy.
+
+    Keeping this calculation separate from sampling makes it possible to
+    audit or replay a fixed trajectory without duplicating MDM's x-start
+    parameterization math in diagnostic tools.
+    """
+
+    if eta <= 0:
+        raise ValueError("eta must be > 0 for a stochastic DDPO policy.")
+    if timestep.ndim != 1 or timestep.shape[0] != sample.shape[0]:
+        raise ValueError("timestep must have shape [batch].")
+
+    out = diffusion.p_mean_variance(
+        model,
+        sample,
+        timestep,
+        clip_denoised=clip_denoised,
+        model_kwargs=model_kwargs,
+    )
+    pred_xstart = out["pred_xstart"]
+    eps = diffusion._predict_eps_from_xstart(sample, timestep, pred_xstart)
+
+    alpha_bar = _extract(diffusion.alphas_cumprod, timestep, sample.shape)
+    alpha_bar_prev = _extract(
+        diffusion.alphas_cumprod_prev,
+        timestep,
+        sample.shape,
+    )
+    sigma_sq = (
+        eta**2
+        * (1.0 - alpha_bar_prev)
+        / (1.0 - alpha_bar).clamp_min(1.0e-12)
+        * (1.0 - alpha_bar / alpha_bar_prev.clamp_min(1.0e-12))
+    ).clamp_min(0.0)
+    direction_scale = (1.0 - alpha_bar_prev - sigma_sq).clamp_min(0.0).sqrt()
+    mean = (
+        pred_xstart * alpha_bar_prev.sqrt() + direction_scale * eps
+    ).contiguous()
+
+    active = (timestep != 0).to(sample.dtype).reshape(
+        sample.shape[0], *([1] * (sample.ndim - 1))
+    )
+    std = sigma_sq.sqrt().to(sample.dtype) * active
+    return mean, std, pred_xstart
+
+
 def ddim_step_with_logprob(
     diffusion: Any,
     model: torch.nn.Module,
@@ -55,39 +111,15 @@ def ddim_step_with_logprob(
     log-probability.  It is still executed to produce the final clean motion.
     """
 
-    if eta <= 0:
-        raise ValueError("eta must be > 0 for a stochastic DDPO policy.")
-    if timestep.ndim != 1 or timestep.shape[0] != sample.shape[0]:
-        raise ValueError("timestep must have shape [batch].")
-
-    out = diffusion.p_mean_variance(
+    mean, std, pred_xstart = ddim_transition_mean_std(
+        diffusion,
         model,
         sample,
         timestep,
-        clip_denoised=clip_denoised,
         model_kwargs=model_kwargs,
+        eta=eta,
+        clip_denoised=clip_denoised,
     )
-    pred_xstart = out["pred_xstart"]
-    eps = diffusion._predict_eps_from_xstart(sample, timestep, pred_xstart)
-
-    alpha_bar = _extract(diffusion.alphas_cumprod, timestep, sample.shape)
-    alpha_bar_prev = _extract(diffusion.alphas_cumprod_prev, timestep, sample.shape)
-    sigma_sq = (
-        eta**2
-        * (1.0 - alpha_bar_prev)
-        / (1.0 - alpha_bar).clamp_min(1.0e-12)
-        * (1.0 - alpha_bar / alpha_bar_prev.clamp_min(1.0e-12))
-    ).clamp_min(0.0)
-    sigma = sigma_sq.sqrt()
-    direction_scale = (1.0 - alpha_bar_prev - sigma_sq).clamp_min(0.0).sqrt()
-    mean = (
-        pred_xstart * alpha_bar_prev.sqrt() + direction_scale * eps
-    ).contiguous()
-
-    active = (timestep != 0).to(sample.dtype).reshape(
-        sample.shape[0], *([1] * (sample.ndim - 1))
-    )
-    std = sigma.to(sample.dtype) * active
 
     if prev_sample is None:
         if noise is None:

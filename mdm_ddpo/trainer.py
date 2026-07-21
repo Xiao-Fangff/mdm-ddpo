@@ -42,9 +42,12 @@ from .runtime import (
     build_model_kwargs,
     build_policy_model,
     CachedTextEmbedding,
+    diffusion_prediction_type,
+    diffusion_runtime_metadata,
     load_model_args,
     resolve_device,
     resolve_reward_device,
+    validate_diffusion_runtime_metadata,
     seed_everything,
     split_text_embeddings,
 )
@@ -1140,6 +1143,34 @@ class DDPOTrainer:
             self.data_loader,
             self.device,
         )
+        self.prediction_type = diffusion_prediction_type(self.diffusion)
+        self.diffusion_metadata = diffusion_runtime_metadata(
+            self.model_args,
+            self.diffusion,
+        )
+        with open(
+            self.output_dir / "runtime_metadata.json",
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(
+                {
+                    "model_path": str(
+                        Path(config.model_path).expanduser().resolve()
+                    ),
+                    "model_args_path": str(
+                        Path(config.model_args_path).expanduser().resolve()
+                    ),
+                    "mdm_diffusion": self.diffusion_metadata,
+                    "ddpo_sampler": "stochastic_ddim",
+                    "ddim_eta": config.ddim_eta,
+                    "guidance_scale": config.guidance_scale,
+                    "clip_denoised": config.clip_denoised,
+                },
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
 
         self.lora_report: LoRAReport | None = configure_trainable_policy(
             self.model,
@@ -1191,10 +1222,18 @@ class DDPOTrainer:
             if config.reward_calibration_path
             else None
         )
+        self._validate_calibration_mdm(
+            self.reward_calibration,
+            source="Reward calibration",
+        )
         self.step_reward_calibration: StepRewardCalibration | None = (
             load_step_reward_calibration(config.step_reward_calibration_path)
             if config.step_reward_calibration_path
             else None
+        )
+        self._validate_calibration_mdm(
+            self.step_reward_calibration,
+            source="Step reward calibration",
         )
         self.step_detector: HardStepDetector | None = None
         self.step_mdm_mean: torch.Tensor | None = None
@@ -1325,12 +1364,18 @@ class DDPOTrainer:
                 f"{self.lora_report.trainable_parameters:,}",
             )
         LOGGER.info(
-            "Diffusion steps=%d, policy transitions per sample=%d, "
+            "Diffusion prediction type=%s, steps=%d, "
+            "policy transitions per sample=%d, "
             "policy device=%s, reward device=%s",
+            self.prediction_type,
             self.sample_steps,
             self.sample_steps - 1,
             self.device,
             self.reward_device,
+        )
+        LOGGER.info(
+            "MDM diffusion configuration: %s",
+            json.dumps(self.diffusion_metadata, sort_keys=True),
         )
         if (
             config.precision != "no"
@@ -1341,10 +1386,40 @@ class DDPOTrainer:
                 "--train-batch-size equals --rollout-batch-size."
             )
 
+    def _validate_calibration_mdm(
+        self,
+        calibration: RewardCalibration | StepRewardCalibration | None,
+        *,
+        source: str,
+    ) -> None:
+        if calibration is None:
+            return
+        metadata = calibration.payload.get("metadata", {})
+        artifact_diffusion = metadata.get("mdm_diffusion")
+        # Legacy calibration files predate this audit and remain loadable.
+        if artifact_diffusion is None:
+            return
+        validate_diffusion_runtime_metadata(
+            artifact_diffusion,
+            self.diffusion_metadata,
+            source=source,
+        )
+        artifact_model_path = metadata.get("model_path")
+        if artifact_model_path is not None:
+            calibrated_model = Path(artifact_model_path).expanduser().resolve()
+            current_model = Path(self.config.model_path).expanduser().resolve()
+            if calibrated_model != current_model:
+                raise ValueError(
+                    f"{source} was generated for model {calibrated_model}, "
+                    f"but the current policy uses {current_model}."
+                )
+
     def preflight_summary(self) -> dict[str, Any]:
         total, trainable = parameter_counts(self.model)
         return {
             "dataset_samples": len(self.data_loader.dataset),
+            "prediction_type": self.prediction_type,
+            "mdm_diffusion": dict(self.diffusion_metadata),
             "diffusion_steps": self.sample_steps,
             "policy_transitions": self.sample_steps - 1,
             "policy_parameters": total,
@@ -4208,6 +4283,9 @@ class DDPOTrainer:
             "epoch": epoch,
             "global_step": self.global_step,
             "config": self.config.to_dict(),
+            "mdm_diffusion": dict(
+                getattr(self, "diffusion_metadata", {})
+            ),
             "train_mode": self.config.train_mode,
             "policy": trainable_state_dict(self.model),
             "optimizer": self.optimizer.state_dict(),
@@ -4309,6 +4387,13 @@ class DDPOTrainer:
             raise ValueError(
                 f"Checkpoint train_mode={checkpoint_mode!r} does not match "
                 f"current mode={self.config.train_mode!r}."
+            )
+        checkpoint_diffusion = checkpoint.get("mdm_diffusion")
+        if checkpoint_diffusion:
+            validate_diffusion_runtime_metadata(
+                checkpoint_diffusion,
+                self.diffusion_metadata,
+                source="Checkpoint",
             )
         checkpoint_calibration_id = checkpoint.get("reward_calibration_id")
         current_calibration_id = (

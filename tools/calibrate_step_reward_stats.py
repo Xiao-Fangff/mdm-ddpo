@@ -21,6 +21,7 @@ from mdm_ddpo.runtime import (  # noqa: E402
     build_data_loader,
     build_mdm,
     build_policy_model,
+    diffusion_runtime_metadata,
     load_model_args,
     resolve_device,
     seed_everything,
@@ -148,6 +149,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default=TrainConfig.model_path)
     parser.add_argument("--model-args-path", default=TrainConfig.model_args_path)
     parser.add_argument(
+        "--prediction-type",
+        choices=["auto", "x_start", "epsilon"],
+        default="auto",
+    )
+    parser.add_argument(
         "--allow-small-run",
         action="store_true",
         help="Allow a non-production calibration for smoke testing only.",
@@ -202,6 +208,7 @@ def _build_config(args: argparse.Namespace, output: Path) -> TrainConfig:
         motionrft_root=args.motionrft_root,
         model_path=args.model_path,
         model_args_path=args.model_args_path,
+        prediction_type=args.prediction_type,
         output_dir=str(output.parent),
         data_cache_dir=args.data_cache_dir,
         data_workers=args.data_workers,
@@ -439,6 +446,7 @@ def main(argv: list[str] | None = None) -> None:
         "step_targets": list(config.step_target_values),
         "step_samples_per_prompt": config.step_samples_per_prompt,
         "step_pool_source": config.step_rollout_source,
+        "mdm_diffusion": diffusion_runtime_metadata(model_args, diffusion),
     }
     payload = compute_step_reward_calibration(
         calibrated_reward,

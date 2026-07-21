@@ -1,0 +1,135 @@
+{
+  "conditions": 24,
+  "number_style": "words",
+  "pool_id": "52127be993e53464a44b96d2524c4e382d3765b1eacbc5539f0b640b77e0bf69",
+  "records": [
+    {
+      "checkpoint": "",
+      "delta_from_original": {
+        "ankle_high_frequency_ratio": 0.0,
+        "hard_exact_fraction": 0.0,
+        "hard_mae": 0.0,
+        "hard_target_count_spearman": 0.0,
+        "hard_within_one_fraction": 0.0,
+        "soft_target_count_spearman": 0.0
+      },
+      "epoch": -1,
+      "label": "original_mdm",
+      "metrics": {
+        "ankle_high_frequency_ratio_mean": 0.35653573274612427,
+        "candidate_count_mean": 4.333333492279053,
+        "candidate_spacing_mean": 0.5704691410064697,
+        "embedding": {
+          "projected_embed_text": {
+            "numerically_distinguishable": 1.0,
+            "pairwise_cosine_distance_mean": 0.03547978028655052,
+            "pairwise_cosine_distance_min": 0.008540928363800049,
+            "pairwise_rms_distance_mean": 0.01778983883559704,
+            "pairwise_rms_distance_min": 0.007611716166138649
+          },
+          "raw_text_encoder": {
+            "numerically_distinguishable": 1.0,
+            "pairwise_cosine_distance_mean": 0.01614808849990368,
+            "pairwise_cosine_distance_min": 0.0022521615028381348,
+            "pairwise_rms_distance_mean": 0.04873538017272949,
+            "pairwise_rms_distance_min": 0.019699743017554283
+          }
+        },
+        "hard": {
+          "length_count_spearman": 0.4270544516566092,
+          "length_regression_coefficient": 0.04684763572679512,
+          "length_standardized_coefficient": 0.44385308362873993,
+          "regression_r2": 0.4895423398425821,
+          "target_count_spearman": 0.09591452703690387,
+          "target_regression_coefficient": 0.121428571428572,
+          "target_standardized_coefficient": 0.08222384734970876
+        },
+        "hard_exact_fraction": 0.12152777777777778,
+        "hard_mae": 2.388888888888889,
+        "hard_per_target": {
+          "1": {
+            "detected_mean": 3.5208332538604736,
+            "exact_fraction": 0.0625,
+            "mae": 2.8541666666666665,
+            "within_one_fraction": 0.3333333333333333
+          },
+          "2": {
+            "detected_mean": 4.229166507720947,
+            "exact_fraction": 0.0625,
+            "mae": 2.8541666666666665,
+            "within_one_fraction": 0.22916666666666666
+          },
+          "3": {
+            "detected_mean": 3.9375,
+            "exact_fraction": 0.16666666666666666,
+            "mae": 2.1458333333333335,
+            "within_one_fraction": 0.3541666666666667
+          },
+          "4": {
+            "detected_mean": 4.375,
+            "exact_fraction": 0.125,
+            "mae": 2.0833333333333335,
+            "within_one_fraction": 0.4375
+          },
+          "5": {
+            "detected_mean": 4.041666507720947,
+            "exact_fraction": 0.1875,
+            "mae": 2.125,
+            "within_one_fraction": 0.4166666666666667
+          },
+          "6": {
+            "detected_mean": 4.395833492279053,
+            "exact_fraction": 0.125,
+            "mae": 2.2708333333333335,
+            "within_one_fraction": 0.4166666666666667
+          }
+        },
+        "hard_target_means": {
+          "1": 3.5208332538604736,
+          "2": 4.229166507720947,
+          "3": 3.9375,
+          "4": 4.375,
+          "5": 4.041666507720947,
+          "6": 4.395833492279053
+        },
+        "hard_within_condition_target_range_mean": 1.1875,
+        "hard_within_one_fraction": 0.3645833333333333,
+        "motion": {
+          "adjacent_target_motion_rms_mean": 0.22704848647117615,
+          "pairwise_motion_rms_mean": 0.25996673107147217,
+          "pairwise_motion_rms_median": 0.18482156097888947
+        },
+        "soft": {
+          "length_count_spearman": 0.38843923977206607,
+          "length_regression_coefficient": 0.0382495132345588,
+          "length_standardized_coefficient": 0.3987092163495343,
+          "regression_r2": 0.5248979742655406,
+          "target_count_spearman": 0.10152640296435743,
+          "target_regression_coefficient": 0.12021153874317904,
+          "target_standardized_coefficient": 0.08955747971036948
+        },
+        "soft_hard_abs_difference_mean": 0.5574408173561096,
+        "soft_mae": 2.2023007127191994,
+        "soft_target_means": {
+          "1": 3.05031418800354,
+          "2": 3.64812970161438,
+          "3": 3.3460140228271484,
+          "4": 3.8064815998077393,
+          "5": 3.497967004776001,
+          "6": 3.889799118041992
+        },
+        "soft_within_condition_target_range_mean": 1.1270607709884644
+      },
+      "pool_id": "52127be993e53464a44b96d2524c4e382d3765b1eacbc5539f0b640b77e0bf69"
+    }
+  ],
+  "samples_per_condition": 2,
+  "targets": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ]
+}

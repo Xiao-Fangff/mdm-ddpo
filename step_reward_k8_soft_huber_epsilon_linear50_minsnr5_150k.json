@@ -1,0 +1,190 @@
+{
+  "calibration_id": "8f297155dcab39df0837c2d920dced76daeee7bf364c21fa2416ae73c6112bce",
+  "component": {
+    "global_max": 0.15000000596046448,
+    "global_mean": -0.4061700403690338,
+    "global_min": -3.119217872619629,
+    "global_scale": 0.5133299231529236,
+    "global_std": 0.5133299231529236,
+    "nonzero_centered_sample_fraction": 1.0,
+    "pairwise_reward_tie_fraction": 0.002697172619047619,
+    "top1_centered_concentration": 0.39920589327812195,
+    "unique_reward_levels_mean": 7.942708492279053,
+    "unique_reward_levels_median": 8.0,
+    "unique_reward_levels_min": 4.0,
+    "within_group_range_mean": 0.9694885611534119,
+    "within_group_range_p25": 0.5707274675369263,
+    "within_group_range_p50": 0.8900704979896545,
+    "within_group_std_max": 0.9147881269454956,
+    "within_group_std_mean": 0.31676185131073,
+    "within_group_std_min": 0.020664744079113007,
+    "within_group_std_p25": 0.18586629629135132,
+    "within_group_std_p25_raw": 0.18586629629135132,
+    "within_group_std_p50": 0.2913011908531189,
+    "within_group_std_p50_raw": 0.2913011908531189,
+    "within_group_zero_std_fraction": 0.0
+  },
+  "detection_diagnostics": {
+    "ankle_high_frequency_ratio": {
+      "max": 0.9294419884681702,
+      "mean": 0.3246977627277374
+    },
+    "candidate_count": {
+      "max": 14.0,
+      "mean": 5.070638179779053
+    },
+    "candidate_spacing": {
+      "max": 3.299999952316284,
+      "mean": 0.6446616649627686
+    }
+  },
+  "detector": {
+    "backend": "progressive",
+    "fps": 20,
+    "lead_threshold": 0.138,
+    "rgdno_threshold": 0.005,
+    "soft": {
+      "ankle_high_frequency_cutoff_hz": 4.0,
+      "cluster_gap_seconds": 0.15,
+      "lead_temperature": 1.0,
+      "length_temperature": 1.0,
+      "progress_temperature": 1.0
+    }
+  },
+  "full_calibration": true,
+  "metadata": {
+    "ddim_eta": 1.0,
+    "guidance_scale": 2.5,
+    "mdm_diffusion": {
+      "lambda_xstart": 1.0,
+      "lambda_xstart_vel": 0.1,
+      "min_snr_gamma": 5.0,
+      "model_var_type": "FIXED_SMALL",
+      "noise_schedule": "linear",
+      "prediction_type": "epsilon",
+      "sample_steps": 50,
+      "sigma_small": true,
+      "training_diffusion_steps": 50
+    },
+    "model_path": "/home/zhiwei/projects/motion-diffusion-model/save/humanml_trans_dec_512_bert_epsilon_linear50_minsnr5_xstart1_vel01/model000150000.pt",
+    "policy": "original_mdm_without_lora",
+    "pool_id": "26e7d961d6b9a1ccca4d17b8446fbdeade3560667b21f8d93dfb2b44199b2d35",
+    "pool_path": "/home/zhiwei/projects/mdm-ddpo/artifacts/step_reward_k8_soft_huber_pool.pt",
+    "precision": "bf16",
+    "sample_steps": 50,
+    "seed": 20260718,
+    "step_pool_source": "synthetic",
+    "step_samples_per_prompt": 8,
+    "step_targets": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ]
+  },
+  "metrics": {
+    "detected_mean": 4.841471195220947,
+    "exact_fraction": 0.1139322891831398,
+    "mean_absolute_error": 2.7203776836395264,
+    "soft_count_mean": 4.2224440574646,
+    "soft_hard_abs_difference_mean": 0.6390771269798279,
+    "soft_mean_absolute_error": 2.4752037525177,
+    "target_mean": 3.5,
+    "within_one_fraction": 0.3561197817325592
+  },
+  "num_prompts": 384,
+  "per_target": {
+    "1": {
+      "hard_count_mean": 4.349609375,
+      "hard_exact_fraction": 0.0703125,
+      "hard_mae": 3.505859375,
+      "hard_within_one_fraction": 0.291015625,
+      "samples": 512.0,
+      "soft_count_mean": 3.7767276763916016,
+      "soft_error_mean": 2.7767276763916016,
+      "soft_hard_abs_difference_mean": 0.5824885368347168,
+      "soft_mae": 2.9696686267852783,
+      "target_error_scale": 3.826314926147461
+    },
+    "2": {
+      "hard_count_mean": 5.041015625,
+      "hard_exact_fraction": 0.087890625,
+      "hard_mae": 3.283203125,
+      "hard_within_one_fraction": 0.26953125,
+      "samples": 512.0,
+      "soft_count_mean": 4.42683219909668,
+      "soft_error_mean": 2.4268319606781006,
+      "soft_hard_abs_difference_mean": 0.632169246673584,
+      "soft_mae": 2.7632625102996826,
+      "target_error_scale": 3.574709892272949
+    },
+    "3": {
+      "hard_count_mean": 4.798828125,
+      "hard_exact_fraction": 0.150390625,
+      "hard_mae": 2.462890625,
+      "hard_within_one_fraction": 0.412109375,
+      "samples": 512.0,
+      "soft_count_mean": 4.149446487426758,
+      "soft_error_mean": 1.1494460105895996,
+      "soft_hard_abs_difference_mean": 0.6644615530967712,
+      "soft_mae": 2.0861220359802246,
+      "target_error_scale": 2.7546260356903076
+    },
+    "4": {
+      "hard_count_mean": 5.111328125,
+      "hard_exact_fraction": 0.13671875,
+      "hard_mae": 2.345703125,
+      "hard_within_one_fraction": 0.423828125,
+      "samples": 512.0,
+      "soft_count_mean": 4.427847862243652,
+      "soft_error_mean": 0.4278479516506195,
+      "soft_hard_abs_difference_mean": 0.7096806168556213,
+      "soft_mae": 2.1021177768707275,
+      "target_error_scale": 2.686278820037842
+    },
+    "5": {
+      "hard_count_mean": 4.7109375,
+      "hard_exact_fraction": 0.142578125,
+      "hard_mae": 2.27734375,
+      "hard_within_one_fraction": 0.38671875,
+      "samples": 512.0,
+      "soft_count_mean": 4.109626770019531,
+      "soft_error_mean": -0.8903732895851135,
+      "soft_hard_abs_difference_mean": 0.6372070908546448,
+      "soft_mae": 2.331946611404419,
+      "target_error_scale": 2.788015127182007
+    },
+    "6": {
+      "hard_count_mean": 5.037109375,
+      "hard_exact_fraction": 0.095703125,
+      "hard_mae": 2.447265625,
+      "hard_within_one_fraction": 0.353515625,
+      "samples": 512.0,
+      "soft_count_mean": 4.444182872772217,
+      "soft_error_mean": -1.5558173656463623,
+      "soft_hard_abs_difference_mean": 0.6084559559822083,
+      "soft_mae": 2.5981051921844482,
+      "target_error_scale": 3.0695443153381348
+    }
+  },
+  "reward": {
+    "exact_bonus": 0.15,
+    "huber_delta": 1.0,
+    "linear_tolerance": 3.0,
+    "mode": "soft_huber_exact",
+    "target_scale_floor": 0.25,
+    "temperature": 1.0
+  },
+  "samples_per_prompt": 8,
+  "schema_version": 1,
+  "target_error_scales": {
+    "1": 3.826314926147461,
+    "2": 3.574709892272949,
+    "3": 2.7546260356903076,
+    "4": 2.686278820037842,
+    "5": 2.788015127182007,
+    "6": 3.0695443153381348
+  }
+}

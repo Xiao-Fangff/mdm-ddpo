@@ -29,6 +29,7 @@ from mdm_ddpo.runtime import (  # noqa: E402
     build_mdm,
     build_model_kwargs,
     build_policy_model,
+    diffusion_runtime_metadata,
     load_model_args,
     resolve_device,
     seed_everything,
@@ -95,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--motionrft-root", default=TrainConfig.motionrft_root)
     parser.add_argument("--model-path", default=TrainConfig.model_path)
     parser.add_argument("--model-args-path", default=TrainConfig.model_args_path)
+    parser.add_argument(
+        "--prediction-type",
+        choices=["auto", "x_start", "epsilon"],
+        default="auto",
+    )
     parser.add_argument("--data-cache-dir", default=TrainConfig.data_cache_dir)
     parser.add_argument("--save-motions", action="store_true")
     return parser
@@ -432,6 +438,7 @@ def main(argv: list[str] | None = None) -> None:
         motionrft_root=args.motionrft_root,
         model_path=args.model_path,
         model_args_path=args.model_args_path,
+        prediction_type=args.prediction_type,
         data_cache_dir=args.data_cache_dir,
         data_workers=0,
         seed=args.seed,
@@ -584,6 +591,10 @@ def main(argv: list[str] | None = None) -> None:
                 "samples_per_condition": pool.samples_per_condition,
                 "targets": pool.targets.tolist(),
                 "number_style": pool.number_style,
+                "mdm_diffusion": diffusion_runtime_metadata(
+                    model_args,
+                    diffusion,
+                ),
                 "records": records,
             },
             indent=2,

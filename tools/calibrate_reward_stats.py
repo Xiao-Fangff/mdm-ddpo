@@ -28,6 +28,7 @@ from mdm_ddpo.runtime import (  # noqa: E402
     build_dataset,
     build_mdm,
     build_policy_model,
+    diffusion_runtime_metadata,
     load_model_args,
     resolve_device,
     resolve_reward_device,
@@ -76,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default=TrainConfig.model_path)
     parser.add_argument("--model-args-path", default=TrainConfig.model_args_path)
     parser.add_argument(
+        "--prediction-type",
+        choices=["auto", "x_start", "epsilon"],
+        default="auto",
+    )
+    parser.add_argument(
         "--reward-backbone-path",
         default=TrainConfig.reward_backbone_path,
     )
@@ -117,6 +123,7 @@ def _build_config(args: argparse.Namespace, output: Path) -> TrainConfig:
         motionrft_root=args.motionrft_root,
         model_path=args.model_path,
         model_args_path=args.model_args_path,
+        prediction_type=args.prediction_type,
         reward_backbone_path=args.reward_backbone_path,
         reward_t5_path=args.reward_t5_path,
         output_dir=str(output.parent),
@@ -281,6 +288,7 @@ def main(argv: list[str] | None = None) -> None:
         "ddim_eta": config.ddim_eta,
         "precision": config.precision,
         "reward_embedding_mode": "mean",
+        "mdm_diffusion": diffusion_runtime_metadata(model_args, diffusion),
     }
     payload = compute_reward_calibration(
         evaluation.retrieval_by_prompt,
