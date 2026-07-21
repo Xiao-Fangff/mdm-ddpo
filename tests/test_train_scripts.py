@@ -128,6 +128,48 @@ class TrainScriptTest(unittest.TestCase):
         ):
             self.assertIn(expected, result.stdout)
 
+    def test_epsilon_count_only_script_freezes_lora_and_uses_diagnostic_lr(self):
+        project_root = Path(__file__).resolve().parents[1]
+        with (
+            tempfile.NamedTemporaryFile() as reward_calibration,
+            tempfile.NamedTemporaryFile() as step_calibration,
+        ):
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "PYTHON": "/bin/echo",
+                    "MDM_DDPO_REWARD_CALIBRATION_PATH": reward_calibration.name,
+                    "MDM_DDPO_STEP_REWARD_CALIBRATION_PATH": step_calibration.name,
+                    "MDM_DDPO_FIXED_EVAL_POOL_PATH": "/tmp/human-pool.pt",
+                    "MDM_DDPO_FIXED_STEP_EVAL_POOL_PATH": "/tmp/step-pool.pt",
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(
+                        project_root
+                        / "scripts"
+                        / "train_epsilon_count_only_step_k8_short.sh"
+                    ),
+                ],
+                cwd=project_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        for expected in (
+            "--prediction-type epsilon",
+            "--enable-count-conditioning",
+            "--no-train-lora",
+            "--learning-rate 1e-4",
+            "--clip-range 1e-3",
+        ):
+            self.assertIn(expected, result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -359,6 +359,128 @@ def create_synthetic_step_records(
     return output, interval
 
 
+def create_balanced_step_sft_records(
+    records: Sequence[StepSampleRecord],
+    *,
+    targets: Sequence[int],
+    length_bins: int,
+    seed: int,
+    prompt_seed: int,
+    max_samples_per_bin_target: int = 0,
+) -> tuple[list[StepSampleRecord], dict[str, Any]]:
+    """Balance target classes inside shared length bins for count SFT.
+
+    Every retained length bin contributes exactly the same number of real
+    motions for every target. Prompt template slots are also shared across
+    targets, so neither length-bin frequency nor template ordering predicts
+    the requested count.
+    """
+
+    target_values = parse_step_targets(targets)
+    if length_bins <= 0:
+        raise ValueError("SFT length bin count must be positive.")
+    if max_samples_per_bin_target < 0:
+        raise ValueError("SFT per-cell sample cap cannot be negative.")
+    _, (lower, upper) = shared_step_length_support(
+        records,
+        targets=target_values,
+    )
+    support_width = upper - lower + 1
+
+    def bin_index(length: int) -> int:
+        relative = min(max(int(length) - lower, 0), support_width - 1)
+        return min(length_bins - 1, relative * length_bins // support_width)
+
+    grouped: dict[tuple[int, int], list[StepSampleRecord]] = {}
+    for record in records:
+        if record.target_steps not in target_values:
+            continue
+        if lower <= record.length <= upper:
+            grouped.setdefault(
+                (bin_index(record.length), record.target_steps),
+                [],
+            ).append(record)
+
+    selected: list[StepSampleRecord] = []
+    cells: list[dict[str, Any]] = []
+    shared_slot_offset = 0
+    for length_bin in range(length_bins):
+        available = {
+            target: list(grouped.get((length_bin, target), ()))
+            for target in target_values
+        }
+        retained = min(len(values) for values in available.values())
+        if max_samples_per_bin_target > 0:
+            retained = min(retained, max_samples_per_bin_target)
+        if retained <= 0:
+            continue
+        cell_lengths: dict[str, list[int]] = {}
+        for target in target_values:
+            values = sorted(
+                available[target],
+                key=lambda item: item.sample_id,
+            )
+            random.Random(
+                seed + length_bin * 1_000_003 + target * 10_007
+            ).shuffle(values)
+            chosen = values[:retained]
+            cell_lengths[str(target)] = [record.length for record in chosen]
+            selected.extend(
+                replace(
+                    record,
+                    prompt=render_shared_step_prompt(
+                        target,
+                        shared_slot_offset + slot,
+                        prompt_seed,
+                    ),
+                )
+                for slot, record in enumerate(chosen)
+            )
+        cells.append(
+            {
+                "bin": length_bin,
+                "retained_per_target": retained,
+                "lengths_by_target": cell_lengths,
+            }
+        )
+        shared_slot_offset += retained
+
+    if not selected:
+        raise ValueError(
+            "No SFT length bin contains at least one real motion for every "
+            "configured target. Reduce --length-bins or inspect the manifest."
+        )
+    target_counts = {
+        str(target): sum(record.target_steps == target for record in selected)
+        for target in target_values
+    }
+    if len(set(target_counts.values())) != 1:
+        raise RuntimeError("Balanced SFT selection produced unequal targets.")
+    target_length_means = {
+        str(target): float(
+            np.mean(
+                [
+                    record.length
+                    for record in selected
+                    if record.target_steps == target
+                ]
+            )
+        )
+        for target in target_values
+    }
+    audit = {
+        "targets": list(target_values),
+        "common_length_support": [lower, upper],
+        "requested_length_bins": int(length_bins),
+        "retained_length_bins": len(cells),
+        "selected_samples": len(selected),
+        "samples_per_target": target_counts,
+        "length_mean_per_target": target_length_means,
+        "cells": cells,
+    }
+    return selected, audit
+
+
 def load_humanml_stats(mdm_root: str | Path) -> tuple[np.ndarray, np.ndarray]:
     root = Path(mdm_root).expanduser().resolve() / "dataset" / "HumanML3D"
     mean_path = root / "Mean.npy"
@@ -845,6 +967,7 @@ __all__ = [
     "create_fixed_step_eval_pool",
     "create_synthetic_fixed_step_eval_pool",
     "create_synthetic_step_records",
+    "create_balanced_step_sft_records",
     "fixed_step_eval_pool_id",
     "load_fixed_step_eval_pool",
     "load_humanml_stats",

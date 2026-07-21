@@ -139,7 +139,11 @@ class SwanLabTrackerTest(unittest.TestCase):
                 "log_ratio_max": 0.004,
                 "ratio_std": 0.003,
                 "lora_norm": 2.0,
+                "count_norm": 3.0,
+                "trainable_parameter_norm": 4.0,
                 "update_norm": 0.01,
+                "lora_update_norm": 0.006,
+                "count_update_norm": 0.008,
                 "anchor_loss": 0.8,
                 "anchor_weighted_loss": 0.08,
                 "anchor_grad_norm": 2.0,
@@ -196,7 +200,14 @@ class SwanLabTrackerTest(unittest.TestCase):
         self.assertEqual(metrics["ppo/log_ratio_abs_max"], 0.004)
         self.assertEqual(metrics["ppo/ratio_std"], 0.003)
         self.assertEqual(metrics["optimization/lora_norm"], 2.0)
+        self.assertEqual(metrics["optimization/count_norm"], 3.0)
+        self.assertEqual(
+            metrics["optimization/trainable_parameter_norm"],
+            4.0,
+        )
         self.assertEqual(metrics["optimization/update_norm"], 0.01)
+        self.assertEqual(metrics["optimization/lora_update_norm"], 0.006)
+        self.assertEqual(metrics["optimization/count_update_norm"], 0.008)
         self.assertEqual(metrics["anchor/loss"], 0.8)
         self.assertEqual(metrics["anchor/weighted_loss"], 0.08)
         self.assertEqual(metrics["anchor/grad_norm"], 2.0)

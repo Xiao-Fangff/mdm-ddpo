@@ -126,9 +126,34 @@ def configure_trainable_policy(
     return None
 
 
+def is_lora_parameter_name(name: str) -> bool:
+    return (
+        ".parametrizations." in name
+        and (name.endswith(".lora_a") or name.endswith(".lora_b"))
+    )
+
+
+def set_lora_trainable(model: nn.Module, trainable: bool) -> int:
+    matched = 0
+    for name, parameter in model.named_parameters():
+        if is_lora_parameter_name(name):
+            parameter.requires_grad_(trainable)
+            matched += parameter.numel()
+    if matched == 0:
+        raise RuntimeError("No injected LoRA parameters were found.")
+    return matched
+
+
 def trainable_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    # Frozen LoRA/count tensors remain part of the portable policy. This lets
+    # count-only DDPO checkpoints reconstruct their SFT starting policy even
+    # though only the count adapter receives gradients.
     trainable_names = {
-        name for name, parameter in model.named_parameters() if parameter.requires_grad
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+        or is_lora_parameter_name(name)
+        or name.startswith("count_conditioning.")
     }
     return {
         name: tensor.detach().cpu()
@@ -149,11 +174,14 @@ def load_trainable_state_dict(
         name
         for name, parameter in model.named_parameters()
         if parameter.requires_grad
+        or is_lora_parameter_name(name)
+        or name.startswith("count_conditioning.")
     }
     missing = sorted(required - set(state_dict))
     if missing:
         raise KeyError(
-            "Checkpoint is missing trainable policy tensors: "
+            "Checkpoint is missing trainable policy tensors (including "
+            "frozen portable LoRA/count state): "
             f"{missing[:8]}"
         )
     model.load_state_dict(state_dict, strict=False)

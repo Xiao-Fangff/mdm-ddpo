@@ -187,6 +187,11 @@ def _model_kwargs(
         cached_text_embeddings=[
             trajectory.text_embeddings[index] for index in indices
         ],
+        target_steps=(
+            trajectory.target_steps[sample_indices]
+            if trajectory.target_steps is not None
+            else None
+        ),
     )
 
 

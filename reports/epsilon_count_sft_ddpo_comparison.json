@@ -1,0 +1,557 @@
+[
+  {
+    "acceptance_points": 0,
+    "advantage": {
+      "component_advantage_m2m_contribution_mean_abs": {
+        "last_10_mean": 0.17177953819433847,
+        "max": 0.18422551453113556,
+        "mean": 0.17177953819433847,
+        "median": 0.17297381162643433,
+        "min": 0.15454146265983582
+      },
+      "component_advantage_m2m_step_conflict_fraction": {
+        "last_10_mean": 0.4713541666666667,
+        "max": 0.546875,
+        "mean": 0.4713541666666667,
+        "median": 0.484375,
+        "min": 0.359375
+      },
+      "component_advantage_retrieval_contribution_mean_abs": {
+        "last_10_mean": 0.17205533385276794,
+        "max": 0.1792600452899933,
+        "mean": 0.17205533385276794,
+        "median": 0.172292098402977,
+        "min": 0.16441316902637482
+      },
+      "component_advantage_retrieval_step_conflict_fraction": {
+        "last_10_mean": 0.3893229166666667,
+        "max": 0.484375,
+        "mean": 0.3893229166666667,
+        "median": 0.3828125,
+        "min": 0.25
+      },
+      "component_advantage_step_contribution_mean_abs": {
+        "last_10_mean": 0.6330482165018717,
+        "max": 0.6556181907653809,
+        "mean": 0.6330482165018717,
+        "median": 0.6373425424098969,
+        "min": 0.5954567193984985
+      },
+      "component_advantage_step_group_std_median": {
+        "last_10_mean": 0.20901922384897867,
+        "max": 0.29604899883270264,
+        "mean": 0.20901922384897867,
+        "median": 0.18869362771511078,
+        "min": 0.16290713846683502
+      },
+      "component_advantage_step_zero_variance_prompt_fraction": {
+        "last_10_mean": 0.0,
+        "max": 0.0,
+        "mean": 0.0,
+        "median": 0.0,
+        "min": 0.0
+      }
+    },
+    "best_step_epoch": 5,
+    "epochs": 6,
+    "fixed_best_step": {
+      "eval_step_exact_fraction_delta": -0.0052083334885537624,
+      "eval_step_mae_delta": -0.0390625,
+      "eval_step_reward_delta": 0.009354505687952042,
+      "eval_step_within_one_fraction_delta": 0.010416666977107525
+    },
+    "fixed_final": {
+      "eval_step_exact_fraction_delta": -0.0052083334885537624,
+      "eval_step_mae_delta": -0.0390625,
+      "eval_step_reward_delta": 0.009354505687952042,
+      "eval_step_within_one_fraction_delta": 0.010416666977107525
+    },
+    "run": "epsilon_count_sft_step_k8_short",
+    "run_dir": "/home/zhiwei/projects/mdm-ddpo/outputs/epsilon_count_sft_step_k8_short",
+    "targets_baseline": {
+      "1": {
+        "detected_mean": 3.90625,
+        "exact_accuracy": 0.109375,
+        "mae": 3.09375,
+        "within_one_accuracy": 0.34375
+      },
+      "2": {
+        "detected_mean": 3.703125,
+        "exact_accuracy": 0.046875,
+        "mae": 2.234375,
+        "within_one_accuracy": 0.359375
+      },
+      "3": {
+        "detected_mean": 3.96875,
+        "exact_accuracy": 0.1875,
+        "mae": 1.84375,
+        "within_one_accuracy": 0.53125
+      },
+      "4": {
+        "detected_mean": 6.046875,
+        "exact_accuracy": 0.140625,
+        "mae": 2.671875,
+        "within_one_accuracy": 0.3125
+      },
+      "5": {
+        "detected_mean": 8.484375,
+        "exact_accuracy": 0.0625,
+        "mae": 3.484375,
+        "within_one_accuracy": 0.234375
+      },
+      "6": {
+        "detected_mean": 10.375,
+        "exact_accuracy": 0.03125,
+        "mae": 4.71875,
+        "within_one_accuracy": 0.140625
+      }
+    },
+    "targets_best_step": {
+      "1": {
+        "detected_mean": 3.796875,
+        "exact_accuracy": 0.078125,
+        "mae": 3.046875,
+        "within_one_accuracy": 0.359375
+      },
+      "2": {
+        "detected_mean": 3.625,
+        "exact_accuracy": 0.0625,
+        "mae": 2.15625,
+        "within_one_accuracy": 0.40625
+      },
+      "3": {
+        "detected_mean": 3.953125,
+        "exact_accuracy": 0.203125,
+        "mae": 1.859375,
+        "within_one_accuracy": 0.515625
+      },
+      "4": {
+        "detected_mean": 5.953125,
+        "exact_accuracy": 0.125,
+        "mae": 2.671875,
+        "within_one_accuracy": 0.3125
+      },
+      "5": {
+        "detected_mean": 8.40625,
+        "exact_accuracy": 0.0625,
+        "mae": 3.40625,
+        "within_one_accuracy": 0.25
+      },
+      "6": {
+        "detected_mean": 10.296875,
+        "exact_accuracy": 0.015625,
+        "mae": 4.671875,
+        "within_one_accuracy": 0.140625
+      }
+    },
+    "targets_final": {
+      "1": {
+        "detected_mean": 3.796875,
+        "exact_accuracy": 0.078125,
+        "mae": 3.046875,
+        "within_one_accuracy": 0.359375
+      },
+      "2": {
+        "detected_mean": 3.625,
+        "exact_accuracy": 0.0625,
+        "mae": 2.15625,
+        "within_one_accuracy": 0.40625
+      },
+      "3": {
+        "detected_mean": 3.953125,
+        "exact_accuracy": 0.203125,
+        "mae": 1.859375,
+        "within_one_accuracy": 0.515625
+      },
+      "4": {
+        "detected_mean": 5.953125,
+        "exact_accuracy": 0.125,
+        "mae": 2.671875,
+        "within_one_accuracy": 0.3125
+      },
+      "5": {
+        "detected_mean": 8.40625,
+        "exact_accuracy": 0.0625,
+        "mae": 3.40625,
+        "within_one_accuracy": 0.25
+      },
+      "6": {
+        "detected_mean": 10.296875,
+        "exact_accuracy": 0.015625,
+        "mae": 4.671875,
+        "within_one_accuracy": 0.140625
+      }
+    },
+    "validation_points": 6
+  },
+  {
+    "acceptance_points": 0,
+    "advantage": {
+      "component_advantage_m2m_contribution_mean_abs": {
+        "last_10_mean": 0.17162992556889853,
+        "max": 0.18397419154644012,
+        "mean": 0.17162992556889853,
+        "median": 0.1726607009768486,
+        "min": 0.15512588620185852
+      },
+      "component_advantage_m2m_step_conflict_fraction": {
+        "last_10_mean": 0.4661458333333333,
+        "max": 0.53125,
+        "mean": 0.4661458333333333,
+        "median": 0.4765625,
+        "min": 0.375
+      },
+      "component_advantage_retrieval_contribution_mean_abs": {
+        "last_10_mean": 0.1717213566104571,
+        "max": 0.1781197041273117,
+        "mean": 0.1717213566104571,
+        "median": 0.1724395528435707,
+        "min": 0.16324470937252045
+      },
+      "component_advantage_retrieval_step_conflict_fraction": {
+        "last_10_mean": 0.3828125,
+        "max": 0.484375,
+        "mean": 0.3828125,
+        "median": 0.3828125,
+        "min": 0.265625
+      },
+      "component_advantage_step_contribution_mean_abs": {
+        "last_10_mean": 0.6282357573509216,
+        "max": 0.6554661393165588,
+        "mean": 0.6282357573509216,
+        "median": 0.6297070384025574,
+        "min": 0.5997895002365112
+      },
+      "component_advantage_step_group_std_median": {
+        "last_10_mean": 0.20479746411244074,
+        "max": 0.2910805940628052,
+        "mean": 0.20479746411244074,
+        "median": 0.18510928004980087,
+        "min": 0.1507786363363266
+      },
+      "component_advantage_step_zero_variance_prompt_fraction": {
+        "last_10_mean": 0.0,
+        "max": 0.0,
+        "mean": 0.0,
+        "median": 0.0,
+        "min": 0.0
+      }
+    },
+    "best_step_epoch": 5,
+    "epochs": 6,
+    "fixed_best_step": {
+      "eval_step_exact_fraction_delta": 0.0,
+      "eval_step_mae_delta": -0.010416666977107525,
+      "eval_step_reward_delta": 0.003162574954330921,
+      "eval_step_within_one_fraction_delta": 0.0026041667442768812
+    },
+    "fixed_final": {
+      "eval_step_exact_fraction_delta": 0.0,
+      "eval_step_mae_delta": -0.010416666977107525,
+      "eval_step_reward_delta": 0.003162574954330921,
+      "eval_step_within_one_fraction_delta": 0.0026041667442768812
+    },
+    "run": "epsilon_count_only_step_k8_short",
+    "run_dir": "/home/zhiwei/projects/mdm-ddpo/outputs/epsilon_count_only_step_k8_short",
+    "targets_baseline": {
+      "1": {
+        "detected_mean": 3.90625,
+        "exact_accuracy": 0.109375,
+        "mae": 3.09375,
+        "within_one_accuracy": 0.34375
+      },
+      "2": {
+        "detected_mean": 3.703125,
+        "exact_accuracy": 0.046875,
+        "mae": 2.234375,
+        "within_one_accuracy": 0.359375
+      },
+      "3": {
+        "detected_mean": 3.96875,
+        "exact_accuracy": 0.1875,
+        "mae": 1.84375,
+        "within_one_accuracy": 0.53125
+      },
+      "4": {
+        "detected_mean": 6.046875,
+        "exact_accuracy": 0.140625,
+        "mae": 2.671875,
+        "within_one_accuracy": 0.3125
+      },
+      "5": {
+        "detected_mean": 8.484375,
+        "exact_accuracy": 0.0625,
+        "mae": 3.484375,
+        "within_one_accuracy": 0.234375
+      },
+      "6": {
+        "detected_mean": 10.375,
+        "exact_accuracy": 0.03125,
+        "mae": 4.71875,
+        "within_one_accuracy": 0.140625
+      }
+    },
+    "targets_best_step": {
+      "1": {
+        "detected_mean": 3.875,
+        "exact_accuracy": 0.09375,
+        "mae": 3.09375,
+        "within_one_accuracy": 0.359375
+      },
+      "2": {
+        "detected_mean": 3.71875,
+        "exact_accuracy": 0.0625,
+        "mae": 2.21875,
+        "within_one_accuracy": 0.359375
+      },
+      "3": {
+        "detected_mean": 3.96875,
+        "exact_accuracy": 0.1875,
+        "mae": 1.84375,
+        "within_one_accuracy": 0.546875
+      },
+      "4": {
+        "detected_mean": 6.078125,
+        "exact_accuracy": 0.140625,
+        "mae": 2.734375,
+        "within_one_accuracy": 0.296875
+      },
+      "5": {
+        "detected_mean": 8.4375,
+        "exact_accuracy": 0.0625,
+        "mae": 3.4375,
+        "within_one_accuracy": 0.234375
+      },
+      "6": {
+        "detected_mean": 10.3125,
+        "exact_accuracy": 0.03125,
+        "mae": 4.65625,
+        "within_one_accuracy": 0.140625
+      }
+    },
+    "targets_final": {
+      "1": {
+        "detected_mean": 3.875,
+        "exact_accuracy": 0.09375,
+        "mae": 3.09375,
+        "within_one_accuracy": 0.359375
+      },
+      "2": {
+        "detected_mean": 3.71875,
+        "exact_accuracy": 0.0625,
+        "mae": 2.21875,
+        "within_one_accuracy": 0.359375
+      },
+      "3": {
+        "detected_mean": 3.96875,
+        "exact_accuracy": 0.1875,
+        "mae": 1.84375,
+        "within_one_accuracy": 0.546875
+      },
+      "4": {
+        "detected_mean": 6.078125,
+        "exact_accuracy": 0.140625,
+        "mae": 2.734375,
+        "within_one_accuracy": 0.296875
+      },
+      "5": {
+        "detected_mean": 8.4375,
+        "exact_accuracy": 0.0625,
+        "mae": 3.4375,
+        "within_one_accuracy": 0.234375
+      },
+      "6": {
+        "detected_mean": 10.3125,
+        "exact_accuracy": 0.03125,
+        "mae": 4.65625,
+        "within_one_accuracy": 0.140625
+      }
+    },
+    "validation_points": 3
+  },
+  {
+    "acceptance_points": 1,
+    "advantage": {
+      "component_advantage_m2m_contribution_mean_abs": {
+        "last_10_mean": 0.17628563195466995,
+        "max": 0.1859864890575409,
+        "mean": 0.17628563195466995,
+        "median": 0.1763835847377777,
+        "min": 0.16787029802799225
+      },
+      "component_advantage_m2m_step_conflict_fraction": {
+        "last_10_mean": 0.4622395833333333,
+        "max": 0.5234375,
+        "mean": 0.4622395833333333,
+        "median": 0.47265625,
+        "min": 0.3671875
+      },
+      "component_advantage_retrieval_contribution_mean_abs": {
+        "last_10_mean": 0.17477002243200937,
+        "max": 0.18280386924743652,
+        "mean": 0.17477002243200937,
+        "median": 0.17446762323379517,
+        "min": 0.16822373867034912
+      },
+      "component_advantage_retrieval_step_conflict_fraction": {
+        "last_10_mean": 0.40234375,
+        "max": 0.4296875,
+        "mean": 0.40234375,
+        "median": 0.41015625,
+        "min": 0.3671875
+      },
+      "component_advantage_step_contribution_mean_abs": {
+        "last_10_mean": 0.6273923615614573,
+        "max": 0.6868786811828613,
+        "mean": 0.6273923615614573,
+        "median": 0.6283449530601501,
+        "min": 0.5575314164161682
+      },
+      "component_advantage_step_group_std_median": {
+        "last_10_mean": 0.21886724481980005,
+        "max": 0.36234334111213684,
+        "mean": 0.21886724481980005,
+        "median": 0.17571644484996796,
+        "min": 0.15934135019779205
+      },
+      "component_advantage_step_zero_variance_prompt_fraction": {
+        "last_10_mean": 0.0,
+        "max": 0.0,
+        "mean": 0.0,
+        "median": 0.0,
+        "min": 0.0
+      }
+    },
+    "best_step_epoch": 5,
+    "epochs": 6,
+    "fixed_best_step": {
+      "eval_step_exact_fraction_delta": 0.0026041667442768812,
+      "eval_step_mae_delta": -0.109375,
+      "eval_step_reward_delta": 0.02588505856692791,
+      "eval_step_within_one_fraction_delta": 0.0338541679084301
+    },
+    "fixed_final": {
+      "eval_step_exact_fraction_delta": 0.0026041667442768812,
+      "eval_step_mae_delta": -0.109375,
+      "eval_step_reward_delta": 0.02588505856692791,
+      "eval_step_within_one_fraction_delta": 0.0338541679084301
+    },
+    "run": "epsilon_count_only_step_k8_lr1e4_clip1e3",
+    "run_dir": "/home/zhiwei/projects/mdm-ddpo/outputs/epsilon_count_only_step_k8_lr1e4_clip1e3",
+    "targets_baseline": {
+      "1": {
+        "detected_mean": 3.90625,
+        "exact_accuracy": 0.109375,
+        "mae": 3.09375,
+        "within_one_accuracy": 0.34375
+      },
+      "2": {
+        "detected_mean": 3.703125,
+        "exact_accuracy": 0.046875,
+        "mae": 2.234375,
+        "within_one_accuracy": 0.359375
+      },
+      "3": {
+        "detected_mean": 3.96875,
+        "exact_accuracy": 0.1875,
+        "mae": 1.84375,
+        "within_one_accuracy": 0.53125
+      },
+      "4": {
+        "detected_mean": 6.046875,
+        "exact_accuracy": 0.140625,
+        "mae": 2.671875,
+        "within_one_accuracy": 0.3125
+      },
+      "5": {
+        "detected_mean": 8.484375,
+        "exact_accuracy": 0.0625,
+        "mae": 3.484375,
+        "within_one_accuracy": 0.234375
+      },
+      "6": {
+        "detected_mean": 10.375,
+        "exact_accuracy": 0.03125,
+        "mae": 4.71875,
+        "within_one_accuracy": 0.140625
+      }
+    },
+    "targets_best_step": {
+      "1": {
+        "detected_mean": 3.546875,
+        "exact_accuracy": 0.09375,
+        "mae": 2.796875,
+        "within_one_accuracy": 0.40625
+      },
+      "2": {
+        "detected_mean": 3.609375,
+        "exact_accuracy": 0.0625,
+        "mae": 2.140625,
+        "within_one_accuracy": 0.40625
+      },
+      "3": {
+        "detected_mean": 3.8125,
+        "exact_accuracy": 0.203125,
+        "mae": 1.84375,
+        "within_one_accuracy": 0.515625
+      },
+      "4": {
+        "detected_mean": 5.90625,
+        "exact_accuracy": 0.140625,
+        "mae": 2.625,
+        "within_one_accuracy": 0.34375
+      },
+      "5": {
+        "detected_mean": 8.34375,
+        "exact_accuracy": 0.078125,
+        "mae": 3.34375,
+        "within_one_accuracy": 0.28125
+      },
+      "6": {
+        "detected_mean": 10.265625,
+        "exact_accuracy": 0.015625,
+        "mae": 4.640625,
+        "within_one_accuracy": 0.171875
+      }
+    },
+    "targets_final": {
+      "1": {
+        "detected_mean": 3.546875,
+        "exact_accuracy": 0.09375,
+        "mae": 2.796875,
+        "within_one_accuracy": 0.40625
+      },
+      "2": {
+        "detected_mean": 3.609375,
+        "exact_accuracy": 0.0625,
+        "mae": 2.140625,
+        "within_one_accuracy": 0.40625
+      },
+      "3": {
+        "detected_mean": 3.8125,
+        "exact_accuracy": 0.203125,
+        "mae": 1.84375,
+        "within_one_accuracy": 0.515625
+      },
+      "4": {
+        "detected_mean": 5.90625,
+        "exact_accuracy": 0.140625,
+        "mae": 2.625,
+        "within_one_accuracy": 0.34375
+      },
+      "5": {
+        "detected_mean": 8.34375,
+        "exact_accuracy": 0.078125,
+        "mae": 3.34375,
+        "within_one_accuracy": 0.28125
+      },
+      "6": {
+        "detected_mean": 10.265625,
+        "exact_accuracy": 0.015625,
+        "mae": 4.640625,
+        "within_one_accuracy": 0.171875
+      }
+    },
+    "validation_points": 6
+  }
+]

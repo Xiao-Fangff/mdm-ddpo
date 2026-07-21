@@ -16,6 +16,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from .config import TrainConfig
+from .count_conditioning import install_count_conditioning
 
 
 @dataclass(frozen=True)
@@ -344,6 +345,11 @@ def _build_respaced_diffusion(
         lambda_vel=base_diffusion.lambda_vel,
         lambda_fc=base_diffusion.lambda_fc,
         lambda_target_loc=base_diffusion.lambda_target_loc,
+        min_snr_gamma=float(getattr(base_diffusion, "min_snr_gamma", 0.0)),
+        lambda_xstart=float(getattr(base_diffusion, "lambda_xstart", 0.0)),
+        lambda_xstart_vel=float(
+            getattr(base_diffusion, "lambda_xstart_vel", 0.0)
+        ),
         data_rep=base_diffusion.data_rep,
     )
 
@@ -370,6 +376,8 @@ def build_mdm(
         model, base_diffusion = create_model_and_diffusion(model_args, data_loader)
         configure_diffusion_prediction_type(base_diffusion, prediction_type)
         load_saved_model(model, config.model_path, use_avg=True)
+    if config.enable_count_conditioning:
+        install_count_conditioning(model)
 
     sample_steps = config.sample_steps or int(model_args.diffusion_steps)
     if sample_steps < 2:
@@ -432,6 +440,7 @@ def build_model_kwargs(
     device: torch.device,
     guidance_scale: float,
     cached_text_embeddings: list[CachedTextEmbedding] | None = None,
+    target_steps: torch.Tensor | None = None,
 ) -> dict[str, dict[str, Any]]:
     lengths = lengths.to(device=device, dtype=torch.long)
     mask = lengths_to_motion_mask(lengths, num_frames, device=device)
@@ -446,6 +455,15 @@ def build_model_kwargs(
             dtype=torch.float32,
         ),
     }
+    if target_steps is not None:
+        resolved_targets = torch.as_tensor(
+            target_steps,
+            device=device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if resolved_targets.shape != lengths.shape:
+            raise ValueError("Count target batch does not match motion lengths.")
+        y["target_steps"] = resolved_targets
     if cached_text_embeddings is None:
         with torch.no_grad():
             y["text_embed"] = canonicalize_text_embeddings(

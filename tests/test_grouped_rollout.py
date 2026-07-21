@@ -319,6 +319,7 @@ class GroupedRolloutTest(unittest.TestCase):
         self.assertEqual(config.samples_per_prompt, 4)
         self.assertEqual(config.step_samples_per_prompt, 16)
         self.assertEqual(config.fixed_step_eval_samples_per_prompt, 16)
+        self.assertTrue(config.train_lora)
         self.assertTrue(config.step_use_m2m_reward)
         self.assertEqual(config.advantage_mode, "group_whiten")
         self.assertEqual(config.reward_embedding_mode, "mean")

@@ -19,14 +19,22 @@ from tqdm.auto import tqdm
 
 from .calibration import RewardCalibration, load_reward_calibration
 from .config import TrainConfig
+from .count_conditioning import (
+    count_conditioning_metadata,
+    count_conditioning_signature,
+    set_count_conditioning_trainable,
+    validate_count_conditioning_signature,
+)
 from .diffusion import ddim_step_with_logprob
 from .lora import (
     LoRAReport,
     configure_trainable_policy,
     load_trainable_state_dict,
     parameter_counts,
+    set_lora_trainable,
     trainable_state_dict,
 )
+from .policy_io import policy_checkpoint_id
 from .rewards import (
     MotionReward,
     RewardOutput,
@@ -1148,6 +1156,25 @@ class DDPOTrainer:
             self.model_args,
             self.diffusion,
         )
+
+        self.lora_report: LoRAReport | None = configure_trainable_policy(
+            self.model,
+            mode=config.train_mode,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_target_regex=config.lora_target_regex,
+        )
+        if self.lora_report is not None and not config.train_lora:
+            set_lora_trainable(self.model, False)
+        if config.enable_count_conditioning:
+            set_count_conditioning_trainable(
+                self.model,
+                config.train_count_conditioning,
+            )
+        self.initial_policy_id = ""
+        if config.initial_policy_path:
+            self._load_initial_policy(config.initial_policy_path)
+        self.count_conditioning_metadata = count_conditioning_metadata(self.model)
         with open(
             self.output_dir / "runtime_metadata.json",
             "w",
@@ -1162,6 +1189,10 @@ class DDPOTrainer:
                         Path(config.model_args_path).expanduser().resolve()
                     ),
                     "mdm_diffusion": self.diffusion_metadata,
+                    "count_conditioning": self.count_conditioning_metadata,
+                    "initial_policy_path": str(
+                        Path(config.initial_policy_path).expanduser().resolve()
+                    ) if config.initial_policy_path else "",
                     "ddpo_sampler": "stochastic_ddim",
                     "ddim_eta": config.ddim_eta,
                     "guidance_scale": config.guidance_scale,
@@ -1171,14 +1202,6 @@ class DDPOTrainer:
                 indent=2,
                 sort_keys=True,
             )
-
-        self.lora_report: LoRAReport | None = configure_trainable_policy(
-            self.model,
-            mode=config.train_mode,
-            lora_rank=config.lora_rank,
-            lora_alpha=config.lora_alpha,
-            lora_target_regex=config.lora_target_regex,
-        )
         self.model.eval()
         self.policy_model = build_policy_model(
             self.model,
@@ -1395,6 +1418,21 @@ class DDPOTrainer:
         if calibration is None:
             return
         metadata = calibration.payload.get("metadata", {})
+        artifact_count_conditioning = metadata.get("count_conditioning")
+        if artifact_count_conditioning is not None:
+            validate_count_conditioning_signature(
+                self.model,
+                artifact_count_conditioning,
+                source=source,
+            )
+        if not self.config.resume:
+            artifact_policy_id = str(metadata.get("policy_id", ""))
+            if artifact_policy_id != self.initial_policy_id:
+                raise ValueError(
+                    f"{source} policy id does not match the initialized "
+                    "LoRA/count policy. Generate calibration from the exact "
+                    "--initial-policy-path checkpoint."
+                )
         artifact_diffusion = metadata.get("mdm_diffusion")
         # Legacy calibration files predate this audit and remain loadable.
         if artifact_diffusion is None:
@@ -1420,6 +1458,7 @@ class DDPOTrainer:
             "dataset_samples": len(self.data_loader.dataset),
             "prediction_type": self.prediction_type,
             "mdm_diffusion": dict(self.diffusion_metadata),
+            "count_conditioning": count_conditioning_metadata(self.model),
             "diffusion_steps": self.sample_steps,
             "policy_transitions": self.sample_steps - 1,
             "policy_parameters": total,
@@ -1427,6 +1466,7 @@ class DDPOTrainer:
             "lora_adapters": (
                 self.lora_report.adapters if self.lora_report is not None else 0
             ),
+            "train_lora": self.config.train_lora,
             "reward_t5_tensors_loaded_separately": len(
                 self.reward_model.missing_checkpoint_keys
             ),
@@ -2106,6 +2146,7 @@ class DDPOTrainer:
                 num_frames,
                 device=self.device,
                 guidance_scale=self.config.guidance_scale,
+                target_steps=target_steps,
             )
             prompt_shape = tuple(self.fixed_step_eval_pool.motion.shape[1:])
             prompt_generators: list[torch.Generator] = []
@@ -2483,6 +2524,7 @@ class DDPOTrainer:
             num_frames,
             device=self.device,
             guidance_scale=self.config.guidance_scale,
+            target_steps=target_steps,
         )
         motion_mask = model_kwargs["y"]["mask"]
         cached_text_embeddings = split_text_embeddings(
@@ -3018,6 +3060,8 @@ class DDPOTrainer:
             "loss": [],
             "grad_norm": [],
             "update_norm": [],
+            "lora_update_norm": [],
+            "count_update_norm": [],
             "skipped_updates": [],
         }
         if self.anchor_enabled:
@@ -3051,6 +3095,11 @@ class DDPOTrainer:
             parameter
             for name, parameter in named_trainable_parameters
             if "lora_a" in name or "lora_b" in name
+        ]
+        count_parameters = [
+            parameter
+            for name, parameter in named_trainable_parameters
+            if name.startswith("count_conditioning.")
         ]
         for inner_epoch in range(self.config.inner_epochs):
             selected_timesteps, timesteps_per_sample = self._selected_timesteps(
@@ -3092,6 +3141,11 @@ class DDPOTrainer:
                     device=self.device,
                     guidance_scale=self.config.guidance_scale,
                     cached_text_embeddings=cached_text_embeddings,
+                    target_steps=(
+                        trajectory.target_steps[sample_indices]
+                        if trajectory.target_steps is not None
+                        else None
+                    ),
                 )
 
                 minibatch_timesteps = selected_timesteps[sample_indices]
@@ -3220,9 +3274,17 @@ class DDPOTrainer:
                             torch.isfinite(grad_norm).item()
                         )
                         if finite_gradients:
+                            policy_before_update = [
+                                parameter.detach().clone()
+                                for parameter in trainable_parameters
+                            ]
                             lora_before_update = [
                                 parameter.detach().clone()
                                 for parameter in lora_parameters
+                            ]
+                            count_before_update = [
+                                parameter.detach().clone()
+                                for parameter in count_parameters
                             ]
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
@@ -3235,8 +3297,30 @@ class DDPOTrainer:
                                     [
                                         parameter.detach() - before
                                         for parameter, before in zip(
+                                            trainable_parameters,
+                                            policy_before_update,
+                                        )
+                                    ]
+                                )
+                            )
+                            metric_values["lora_update_norm"].append(
+                                _tensor_collection_l2_norm(
+                                    [
+                                        parameter.detach() - before
+                                        for parameter, before in zip(
                                             lora_parameters,
                                             lora_before_update,
+                                        )
+                                    ]
+                                )
+                            )
+                            metric_values["count_update_norm"].append(
+                                _tensor_collection_l2_norm(
+                                    [
+                                        parameter.detach() - before
+                                        for parameter, before in zip(
+                                            count_parameters,
+                                            count_before_update,
                                         )
                                     ]
                                 )
@@ -3281,6 +3365,10 @@ class DDPOTrainer:
                     (all_ratios - 1.0).abs() > self.config.clip_range
                 ).float().mean().item(),
                 "lora_norm": _tensor_collection_l2_norm(lora_parameters),
+                "count_norm": _tensor_collection_l2_norm(count_parameters),
+                "trainable_parameter_norm": _tensor_collection_l2_norm(
+                    trainable_parameters
+                ),
                 **audit_metrics,
             }
         )
@@ -4286,6 +4374,8 @@ class DDPOTrainer:
             "mdm_diffusion": dict(
                 getattr(self, "diffusion_metadata", {})
             ),
+            "count_conditioning": count_conditioning_signature(self.model),
+            "initial_policy_id": getattr(self, "initial_policy_id", ""),
             "train_mode": self.config.train_mode,
             "policy": trainable_state_dict(self.model),
             "optimizer": self.optimizer.state_dict(),
@@ -4375,6 +4465,89 @@ class DDPOTrainer:
         LOGGER.info("Saved checkpoint: %s", checkpoint_path)
         return checkpoint_path
 
+    def _validate_policy_structure(
+        self,
+        payload: dict[str, Any],
+        *,
+        source: str,
+    ) -> None:
+        checkpoint_mode = payload.get("train_mode")
+        if checkpoint_mode != self.config.train_mode:
+            raise ValueError(
+                f"{source} train_mode={checkpoint_mode!r} does not match "
+                f"current mode={self.config.train_mode!r}."
+            )
+        checkpoint_config = payload.get("config")
+        if not isinstance(checkpoint_config, dict):
+            raise ValueError(f"{source} has no valid config mapping.")
+        expected_lora = {
+            "lora_rank": self.config.lora_rank,
+            "lora_alpha": self.config.lora_alpha,
+            "lora_target_regex": self.config.lora_target_regex,
+        }
+        actual_lora = {
+            name: checkpoint_config.get(name)
+            for name in expected_lora
+        }
+        if actual_lora != expected_lora:
+            raise ValueError(
+                f"{source} LoRA configuration does not match the current "
+                f"policy: expected={expected_lora}, actual={actual_lora}."
+            )
+        current_diffusion = getattr(self, "diffusion_metadata", None)
+        if current_diffusion is not None:
+            checkpoint_diffusion = payload.get("mdm_diffusion")
+            if not isinstance(checkpoint_diffusion, dict):
+                raise ValueError(
+                    f"{source} has no audited MDM diffusion metadata."
+                )
+            validate_diffusion_runtime_metadata(
+                checkpoint_diffusion,
+                current_diffusion,
+                source=source,
+            )
+        validate_count_conditioning_signature(
+            self.model,
+            payload.get("count_conditioning"),
+            source=source,
+        )
+
+    def _load_initial_policy(self, path: str) -> None:
+        """Load SFT policy tensors without inheriting optimizer/train state."""
+
+        checkpoint_path = Path(path).expanduser().resolve()
+        payload = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        if not isinstance(payload, dict):
+            raise TypeError("Initial policy checkpoint must contain a mapping.")
+        if payload.get("format") != "count_conditioning_sft_v1":
+            raise ValueError(
+                "--initial-policy-path must point to a "
+                "count_conditioning_sft_v1 checkpoint."
+            )
+        self._validate_policy_structure(payload, source="Initial SFT policy")
+        checkpoint_model_path = payload["config"].get("model_path")
+        if checkpoint_model_path is not None:
+            expected_model = Path(self.config.model_path).expanduser().resolve()
+            actual_model = Path(checkpoint_model_path).expanduser().resolve()
+            if actual_model != expected_model:
+                raise ValueError(
+                    "Initial SFT policy was trained from a different base MDM: "
+                    f"expected={expected_model}, actual={actual_model}."
+                )
+        policy = payload.get("policy")
+        if not isinstance(policy, dict):
+            raise ValueError("Initial SFT policy has no policy state mapping.")
+        load_trainable_state_dict(self.model, policy)
+        self.initial_policy_id = policy_checkpoint_id(payload)
+        LOGGER.info(
+            "Initialized LoRA/count policy from native SFT checkpoint: %s",
+            checkpoint_path,
+        )
+
     def _load_checkpoint(self, path: str) -> None:
         checkpoint_path = Path(path).expanduser().resolve()
         checkpoint = torch.load(
@@ -4382,19 +4555,7 @@ class DDPOTrainer:
             map_location=self.device,
             weights_only=False,
         )
-        checkpoint_mode = checkpoint.get("train_mode")
-        if checkpoint_mode != self.config.train_mode:
-            raise ValueError(
-                f"Checkpoint train_mode={checkpoint_mode!r} does not match "
-                f"current mode={self.config.train_mode!r}."
-            )
-        checkpoint_diffusion = checkpoint.get("mdm_diffusion")
-        if checkpoint_diffusion:
-            validate_diffusion_runtime_metadata(
-                checkpoint_diffusion,
-                self.diffusion_metadata,
-                source="Checkpoint",
-            )
+        self._validate_policy_structure(checkpoint, source="Checkpoint")
         checkpoint_calibration_id = checkpoint.get("reward_calibration_id")
         current_calibration_id = (
             self.reward_calibration.calibration_id
@@ -4441,6 +4602,9 @@ class DDPOTrainer:
             self._restore_rng_state(checkpoint["rng"])
         self.start_epoch = int(checkpoint["epoch"]) + 1
         self.global_step = int(checkpoint.get("global_step", 0))
+        self.initial_policy_id = str(
+            checkpoint.get("initial_policy_id", "")
+        )
         checkpoint_anchor_target = float(
             checkpoint.get("config", {}).get("anchor_auto_grad_ratio", 0.0)
         )

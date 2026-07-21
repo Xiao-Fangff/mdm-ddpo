@@ -10,13 +10,16 @@ import torch
 
 from mdm_ddpo.config import TrainConfig
 from mdm_ddpo.lora import (
-    configure_trainable_policy,
-    load_trainable_state_dict,
     merge_lora,
+)
+from mdm_ddpo.policy_io import (
+    configure_and_load_policy_checkpoint,
+    policy_uses_count_conditioning,
 )
 from mdm_ddpo.runtime import (
     bootstrap_external_repositories,
     build_mdm,
+    diffusion_runtime_metadata,
     load_model_args,
     resolve_device,
 )
@@ -57,6 +60,8 @@ def main() -> None:
         if key in allowed_fields
     }
     config = TrainConfig(**saved_config)
+    config.enable_count_conditioning = policy_uses_count_conditioning(checkpoint)
+    config.train_count_conditioning = config.enable_count_conditioning
     config.device = args.device
     config.precision = "no"
     config.sample_steps = 0
@@ -81,26 +86,26 @@ def main() -> None:
     dummy_data = SimpleNamespace(
         dataset=SimpleNamespace(num_actions=1)
     )
-    model, _, _, _ = build_mdm(
+    model, diffusion, _, _ = build_mdm(
         config,
         model_args,
         dummy_data,
         device,
     )
-    configure_trainable_policy(
+    configure_and_load_policy_checkpoint(
         model,
-        mode=config.train_mode,
-        lora_rank=config.lora_rank,
-        lora_alpha=config.lora_alpha,
-        lora_target_regex=config.lora_target_regex,
+        checkpoint,
+        diffusion_metadata=diffusion_runtime_metadata(model_args, diffusion),
+        model_path=config.model_path,
+        source="Export checkpoint",
     )
-    load_trainable_state_dict(model, checkpoint["policy"])
     merged_adapters = merge_lora(model) if config.train_mode == "lora" else 0
 
     state_dict = {
         name: tensor.detach().cpu()
         for name, tensor in model.state_dict().items()
         if not name.startswith("clip_model.")
+        and not name.startswith("count_conditioning.")
     }
     with open(config.model_args_path, "r", encoding="utf-8") as handle:
         model_args_payload = json.load(handle)
@@ -130,6 +135,9 @@ def main() -> None:
         "output": str(output_path),
         "args": str(args_output_path),
         "merged_lora_adapters": merged_adapters,
+        "count_conditioning_omitted_for_unconditional_count_export": (
+            config.enable_count_conditioning
+        ),
         "state_tensors": len(state_dict),
     }
     print(json.dumps(summary, indent=2, sort_keys=True))

@@ -9,6 +9,7 @@ from mdm_ddpo.lora import (
     inject_lora,
     load_trainable_state_dict,
     merge_lora,
+    set_lora_trainable,
     trainable_state_dict,
 )
 
@@ -100,6 +101,28 @@ class LoRATest(unittest.TestCase):
 
         for name, tensor in source_state.items():
             torch.testing.assert_close(target.state_dict()[name], tensor)
+
+    def test_frozen_lora_remains_in_portable_policy_state(self):
+        model = ToyNetwork()
+        inject_lora(
+            model,
+            rank=2,
+            alpha=2,
+            target_regex=r"(block|attn)",
+        )
+
+        frozen_count = set_lora_trainable(model, False)
+        state = trainable_state_dict(model)
+
+        self.assertGreater(frozen_count, 0)
+        self.assertFalse(any(parameter.requires_grad for parameter in model.parameters()))
+        self.assertTrue(state)
+        self.assertTrue(all("lora_" in name for name in state))
+
+        missing_name = next(iter(state))
+        state.pop(missing_name)
+        with self.assertRaisesRegex(KeyError, "missing trainable policy"):
+            load_trainable_state_dict(model, state)
 
 
 if __name__ == "__main__":

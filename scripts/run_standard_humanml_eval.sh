@@ -14,6 +14,8 @@ CHECKPOINT="$(realpath "$1")"
 OUTPUT_DIR="$(realpath -m "$2")"
 BASELINE_DIR="${OUTPUT_DIR}/baseline"
 CANDIDATE_DIR="${OUTPUT_DIR}/candidate"
+BASE_MODEL_PATH="${BASE_MODEL_PATH:-${MDM_ROOT}/save/humanml_trans_dec_512_bert/model000600000.pt}"
+BASE_MODEL_ARGS_PATH="${BASE_MODEL_ARGS_PATH:-${MDM_ROOT}/save/humanml_trans_dec_512_bert/args.json}"
 
 if [[ -e "${OUTPUT_DIR}" ]]; then
   echo "Refusing to overwrite evaluation directory: ${OUTPUT_DIR}" >&2
@@ -21,27 +23,30 @@ if [[ -e "${OUTPUT_DIR}" ]]; then
 fi
 mkdir -p "${BASELINE_DIR}" "${CANDIDATE_DIR}"
 
-cp "${MDM_ROOT}/save/humanml_trans_dec_512_bert/model000600000.pt" \
-  "${BASELINE_DIR}/model000600000.pt"
-cp "${MDM_ROOT}/save/humanml_trans_dec_512_bert/args.json" \
+cp "${BASE_MODEL_PATH}" "${BASELINE_DIR}/model_baseline.pt"
+cp "${BASE_MODEL_ARGS_PATH}" \
   "${BASELINE_DIR}/args.json"
 
 "${PYTHON}" "${PROJECT_ROOT}/export_ddpo.py" \
   --checkpoint "${CHECKPOINT}" \
-  --output "${CANDIDATE_DIR}/model_ddpo.pt"
+  --output "${CANDIDATE_DIR}/model_ddpo.pt" \
+  --model-path "${BASE_MODEL_PATH}" \
+  --model-args-path "${BASE_MODEL_ARGS_PATH}"
 
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-mdm-ddpo}"
 export PYTHON
 cd "${MOTIONRFT_ROOT}"
 bash RFT_MDM_v2/run_eval_mdm.sh \
-  --model-path "${BASELINE_DIR}/model000600000.pt" \
+  --model-path "${BASELINE_DIR}/model_baseline.pt" \
   --device "${EVAL_DEVICE:-0}" \
   --eval-mode "${EVAL_MODE:-debug}" \
   --guidance-param 2.5 \
-  --cache-dir "${OUTPUT_DIR}/cache_baseline"
+  --use-average-model \
+  --output-dir "${BASELINE_DIR}/eval"
 bash RFT_MDM_v2/run_eval_mdm.sh \
   --model-path "${CANDIDATE_DIR}/model_ddpo.pt" \
   --device "${EVAL_DEVICE:-0}" \
   --eval-mode "${EVAL_MODE:-debug}" \
   --guidance-param 2.5 \
-  --cache-dir "${OUTPUT_DIR}/cache_candidate"
+  --use-average-model \
+  --output-dir "${CANDIDATE_DIR}/eval"

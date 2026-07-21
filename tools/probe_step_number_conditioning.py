@@ -17,6 +17,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from mdm_ddpo.config import TrainConfig  # noqa: E402
+from mdm_ddpo.count_conditioning import (  # noqa: E402
+    count_conditioning_metadata,
+    count_conditioning_signature,
+    set_count_conditioning_trainable,
+    validate_count_conditioning_signature,
+)
 from mdm_ddpo.diffusion import ddim_step_with_logprob  # noqa: E402
 from mdm_ddpo.lora import (  # noqa: E402
     configure_trainable_policy,
@@ -33,6 +39,7 @@ from mdm_ddpo.runtime import (  # noqa: E402
     load_model_args,
     resolve_device,
     seed_everything,
+    validate_diffusion_runtime_metadata,
 )
 from mdm_ddpo.step_data import (  # noqa: E402
     load_humanml_stats,
@@ -222,10 +229,31 @@ def _embedding_metrics(
             "numerically_distinguishable": float(distance.min() > 1.0e-8),
         }
 
-    return {
+    output: dict[str, Any] = {
         "raw_text_encoder": summarize(raw),
         "projected_embed_text": summarize(projected),
     }
+    conditioning = getattr(model, "count_conditioning", None)
+    if conditioning is not None:
+        device = next(conditioning.parameters()).device
+        with torch.no_grad():
+            explicit = conditioning(pool.targets.to(device)).float().cpu()
+        pairwise = torch.stack(
+            [
+                (explicit[first] - explicit[second]).square().mean().sqrt()
+                for first, second in itertools.combinations(
+                    range(len(pool.targets)),
+                    2,
+                )
+            ]
+        )
+        output["explicit_count_conditioning"] = {
+            "pairwise_rms_distance_mean": pairwise.mean().item(),
+            "pairwise_rms_distance_min": pairwise.min().item(),
+            "numerically_distinguishable": float(pairwise.min() > 1.0e-8),
+            "metadata": count_conditioning_metadata(model),
+        }
+    return output
 
 
 def _motion_pair_metrics(
@@ -324,6 +352,10 @@ def _evaluate_policy(
             pool.max_frames,
             device=torch.device(config.device),
             guidance_scale=config.guidance_scale,
+            target_steps=torch.tensor(
+                targets * len(batch_units),
+                dtype=torch.long,
+            ),
         )
         for step in range(diffusion.num_timesteps - 1, -1, -1):
             timestep = torch.full(
@@ -433,12 +465,33 @@ def main(argv: list[str] | None = None) -> None:
         (Path(path).expanduser().resolve(), _load_checkpoint(path))
         for path in args.checkpoints
     ]
+    checkpoint_count_signatures = [
+        payload.get(
+            "count_conditioning",
+            {"enabled": False, "version": 1},
+        )
+        for _, payload in checkpoint_payloads
+    ]
+    if checkpoint_count_signatures and any(
+        signature != checkpoint_count_signatures[0]
+        for signature in checkpoint_count_signatures[1:]
+    ):
+        raise ValueError(
+            "All probed checkpoints must use the same count-conditioning "
+            "structure."
+        )
+    count_conditioning_enabled = bool(
+        checkpoint_count_signatures
+        and checkpoint_count_signatures[0].get("enabled", False)
+    )
     config = TrainConfig(
         mdm_root=args.mdm_root,
         motionrft_root=args.motionrft_root,
         model_path=args.model_path,
         model_args_path=args.model_args_path,
         prediction_type=args.prediction_type,
+        enable_count_conditioning=count_conditioning_enabled,
+        train_count_conditioning=count_conditioning_enabled,
         data_cache_dir=args.data_cache_dir,
         data_workers=0,
         seed=args.seed,
@@ -474,6 +527,14 @@ def main(argv: list[str] | None = None) -> None:
             lora_alpha=float(first_config["lora_alpha"]),
             lora_target_regex=str(first_config["lora_target_regex"]),
         )
+        if count_conditioning_enabled:
+            set_count_conditioning_trainable(model, True)
+        validate_count_conditioning_signature(
+            model,
+            checkpoint_payloads[0][1].get("count_conditioning"),
+            source="Probe checkpoint",
+        )
+        runtime_diffusion = diffusion_runtime_metadata(model_args, diffusion)
         for path, payload in checkpoint_payloads[1:]:
             current = payload["config"]
             signature = (
@@ -490,6 +551,20 @@ def main(argv: list[str] | None = None) -> None:
             )
             if signature != expected:
                 raise ValueError(f"Checkpoint LoRA settings differ: {path}")
+        for path, payload in checkpoint_payloads:
+            validate_diffusion_runtime_metadata(
+                payload.get("mdm_diffusion", {}),
+                runtime_diffusion,
+                source=f"Probe checkpoint {path}",
+            )
+            checkpoint_model_path = payload.get("config", {}).get("model_path")
+            if checkpoint_model_path is not None and (
+                Path(checkpoint_model_path).expanduser().resolve()
+                != Path(config.model_path).expanduser().resolve()
+            ):
+                raise ValueError(
+                    f"Probe checkpoint uses a different base MDM: {path}."
+                )
     model.eval()
     policy_model = build_policy_model(model, config.guidance_scale)
     policy_model.eval()
@@ -595,6 +670,7 @@ def main(argv: list[str] | None = None) -> None:
                     model_args,
                     diffusion,
                 ),
+                "count_conditioning": count_conditioning_signature(model),
                 "records": records,
             },
             indent=2,

@@ -34,6 +34,9 @@ class TrainConfig:
         DEFAULT_MDM_ROOT + "/save/humanml_trans_dec_512_bert/args.json"
     )
     prediction_type: str = "auto"
+    enable_count_conditioning: bool = False
+    train_count_conditioning: bool = True
+    initial_policy_path: str = ""
     reward_backbone_path: str = (
         DEFAULT_MOTIONRFT_ROOT
         + "/checkpoints/motionreward/stage1_retrieval_backbone_r128.pth"
@@ -109,6 +112,7 @@ class TrainConfig:
     anchor_batch_size: int = 0
 
     train_mode: str = "lora"
+    train_lora: bool = True
     lora_rank: int = 8
     lora_alpha: float = 8.0
     lora_target_regex: str = (
@@ -166,6 +170,16 @@ class TrainConfig:
         if self.prediction_type not in {"auto", "x_start", "epsilon"}:
             raise ValueError(
                 "--prediction-type must be one of: auto, x_start, epsilon."
+            )
+        if not self.train_lora and self.train_mode != "lora":
+            raise ValueError("--no-train-lora requires --train-mode lora.")
+        if self.resume and self.initial_policy_path:
+            raise ValueError(
+                "--resume and --initial-policy-path are mutually exclusive."
+            )
+        if self.initial_policy_path and not self.enable_count_conditioning:
+            raise ValueError(
+                "--initial-policy-path requires --enable-count-conditioning."
             )
         if self.dataset != "humanml":
             raise ValueError(
@@ -547,6 +561,14 @@ class TrainConfig:
                 "step reward calibration: "
                 f"{Path(self.step_reward_calibration_path).expanduser()}"
             )
+        if (
+            self.initial_policy_path
+            and not Path(self.initial_policy_path).expanduser().exists()
+        ):
+            missing.append(
+                "initial policy: "
+                f"{Path(self.initial_policy_path).expanduser()}"
+            )
         if missing:
             raise FileNotFoundError("Missing required paths:\n  " + "\n  ".join(missing))
 
@@ -704,6 +726,29 @@ def build_parser() -> argparse.ArgumentParser:
             "How the MDM checkpoint parameterizes its denoising output. "
             "'auto' reads prediction_type or predict_epsilon from args.json "
             "and falls back to x_start for legacy checkpoints."
+        ),
+    )
+    paths.add_argument(
+        "--enable-count-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Inject a zero-initialized explicit count embedding for targets "
+            "0..6; ordinary HumanML uses the no-count id."
+        ),
+    )
+    paths.add_argument(
+        "--train-count-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow DDPO to update an installed count-conditioning module.",
+    )
+    paths.add_argument(
+        "--initial-policy-path",
+        default="",
+        help=(
+            "Load LoRA/count tensors from a native-SFT policy checkpoint "
+            "without restoring DDPO optimizer or epoch state."
         ),
     )
     paths.add_argument(
@@ -1002,6 +1047,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     policy = parser.add_argument_group("policy parameters")
     policy.add_argument("--train-mode", choices=["lora", "full"], default="lora")
+    policy.add_argument(
+        "--train-lora",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Update injected LoRA tensors. Disable after count SFT to run "
+            "count-adapter-only DDPO while preserving ordinary HumanML."
+        ),
+    )
     policy.add_argument("--lora-rank", type=int, default=8)
     policy.add_argument("--lora-alpha", type=float, default=8.0)
     policy.add_argument(

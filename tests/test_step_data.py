@@ -15,6 +15,7 @@ from mdm_ddpo.step_data import (
     create_synthetic_fixed_step_eval_pool,
     create_synthetic_step_records,
     StepMotionDataset,
+    create_balanced_step_sft_records,
     create_fixed_step_eval_pool,
     load_fixed_step_eval_pool,
     load_step_manifest,
@@ -132,6 +133,38 @@ class StepDataTest(unittest.TestCase):
         )
         self.assertEqual(len({record.length for record in first_block}), 1)
         self.assertEqual(len({record.template_slot for record in first_block}), 1)
+
+    def test_count_sft_selection_balances_target_inside_length_bins(self):
+        records = [
+            StepSampleRecord(
+                manifest_index=target * 100 + slot,
+                sample_id=f"t{target}-{slot}",
+                target_steps=target,
+                feature_path=Path("unused.npy"),
+                length=40 + 5 * slot + target,
+            )
+            for target in (1, 2, 3)
+            for slot in range(8)
+        ]
+
+        selected, audit = create_balanced_step_sft_records(
+            records,
+            targets=(1, 2, 3),
+            length_bins=2,
+            seed=7,
+            prompt_seed=11,
+            max_samples_per_bin_target=2,
+        )
+
+        target_counts = {
+            target: sum(record.target_steps == target for record in selected)
+            for target in (1, 2, 3)
+        }
+        self.assertEqual(len(set(target_counts.values())), 1)
+        self.assertEqual(audit["samples_per_target"], {"1": 4, "2": 4, "3": 4})
+        self.assertTrue(all(record.prompt for record in selected))
+        for cell in audit["cells"]:
+            self.assertEqual(cell["retained_per_target"], 2)
 
     def test_manifest_split_is_stratified_disjoint_and_reproducible(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -15,6 +15,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from mdm_ddpo.config import TrainConfig  # noqa: E402
+from mdm_ddpo.count_conditioning import count_conditioning_signature  # noqa: E402
+from mdm_ddpo.policy_io import (  # noqa: E402
+    configure_and_load_policy_checkpoint,
+    load_policy_checkpoint_payload,
+    policy_uses_count_conditioning,
+)
 from mdm_ddpo.rewards import RewardOutput  # noqa: E402
 from mdm_ddpo.runtime import (  # noqa: E402
     bootstrap_external_repositories,
@@ -149,6 +155,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default=TrainConfig.model_path)
     parser.add_argument("--model-args-path", default=TrainConfig.model_args_path)
     parser.add_argument(
+        "--policy-checkpoint",
+        default="",
+        help=(
+            "Optional count-SFT/DDPO policy checkpoint to calibrate instead "
+            "of the zero-LoRA base MDM."
+        ),
+    )
+    parser.add_argument(
         "--prediction-type",
         choices=["auto", "x_start", "epsilon"],
         default="auto",
@@ -202,13 +216,20 @@ def _validate_args(
         )
 
 
-def _build_config(args: argparse.Namespace, output: Path) -> TrainConfig:
+def _build_config(
+    args: argparse.Namespace,
+    output: Path,
+    *,
+    enable_count_conditioning: bool,
+) -> TrainConfig:
     config = TrainConfig(
         mdm_root=args.mdm_root,
         motionrft_root=args.motionrft_root,
         model_path=args.model_path,
         model_args_path=args.model_args_path,
         prediction_type=args.prediction_type,
+        enable_count_conditioning=enable_count_conditioning,
+        train_count_conditioning=enable_count_conditioning,
         output_dir=str(output.parent),
         data_cache_dir=args.data_cache_dir,
         data_workers=args.data_workers,
@@ -351,7 +372,20 @@ def main(argv: list[str] | None = None) -> None:
         if args.samples_output
         else output.with_name("step_reward_calibration_samples.pt")
     )
-    config = _build_config(args, output)
+    policy_payload = (
+        load_policy_checkpoint_payload(args.policy_checkpoint)
+        if args.policy_checkpoint
+        else None
+    )
+    config = _build_config(
+        args,
+        output,
+        enable_count_conditioning=(
+            policy_uses_count_conditioning(policy_payload)
+            if policy_payload is not None
+            else False
+        ),
+    )
     bootstrap_external_repositories(config)
     seed_everything(config.seed)
     device = resolve_device(config.device)
@@ -369,6 +403,16 @@ def main(argv: list[str] | None = None) -> None:
         data_loader,
         device,
     )
+    runtime_diffusion = diffusion_runtime_metadata(model_args, diffusion)
+    policy_structure: dict[str, object] | None = None
+    if policy_payload is not None:
+        policy_structure = configure_and_load_policy_checkpoint(
+            model,
+            policy_payload,
+            diffusion_metadata=runtime_diffusion,
+            model_path=config.model_path,
+            source="Step calibration policy",
+        )
     policy_model = build_policy_model(model, config.guidance_scale)
     pool, mean, std = _load_or_create_pool(
         config,
@@ -435,7 +479,23 @@ def main(argv: list[str] | None = None) -> None:
         ).reward.reshape_as(targets)
     metadata = {
         "model_path": str(Path(config.model_path).expanduser().resolve()),
-        "policy": "original_mdm_without_lora",
+        "policy": (
+            "loaded_trainable_policy"
+            if policy_payload is not None
+            else "original_mdm_without_lora"
+        ),
+        "policy_checkpoint": (
+            str(Path(args.policy_checkpoint).expanduser().resolve())
+            if args.policy_checkpoint
+            else ""
+        ),
+        "policy_structure": policy_structure,
+        "policy_id": (
+            str(policy_structure["policy_id"])
+            if policy_structure is not None
+            else ""
+        ),
+        "count_conditioning": count_conditioning_signature(model),
         "pool_id": pool.pool_id,
         "pool_path": str(pool_path),
         "seed": config.seed,
@@ -446,7 +506,7 @@ def main(argv: list[str] | None = None) -> None:
         "step_targets": list(config.step_target_values),
         "step_samples_per_prompt": config.step_samples_per_prompt,
         "step_pool_source": config.step_rollout_source,
-        "mdm_diffusion": diffusion_runtime_metadata(model_args, diffusion),
+        "mdm_diffusion": runtime_diffusion,
     }
     payload = compute_step_reward_calibration(
         calibrated_reward,
